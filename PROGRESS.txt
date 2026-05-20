@@ -1,0 +1,129 @@
+Project Centaur Progress
+Last updated: 2026-05-18
+
+Current state:
+- Live ticks are running through the Mac `launchd` wrapper on `/Volumes/Bob/www/ghostfrog-centaur`.
+- The migrated Mac uses the project-local `.venv-mac` Python 3.12 environment for unattended ticks.
+- The project-local `.venv-mac` environment has `psycopg2-binary` installed so live operation uses PostgreSQL instead of falling back to SQLite.
+- A post-migration `launchd` tick was verified on 2026-05-01 with tick id `20260501-133905`, `Operations store: postgres`, and exit status `0`.
+- Live operations and dashboard data are PostgreSQL-backed.
+- Centaur collects equities and crypto data.
+- Shadow trading, replay training, strategy fitness, and micro paper execution are all implemented.
+- Paper execution is still tightly constrained to `$10` micro entries, but now allows up to `10` concurrent paper slots and includes the existing crypto strategy plus `momentum.volatility_breakout` by explicit human override.
+- Shadow and replay fitness now include configurable spread/slippage realism instead of assuming perfect fills.
+- Gemini cost accounting is now pinned to the official `gemini-2.5-flash` pricing in `.env`.
+- Gemini analysis is now disabled in the live runtime to control API spend; Centaur is currently operating in function-only mode while keeping the Gemini adapter code available for later reactivation.
+- A one-shot `python3 main.py --backfill-api-costs` command now exists to reprice stored API events and rebuild daily/tick cost rollups where historical request units were recorded.
+- Shadow and replay now apply a fixed per-trade micro-friction floor on top of spread/slippage so `$10` trade economics are scored more defensively.
+- Paper approvals now reject projected gains below `1.5%`, and paper orders now use marketable limit orders instead of raw market orders.
+- Centaur now persists a daily protection baseline in Postgres, blocks new paper entries once equity drawdown reaches `$5.00`, and keeps that protection latched for the session.
+- Centaur now runs an in-pipeline stale-order reaper that cancels untouched equity buy limits older than `5` minutes and records the reaped count in Postgres.
+- Centaur has now started the multi-broker refactor with a broker-adapter layer.
+- The current Alpaca execution path now runs through an `AlpacaBrokerAdapter` so the existing paper flow keeps working while the architecture opens up.
+- Paper trade persistence now stores `broker_id`, so future IG execution history will not pollute Alpaca records.
+- An `alpaca_live` broker scaffold now exists for a possible May 2026 side-by-side paper/live go-live discussion, but live order submission and cancellation are still blocked.
+- The `IG` adapter now exists as a scaffold only; it is not active for execution yet and currently only enforces the minimum-bet / `1x` leverage veto logic.
+- After a seven-day flatline with raw signals but zero shadow proposals, the strategy-allocation suppress threshold was lowered from `-5.0` to `-5.25` by explicit human override on 2026-04-21.
+- After a second flatline with healthy live ticks but zero surviving signals or shadow proposals, the strategy-allocation suppress threshold was lowered again from `-5.25` to `-5.50` by explicit human override on 2026-05-07.
+- After current `mean_reversion.snapback` signals were still being suppressed around `-5.669`, the strategy-allocation suppress threshold was lowered again from `-5.50` to `-5.70` by explicit human override on 2026-05-11.
+- On 2026-05-13, an explicit human override enabled a guarded paper-only adaptive threshold controller. The fixed `.env` threshold remains `-5.70`, while the persisted effective paper threshold may adapt only inside the approved paper-only rails, with max `0.10` moves, at least `medium` GA confidence, at least `120` evidence ticks, and a `30` minute cooldown.
+- The first adaptive move set the effective paper threshold to `-5.80`; a controlled tick at `20260513-184010` used `allocation_suppress_threshold=-5.800`.
+- After the adaptive move, scheduler ticks produced `mean_reversion.snapback` paper buys for `CEG` and `INTC`, while weaker `liquidity_probe` and momentum signals remained suppressed.
+- On 2026-05-14, after the useful `mean_reversion.snapback` cliff drifted to roughly `-5.95`, the adaptive controller was changed from a fixed `-5.90` floor to a local `+/-0.10` cliff band with an absolute hard floor at `-6.10`.
+- On 2026-05-15, after `mean_reversion.snapback` clustered around `-6.073`, the threshold GA was seeded with explicit hard-floor candidates and its extra weak-score penalty was reduced for proposal-viable, paper-allowed signals. `main.py --threshold-advice` then recommended `-6.10` with medium confidence, and the adaptive controller now allows safe catch-up steps toward the same tradeable cliff without waiting for the cooldown.
+- On 2026-05-18, the threshold adviser lookback was widened so quiet weekend/no-signal ticks do not leave the GA with too few usable signal diagnostics on Monday.
+- On 2026-05-18, after explicit human approval, the adaptive controller's absolute paper-only hard floor was widened from `-6.10` to `-6.50` because the current tradeable `mean_reversion.snapback` cliff was clustered just beyond `-6.10`; the floor still blocks the weaker `-6.86` liquidity-probe band and very weak `-11`/`-12` momentum signals. The GA confidence gate now treats a clean local cliff as `medium` only when enough evidence exists, the recent test window has tradeable survivors, and the recommended threshold admits no non-tradeable survivors.
+- On 2026-05-18, Centaur gained a recommendation-only holding-window fitness adviser for `mean_reversion.snapback`. It compares fixed `15m`, `1h`, and `1d` shadow outcomes plus simple dynamic policies such as `take_1h_profit_else_1d`, and surfaces the result via `main.py --holding-window-advice`, status, and the DDEV dashboard snapshot without changing live paper exits.
+- On 2026-05-19, the adaptive threshold controller gained a current-tick cliff governor. It annotates the current raw strategy signals before allocation, finds the nearest paper-allowed proposal-viable cliff and the nearest blocked/disallowed cliff, and may step below the configured `-6.50` fallback floor only when a clean safety gap remains. A direct check moved the effective threshold from `-6.50` to `-6.55` because current `mean_reversion.snapback` was at `-6.549756` while the nearest blocked liquidity-probe cliff was still down at `-6.859063`.
+- On 2026-05-20, the Alpaca Live lane was moved from pure scaffold toward a dormant side-by-side follower. API keys alone still cannot activate live trading: the lane requires explicit live enablement, kill switch off, `LIVE_TRADING_APPROVED`, a live strategy allowlist, live daily-loss clearance, available live slots, and a same-tick paper-approved trade before any live entry order can be submitted. A dormant live managed-exit step was also added so future live positions can use the same persisted stop/target/holding-window plan as paper.
+- On 2026-05-20, an explicit human override added earned-slot compounding for paper and future live lanes. Each full `$10` of tracked P/L above that broker lane's pre-first-order baseline adds one effective `$10` slot. With paper P/L around `$13`, the paper lane now has `11` effective slots instead of the base `10`, while the per-order notional remains `$10`.
+- Broker routing is explicit in config:
+  - equities -> `alpaca_paper`
+  - crypto -> `alpaca_paper`
+- Alpaca Live readiness is explicit in config:
+  - live broker id -> `alpaca_live`
+  - live execution enabled -> `false`
+  - live kill switch -> `true`
+  - live strategy allowlist -> empty
+  - API keys alone -> not enough to trade live
+
+Working strategies:
+- momentum.balanced
+- momentum.strong
+- momentum.volatility_breakout
+- mean_reversion.snapback
+- crypto_momentum.trend
+- liquidity_probe.steady_flow
+
+Important live truth:
+- `momentum.volatility_breakout` is installed, has replay evidence, and is now allowlisted for micro paper execution by explicit human override.
+- After the larger replay run, it has:
+  - 10 all-time proposals
+  - 20 evaluated outcomes
+  - positive latest fitness on 1h and 1d checkpoints
+- Equity discovery is now configured to use the full Nasdaq-100 universe.
+- Paper execution now allows `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`.
+- Equities still require market hours; crypto can now be paper-traded during the overnight crypto window.
+- The new broker layer is active in code, but live execution routing is still Alpaca-only until a human deliberately changes the broker ids.
+- Alpaca Live is scaffolded for readiness visibility only; it must not submit real-money orders until a separate explicit go-live override updates the constraints, decision log, and go-live checklist.
+- IG is in shadow/scaffold mode only and should be treated as not-yet-live.
+- The 2026-04-21 suppress-threshold calibration preserves `$10` notional, Alpaca Paper routing, the existing allowed strategy list, market-hours requirements, the `1.5%` projected-gain gate, max-slot rules, and the `$5.00` daily protector.
+
+Recent dashboard improvements:
+- explicit strategy coverage
+- a ranked strategy leaderboard ordered by current best fitness, with plain-English explanation of why the top strategy is currently on top
+- dedicated breakout activity panel
+- separation of recent 7d proposal counts from all-time training volume
+- read-only dashboard tabs for `AGENTS.md`, `CONSTRAINTS.md`, `DECISION_LOG.md`, `SKILL.md`, and `PROGRESS.txt`
+- open position diagnostics with stop, target, unrealized PnL, and exit state
+- a dedicated account panel showing Alpaca balance, buying power, cash, day change, and current open-position P/L
+- a dedicated `Account` tab plus a top header day-P/L badge for quick balance visibility
+- a second top header badge showing the same day P/L converted into GBP from the live ECB reference rate
+- a dedicated capital-envelope view showing max bankroll, committed amount, free amount, and slot usage based on the `$10 x 10` paper-production rule
+- a return-comparison panel that sets Centaur’s current paper pace against simple long-term investing yardsticks on the same bankroll cap
+- the return-comparison panel now anchors its baseline to the last persisted tick before the first paper order, so later Alpaca order-sync updates do not distort the starting point
+- a dedicated trade-diagnostics view showing why Centaur did or did not trade
+- a dedicated API cost view that shows recorded spend, request volume, and whether internal pricing is actually configured
+- dedicated dashboard tabs for `docs/STRATEGY_SELECTION_CHECKLIST.md` and `docs/GO_LIVE_CHECKLIST.md`
+- the Tk dashboard is now temporarily running in a single-view, no-tabs mode while we diagnose responsiveness; it now keeps only the alert banner, full status summary, and diagnostics
+- the Tk dashboard now uses a lighter snapshot path and reuses that same snapshot for its summary text, instead of rebuilding a second full status snapshot on every refresh
+- broker account snapshots are now persisted per broker in `broker_account_snapshots` during live Alpaca ticks
+- status and the lightweight dashboard summary now show a broker-aware account section, with Alpaca separated from the IG scaffold instead of assuming one account surface
+- status and the lightweight dashboard summary now show Alpaca Live readiness as a separate safe-off lane
+- Alpaca managed exits now preserve the broker-reported fractional `qty` and format it to 9 decimal places with a down-rounding guard, instead of rounding to 6 decimals and risking insufficient-quantity rejects
+- status and the lightweight dashboard now show a `Centaur activity` trail with scan counts, raw strategy-signal previews, fitness-suppressed signal previews, surviving signals, proposal counts, and CFO blocker reasons
+- tick snapshots now persist a compact `tick_blockers` summary, and status now shows the primary stage blocker plus counted rejection and exit-skip reasons for the latest tick
+- the primary operator dashboard is now served through DDEV/OrbStack at `https://ghostfrog-centaur.ddev.site`, backed by a host-written `var/dashboard_snapshot.json` file that refreshes after each control tick
+- managed paper exits now preserve Centaur plan metadata across Alpaca broker refreshes and can recover stop, target, and holding-window rules from the matching shadow proposal if an older order row no longer carries those fields
+- a trade-aware genetic threshold adviser now reports whether recent signal-fitness history supports holding, loosening, or tightening the strategy-allocation suppress threshold; it rewards proposal-viable signals from paper-allowed strategies, tracks a local `+/-0.10` cliff band, penalizes thresholds that only admit disallowed or weak survivors, and its guarded paper-only adaptive state is visible via status output and the DDEV dashboard snapshot
+- a recommendation-only holding-window fitness adviser now reports whether the current `1h` managed-exit window is supported by shadow outcomes or whether a dynamic exit policy deserves testing
+
+Known constraints:
+- do not raise notional above `$10` without explicit approval
+- do not widen paper execution beyond the current 10-slot / equities+crypto / allowed-strategy envelope without approval
+- do not treat replay success as proven live profitability
+- do not silently relax the `1.5%` projected-gain gate or switch paper execution back to raw market orders
+- do not silently lower the fixed `.env` strategy-allocation suppress threshold again; the current explicitly approved config threshold is `-5.70`
+- do not allow the adaptive threshold controller to chase below the current paper-allowed cliff or admit the nearest blocked/disallowed cliff; below the configured `-6.50` fallback floor it may move only by the max step and only when the blocked cliff remains at least `0.10` lower
+- do not allow the adaptive threshold controller to mutate `.env`, order size, broker routing, live policy, max slots, strategy allowlist, projected-gain, stale-order, market-hours, long-only, or daily-protection rules
+- do not allow holding-window fitness advice to mutate managed paper exits; changing the `1h` live paper exit rule requires a separate explicit override
+- do not silently disable the `$5.00` daily protector or the stale-order reaper
+- do not switch equities or crypto to `ig_spreadbet` without explicit human approval once the scaffold exists
+- do not enable `alpaca_live` order submission without an explicit go-live override and recorded rollback rules
+
+Next sensible steps:
+1. Keep Alpaca Paper as the active broker until a specific live-broker or IG activation is approved.
+2. Add broker-aware account/history visuals to the web dashboard and only revisit the Tk monitor if there is a clear reason to keep it.
+3. Run `--backfill-api-costs` when provider pricing changes so older recorded usage is repriced where possible.
+4. Continue expanding replay coverage for newer strategies.
+5. Watch the first paper proposals/orders after the 2026-04-21 suppress-threshold calibration, especially `mean_reversion.snapback`, because the change is intended to unstick proposals without widening size or broker risk.
+6. Use the new `Centaur activity` output when Alpaca looks quiet, because it shows whether Centaur found raw signals that were later suppressed by the fitness allocator before they reached paper execution.
+
+New operating docs:
+- `docs/STRATEGY_SELECTION_CHECKLIST.md`
+- `docs/GO_LIVE_CHECKLIST.md`
+
+Queued improvements:
+- continue larger replay coverage for newer strategies, especially `momentum.volatility_breakout`, under the friction-adjusted scoring model
+- add a post-mortem path that distinguishes strategy loss from execution/friction loss on protection-trigger days
+- add broker-aware account history views and dashboard toggles before IG execution is ever activated

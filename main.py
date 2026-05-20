@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+
+from centaur.backfill import HistoricalBackfillRunner
+from centaur.config import load_runtime_config
+from centaur.control import ControlPipelineRunner
+from centaur.dashboard_snapshot import write_dashboard_snapshot
+from centaur.holding_window_advisor import HoldingWindowAdvisor
+from centaur.replay import HistoricalReplayRunner
+from centaur.status import StatusReporter
+from centaur.threshold_advisor import ThresholdAdvisor
+from centaur.usage import UsageLedger
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Project Centaur control pipeline."
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Run a local development heartbeat loop. Production should use an external scheduler.",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=60,
+        help="Seconds between ticks in --loop mode.",
+    )
+    parser.add_argument(
+        "--max-ticks",
+        type=int,
+        default=0,
+        help="Optional safety limit for --loop mode. Use 0 for unlimited.",
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Run a one-shot historical bars backfill instead of the live control tick.",
+    )
+    parser.add_argument(
+        "--replay",
+        action="store_true",
+        help="Run a one-shot historical replay over stored bars to generate shadow training outcomes.",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show a one-shot Centaur status summary without running a control tick.",
+    )
+    parser.add_argument(
+        "--threshold-advice",
+        action="store_true",
+        help="Run the recommendation-only GA adviser for the strategy suppress threshold.",
+    )
+    parser.add_argument(
+        "--holding-window-advice",
+        action="store_true",
+        help="Run the recommendation-only adviser for strategy holding-window fitness.",
+    )
+    parser.add_argument(
+        "--strategy-id",
+        type=str,
+        default="mean_reversion.snapback",
+        help="Strategy id for advisory commands such as --holding-window-advice.",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Launch the local Centaur web dashboard server.",
+    )
+    parser.add_argument(
+        "--dashboard-desktop",
+        action="store_true",
+        help="Launch the legacy local Centaur desktop monitor window.",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host for the web dashboard server.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8788,
+        help="Port for the web dashboard server.",
+    )
+    parser.add_argument(
+        "--backfill-api-costs",
+        action="store_true",
+        help="Reprice stored API usage events from current provider pricing and rebuild cost rollups.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=0,
+        help="Historical backfill lookback window in days. Uses config default when omitted.",
+    )
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        default="",
+        help="Historical backfill timeframe, for example 1Min or 1Hour.",
+    )
+    parser.add_argument(
+        "--equity-symbols",
+        type=str,
+        default="",
+        help="Optional comma-separated equity symbols for backfill.",
+    )
+    parser.add_argument(
+        "--crypto-symbols",
+        type=str,
+        default="",
+        help="Optional comma-separated crypto symbols for backfill.",
+    )
+    parser.add_argument(
+        "--max-replay-timestamps",
+        type=int,
+        default=0,
+        help="Optional cap on historical timestamps processed in --replay mode. Use 0 for all eligible timestamps.",
+    )
+    parser.add_argument(
+        "--replay-start-at",
+        type=str,
+        default="",
+        help="Optional ISO datetime/date start for --replay mode.",
+    )
+    parser.add_argument(
+        "--replay-end-at",
+        type=str,
+        default="",
+        help="Optional ISO datetime/date end for --replay mode.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.status:
+        StatusReporter().print()
+        return
+
+    if args.threshold_advice:
+        print(ThresholdAdvisor().render(), flush=True)
+        return
+
+    if args.holding_window_advice:
+        advisor = HoldingWindowAdvisor()
+        print(advisor.render(advice=advisor.build_advice(strategy_id=args.strategy_id)), flush=True)
+        return
+
+    if args.dashboard:
+        from centaur.web_dashboard import run_web_dashboard
+
+        run_web_dashboard(
+            host=args.host,
+            port=args.port,
+            config=load_runtime_config(),
+        )
+        return
+
+    if args.dashboard_desktop:
+        from centaur.dashboard import run_dashboard
+
+        run_dashboard()
+        return
+
+    if args.backfill_api_costs:
+        ledger = UsageLedger(config=load_runtime_config())
+        summary = ledger.backfill_api_costs()
+        print("Centaur API cost backfill complete", flush=True)
+        print(
+            (
+                f"Backend: {summary['backend']} | repriced_at={summary['repriced_at']} | "
+                f"events_scanned={summary['events_scanned']} | "
+                f"events_cost_changed={summary['events_cost_changed']} | "
+                f"zero_cost_events={summary['zero_cost_events']}"
+            ),
+            flush=True,
+        )
+        print(
+            (
+                f"Gemini: events_scanned={summary['gemini_events_scanned']} | "
+                f"with_tokens={summary['gemini_events_with_tokens']} | "
+                f"nonzero_cost={summary['gemini_events_nonzero_cost']}"
+            ),
+            flush=True,
+        )
+        print(
+            (
+                f"Rollups: daily_rows_rebuilt={summary['daily_rows_rebuilt']} | "
+                f"tick_runs_updated={summary['tick_runs_updated']} | "
+                f"total_estimated_cost_usd=${float(summary['total_estimated_cost_usd']):.6f}"
+            ),
+            flush=True,
+        )
+        return
+
+    if args.backfill:
+        runner = HistoricalBackfillRunner()
+        runner.run(
+            days=args.days if args.days > 0 else None,
+            timeframe=args.timeframe or None,
+            equity_symbols=_parse_csv_argument(args.equity_symbols),
+            crypto_symbols=_parse_csv_argument(args.crypto_symbols),
+        )
+        return
+
+    if args.replay:
+        runner = HistoricalReplayRunner()
+        runner.run(
+            days=args.days if args.days > 0 else None,
+            timeframe=args.timeframe or None,
+            equity_symbols=_parse_csv_argument(args.equity_symbols),
+            crypto_symbols=_parse_csv_argument(args.crypto_symbols),
+            max_timestamps=args.max_replay_timestamps
+            if args.max_replay_timestamps > 0
+            else None,
+            start_at=_parse_datetime_argument(args.replay_start_at),
+            end_at=_parse_datetime_argument(args.replay_end_at),
+        )
+        return
+
+    runner = ControlPipelineRunner()
+
+    if args.loop:
+        max_ticks = None if args.max_ticks <= 0 else args.max_ticks
+        runner.run_development_loop(
+            interval_seconds=max(1, args.interval_seconds),
+            max_ticks=max_ticks,
+        )
+        return
+
+    try:
+        runner.run_tick()
+    finally:
+        try:
+            write_dashboard_snapshot()
+        except Exception as exc:  # pragma: no cover - best-effort operator surface
+            print(f"Dashboard snapshot refresh failed: {exc}", flush=True)
+
+
+def _parse_csv_argument(value: str) -> tuple[str, ...] | None:
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        return None
+    return tuple(items)
+
+
+def _parse_datetime_argument(value: str) -> datetime | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo
+        return parsed.replace(tzinfo=local_tz)
+    return parsed
+
+
+if __name__ == "__main__":
+    main()

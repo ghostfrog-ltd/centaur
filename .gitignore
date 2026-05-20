@@ -1,0 +1,60 @@
+# Local secrets and runtime config
+.env
+.env.*
+!.env.example
+*.local
+*.local.*
+
+# Python environments and caches
+.venv/
+.venv-*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Runtime state, generated snapshots, and local databases
+var/
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Logs and process files
+logs/*
+!logs/.gitkeep
+*.log
+*.pid
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Dependency/build output
+node_modules/
+vendor/
+dist/
+build/
+.cache/
+.parcel-cache/
+.next/
+
+# Model/data caches and bulky generated artifacts
+.hf-cache/
+*.pkl
+*.pickle
+*.parquet
+*.feather
+
+# Keep DDEV project config trackable; its nested .gitignore handles generated DDEV internals.
