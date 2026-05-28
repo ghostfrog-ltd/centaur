@@ -333,6 +333,7 @@
           { label: "Unrealized", render: (row) => `${fmtSignedCurrency(row.unrealized_pl_usd)} (${fmtSignedPct(row.unrealized_pl_pct)})` },
           { label: "Stop", render: (row) => fmtCurrency(row.stop_loss_price, 4) },
           { label: "Target", render: (row) => fmtCurrency(row.target_price, 4) },
+          { label: "Policy", render: (row) => escapeHtml(row.managed_exit_policy || "-") },
           { label: "Exit", render: (row) => escapeHtml(row.exit_state || "-") }
         ],
         snapshot.open_positions || [],

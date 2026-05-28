@@ -66,6 +66,12 @@ class StatusReporter:
                 f"crypto_overnight_enabled={'yes' if not self.config.paper_execution_equity_only else 'no'} | "
                 f"equity_only={'yes' if self.config.paper_execution_equity_only else 'no'} | "
                 f"notional=${self.config.paper_execution_default_notional_usd:.2f} | "
+                f"profit_capture={self.config.paper_execution_profit_capture_pct * 100:.2f}% | "
+                f"limit_buffer={self.config.paper_execution_limit_buffer_bps:.1f}bps | "
+                f"crypto_limit_buffer={self.config.paper_execution_crypto_limit_buffer_bps:.1f}bps | "
+                f"high_score_override={'on' if self.config.paper_execution_high_score_override_enabled else 'off'}"
+                f"/{self.config.paper_execution_high_score_override_min_score:.1f}+"
+                f"/{self.config.paper_execution_high_score_override_fitness_margin:.2f}fit | "
                 f"max_daily_drawdown=${self.config.paper_execution_max_daily_drawdown_usd:.2f} | "
                 f"stale_order_reaper={self.config.paper_execution_stale_order_minutes}m | "
                 f"base_max_open_positions={self.config.paper_execution_max_open_positions} | "
@@ -76,6 +82,13 @@ class StatusReporter:
         )
         allowed_strategies = ", ".join(self.config.paper_execution_allowed_strategies) or "none"
         lines.append(f"Allowed strategies: {allowed_strategies}")
+        lines.append(
+            (
+                "Projected-gain floor: "
+                f"equities={self.config.paper_execution_min_projected_gain_pct * 100:.2f}% | "
+                f"crypto={self.config.paper_execution_crypto_min_projected_gain_pct * 100:.2f}%"
+            )
+        )
 
         if latest_tick is None:
             lines.append("")
@@ -283,12 +296,14 @@ class StatusReporter:
             advice["adaptive_enabled"] = self.config.strategy_threshold_adaptive_enabled
             advice["adaptive_state"] = {
                 "effective_threshold": state.get("effective_threshold"),
+                "crypto_threshold": self.config.strategy_allocation_crypto_suppress_threshold,
                 "updated_at": self._fmt_dt(state.get("updated_at")),
                 "source_tick_id": state.get("source_tick_id", ""),
                 "reason": state.get("reason", ""),
                 "floor": self.config.strategy_threshold_adaptive_floor,
                 "ceiling": self.config.strategy_threshold_adaptive_ceiling,
                 "band_width": self.config.strategy_threshold_adaptive_band_width,
+                "cliff_safety_gap": self.config.strategy_threshold_adaptive_cliff_safety_gap,
                 "max_step": self.config.strategy_threshold_adaptive_max_step,
                 "cooldown_minutes": self.config.strategy_threshold_adaptive_cooldown_minutes,
                 "min_ticks": self.config.strategy_threshold_adaptive_min_ticks,
@@ -301,6 +316,7 @@ class StatusReporter:
                 "mode": "recommendation_only",
                 "current_threshold": self.config.strategy_allocation_suppress_threshold,
                 "recommended_threshold": self.config.strategy_allocation_suppress_threshold,
+                "crypto_threshold": self.config.strategy_allocation_crypto_suppress_threshold,
                 "action": "hold",
                 "confidence": "low",
                 "adaptive_enabled": self.config.strategy_threshold_adaptive_enabled,
@@ -522,6 +538,7 @@ class StatusReporter:
                 "Exit monitor"
                 f" | mode={paper_exit_management.get('mode', '-')}"
                 f" | positions_checked={paper_exit_management.get('positions_checked', 0)}"
+                f" | exits_refreshed={paper_exit_management.get('exit_orders_refreshed', 0)}"
                 f" | exits_submitted={paper_exit_management.get('exit_orders_submitted', 0)}"
                 + (
                     f" | first_skip={first_skip.get('reason', '-')}"
@@ -574,6 +591,10 @@ class StatusReporter:
                     "suppressed",
                     strategy_signals.get("signals_suppressed", 0),
                 ),
+                "high_score_overrides": allocation.get(
+                    "high_score_overrides",
+                    strategy_signals.get("signals_high_score_overridden", 0),
+                ),
                 "proposals_created": shadow_proposals.get("proposals_created", 0),
                 "cfo_reason": risk_cfo.get("reason", "-"),
             },
@@ -605,6 +626,7 @@ class StatusReporter:
                 f" | raw={flow.get('raw_signals', 0)}"
                 f" | survived={flow.get('surviving_signals', 0)}"
                 f" | suppressed={flow.get('suppressed_signals', 0)}"
+                f" | high_score_overrides={flow.get('high_score_overrides', 0)}"
                 f" | proposals={flow.get('proposals_created', 0)}"
                 f" | cfo={flow.get('cfo_reason', '-')}"
             ),
@@ -691,9 +713,11 @@ class StatusReporter:
                 "adaptive="
                 f"{'on' if advice.get('adaptive_enabled') else 'off'}"
                 f" | effective={self._fmt_number(adaptive_state.get('effective_threshold'), decimals=2)}"
+                f" | crypto={self._fmt_number(adaptive_state.get('crypto_threshold'), decimals=2)}"
                 f" | rails={self._fmt_number(adaptive_state.get('ceiling'), decimals=2)}"
                 f"..{self._fmt_number(adaptive_state.get('floor'), decimals=2)}"
                 f" | band=+/-{self._fmt_number(adaptive_state.get('band_width'), decimals=2)}"
+                f" | cliff_gap={self._fmt_number(adaptive_state.get('cliff_safety_gap'), decimals=2)}"
                 f" | updated={adaptive_state.get('updated_at') or '-'}"
             ),
             (
@@ -733,6 +757,7 @@ class StatusReporter:
         recommendation = self._as_dict(advice.get("recommendation"))
         sample_counts = self._as_dict(advice.get("sample_counts"))
         fixed_all = self._as_dict(advice.get("fixed_windows_all"))
+        fixed_long_all = self._as_dict(advice.get("fixed_windows_long_all"))
         fixed_7d = self._as_dict(advice.get("fixed_windows_7d"))
         policy_all = self._as_dict(advice.get("policy_stats_all"))
         lines = [
@@ -747,6 +772,7 @@ class StatusReporter:
                 "samples="
                 f"all {sample_counts.get('complete_15m_1h_1d', 0)}"
                 f" | 30d {sample_counts.get('complete_15m_1h_1d_30d', 0)}"
+                f" | 1h/1d/7d {sample_counts.get('complete_1h_1d_7d', 0)}"
                 f" | 7d {sample_counts.get('complete_15m_1h_7d', 0)}"
                 f" | 1d {sample_counts.get('complete_15m_1h_1d_1d', 0)}"
             ),
@@ -761,12 +787,23 @@ class StatusReporter:
                 f"15m {self._holding_metric_text(self._as_dict(fixed_7d.get('15m')))}"
                 f" | 1h {self._holding_metric_text(self._as_dict(fixed_7d.get('1h')))}"
             ),
-            (
-                "dynamic="
-                f"1h_profit_else_1d {self._holding_metric_text(self._as_dict(policy_all.get('take_1h_profit_else_1d')))}"
-            ),
-            str(recommendation.get("reason", "-")),
         ]
+        if int(sample_counts.get("complete_1h_1d_7d", 0) or 0) > 0:
+            lines.append(
+                "all-time long="
+                f"1h {self._holding_metric_text(self._as_dict(fixed_long_all.get('1h')))}"
+                f" | 1d {self._holding_metric_text(self._as_dict(fixed_long_all.get('1d')))}"
+                f" | 7d {self._holding_metric_text(self._as_dict(fixed_long_all.get('7d')))}"
+            )
+        lines.extend(
+            [
+                (
+                    "dynamic="
+                    f"1h_profit_else_1d {self._holding_metric_text(self._as_dict(policy_all.get('take_1h_profit_else_1d')))}"
+                ),
+                str(recommendation.get("reason", "-")),
+            ]
+        )
         return lines
 
     def _holding_metric_text(self, metrics: dict[str, Any]) -> str:
@@ -954,10 +991,22 @@ class StatusReporter:
                         if raw_entry.get("planned_take_profit_price") is not None
                         else (entry_order or {}).get("take_profit_price")
                     ),
+                    "profit_capture_pct": self._to_float(
+                        raw_entry.get("planned_profit_capture_pct")
+                    ),
                     "holding_window_code": str(
                         raw_entry.get("planned_holding_window_code")
                         or (entry_order or {}).get("planned_holding_window_code")
                         or "-"
+                    ),
+                    "managed_exit_policy": str(
+                        raw_entry.get("planned_managed_exit_policy")
+                        or (
+                            "profit_after_1h_else_1d"
+                            if str(entry_order.get("strategy_id", "")).strip()
+                            == "mean_reversion.snapback"
+                            else "time_exit"
+                        )
                     ),
                     "exit_state": exit_state_label,
                 }
@@ -1571,6 +1620,7 @@ class StatusReporter:
             f"upl=${unrealized_pl_usd:+.2f} ({unrealized_pct_text}) | "
             f"stop=${self._fmt_number(position.get('stop_loss_price'), decimals=4)} | "
             f"target=${self._fmt_number(position.get('target_price'), decimals=4)} | "
+            f"policy={position.get('managed_exit_policy', '-') or '-'} | "
             f"exit={position.get('exit_state', '-') or '-'} | "
             f"strategy={position.get('strategy_id', '-') or '-'}"
         )

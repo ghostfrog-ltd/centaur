@@ -277,6 +277,7 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
                     exit_slippage_bps=context.config.shadow_exit_slippage_bps,
                     fixed_round_trip_cost_usd=context.config.shadow_fixed_round_trip_cost_usd,
                     reference_notional_usd=context.config.paper_execution_default_notional_usd,
+                    profit_target_ladder_pct=context.config.shadow_profit_target_ladder_pct,
                 )
                 if outcome is not None:
                     outcomes.append(outcome)

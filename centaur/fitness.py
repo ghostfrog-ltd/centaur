@@ -102,6 +102,11 @@ def allocate_strategy_signals(
     min_checkpoints: int,
     favor_threshold: float,
     suppress_threshold: float,
+    asset_class_suppress_thresholds: dict[str, float] | None = None,
+    high_score_override_enabled: bool = False,
+    high_score_override_min_score: float = 90.0,
+    high_score_override_fitness_margin: float = 0.25,
+    high_score_override_allowed_strategies: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     summary_index = {
         (
@@ -119,17 +124,34 @@ def allocate_strategy_signals(
         "favored": 0,
         "weighted": 0,
         "suppressed": 0,
+        "high_score_overrides": 0,
         "unproven": 0,
         "raw_signals": [],
         "suppressed_signals": [],
+        "suppress_thresholds": {},
     }
+    override_allowed_strategies = {
+        str(strategy_id).strip().lower()
+        for strategy_id in (high_score_override_allowed_strategies or set())
+        if str(strategy_id).strip()
+    }
+    if asset_class_suppress_thresholds:
+        stats["suppress_thresholds"] = {
+            str(key).strip().lower(): float(value)
+            for key, value in asset_class_suppress_thresholds.items()
+        }
 
     for signal in signals:
         signal_copy = dict(signal)
         strategy_id = str(signal_copy.get("strategy_id", ""))
-        asset_class = str(signal_copy.get("asset_class", ""))
+        asset_class = str(signal_copy.get("asset_class", "")).strip().lower()
         checkpoint_code = str(signal_copy.get("holding_window_code", "")).lower()
         summary = summary_index.get((strategy_id, asset_class, checkpoint_code))
+        threshold_used = _resolve_suppress_threshold(
+            default_threshold=suppress_threshold,
+            asset_class=asset_class,
+            asset_class_suppress_thresholds=asset_class_suppress_thresholds,
+        )
 
         base_score = float(signal_copy.get("signal_score", 0) or 0)
         adjusted_score = base_score
@@ -154,28 +176,40 @@ def allocate_strategy_signals(
                 )
                 adjusted_score = round(base_score + score_bonus, 6)
 
-                if composite_score <= suppress_threshold:
-                    allocation_status = "suppressed"
-                    stats["suppressed"] += 1
-                    signal_copy.update(
-                        {
-                            "base_signal_score": round(base_score, 6),
-                            "signal_score": adjusted_score,
-                            "allocation_status": allocation_status,
-                            "fitness_composite_score": round(composite_score, 6),
-                            "fitness_sample_weight": round(sample_weight, 6),
-                            "fitness_checkpoints_evaluated": checkpoints_evaluated,
-                            "allocation_note": (
-                                f"Suppressed by shadow fitness: composite {composite_score:.3f} "
-                                f"over {checkpoints_evaluated} checkpoints."
-                            ),
-                        }
+                if composite_score <= threshold_used:
+                    override_allowed = (
+                        high_score_override_enabled
+                        and strategy_id.strip().lower() in override_allowed_strategies
+                        and base_score >= high_score_override_min_score
+                        and composite_score
+                        >= threshold_used - max(0.0, high_score_override_fitness_margin)
                     )
-                    _append_signal_diagnostic(stats["raw_signals"], signal_copy)
-                    _append_signal_diagnostic(stats["suppressed_signals"], signal_copy)
-                    continue
+                    if override_allowed:
+                        allocation_status = "high_score_override"
+                        stats["high_score_overrides"] += 1
+                    else:
+                        allocation_status = "suppressed"
+                        stats["suppressed"] += 1
+                        signal_copy.update(
+                            {
+                                "base_signal_score": round(base_score, 6),
+                                "signal_score": adjusted_score,
+                                "allocation_status": allocation_status,
+                                "fitness_composite_score": round(composite_score, 6),
+                                "fitness_sample_weight": round(sample_weight, 6),
+                                "fitness_checkpoints_evaluated": checkpoints_evaluated,
+                                "suppress_threshold_used": round(threshold_used, 6),
+                                "allocation_note": (
+                                    f"Suppressed by shadow fitness: composite {composite_score:.3f} "
+                                    f"vs threshold {threshold_used:.3f} over {checkpoints_evaluated} checkpoints."
+                                ),
+                            }
+                        )
+                        _append_signal_diagnostic(stats["raw_signals"], signal_copy)
+                        _append_signal_diagnostic(stats["suppressed_signals"], signal_copy)
+                        continue
 
-                if composite_score >= favor_threshold:
+                elif composite_score >= favor_threshold:
                     allocation_status = "favored"
                     stats["favored"] += 1
                 else:
@@ -194,10 +228,14 @@ def allocate_strategy_signals(
                     round(sample_weight, 6) if sample_weight is not None else None
                 ),
                 "fitness_checkpoints_evaluated": checkpoints_evaluated,
+                "suppress_threshold_used": round(threshold_used, 6),
                 "allocation_note": _allocation_note(
                     allocation_status=allocation_status,
                     composite_score=composite_score,
                     checkpoints_evaluated=checkpoints_evaluated,
+                    suppress_threshold=threshold_used,
+                    high_score_override_min_score=high_score_override_min_score,
+                    high_score_override_fitness_margin=high_score_override_fitness_margin,
                 ),
             }
         )
@@ -246,6 +284,7 @@ def _append_signal_diagnostic(
             "fitness_checkpoints_evaluated": int(
                 signal.get("fitness_checkpoints_evaluated", 0) or 0
             ),
+            "suppress_threshold_used": _round(signal.get("suppress_threshold_used")),
             "allocation_note": str(signal.get("allocation_note", "")),
         }
     )
@@ -288,6 +327,9 @@ def _allocation_note(
     allocation_status: str,
     composite_score: float | None,
     checkpoints_evaluated: int,
+    suppress_threshold: float | None = None,
+    high_score_override_min_score: float = 90.0,
+    high_score_override_fitness_margin: float = 0.25,
 ) -> str:
     if composite_score is None or checkpoints_evaluated <= 0:
         return "No prior strategy fitness history yet."
@@ -304,12 +346,31 @@ def _allocation_note(
     if allocation_status == "suppressed":
         return (
             f"Suppressed by shadow fitness: composite {composite_score:.3f} "
-            f"over {checkpoints_evaluated} checkpoints."
+            f"vs threshold {float(suppress_threshold or 0):.3f} over {checkpoints_evaluated} checkpoints."
+        )
+    if allocation_status == "high_score_override":
+        return (
+            f"Paper high-score override: signal score >= {high_score_override_min_score:.1f} "
+            f"and composite {composite_score:.3f} is within {high_score_override_fitness_margin:.3f} "
+            f"of threshold {float(suppress_threshold or 0):.3f} over {checkpoints_evaluated} checkpoints."
         )
     return (
         f"Observed but still unproven: composite {composite_score:.3f} "
         f"over {checkpoints_evaluated} checkpoints."
     )
+
+
+def _resolve_suppress_threshold(
+    *,
+    default_threshold: float,
+    asset_class: str,
+    asset_class_suppress_thresholds: dict[str, float] | None,
+) -> float:
+    if asset_class_suppress_thresholds:
+        specific = asset_class_suppress_thresholds.get(str(asset_class).strip().lower())
+        if specific is not None:
+            return float(specific)
+    return float(default_threshold)
 
 
 def _normalize_datetime(value: Any) -> str | None:

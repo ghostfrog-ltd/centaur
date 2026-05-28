@@ -16,6 +16,7 @@ WINDOW_ORDER = {
     "2h": 120,
     "4h": 240,
     "1d": 1440,
+    "7d": 10080,
 }
 
 
@@ -57,6 +58,15 @@ class HoldingWindowAdvisor:
             required_windows=("15m", "1h", "1d"),
             days=30,
         )
+        long_complete_all = self._proposal_ids(
+            grouped,
+            required_windows=("1h", "1d", "7d"),
+        )
+        long_complete_30 = self._proposal_ids(
+            grouped,
+            required_windows=("1h", "1d", "7d"),
+            days=30,
+        )
         recent_7 = self._proposal_ids(
             grouped,
             required_windows=("15m", "1h"),
@@ -77,6 +87,16 @@ class HoldingWindowAdvisor:
             grouped,
             recent_30,
             windows=("15m", "1h", "1d"),
+        )
+        long_all_stats = self._fixed_window_stats(
+            grouped,
+            long_complete_all,
+            windows=("1h", "1d", "7d"),
+        )
+        long_30_stats = self._fixed_window_stats(
+            grouped,
+            long_complete_30,
+            windows=("1h", "1d", "7d"),
         )
         recent_7_stats = self._fixed_window_stats(
             grouped,
@@ -112,11 +132,15 @@ class HoldingWindowAdvisor:
             "sample_counts": {
                 "complete_15m_1h_1d": len(complete_all),
                 "complete_15m_1h_1d_30d": len(recent_30),
+                "complete_1h_1d_7d": len(long_complete_all),
+                "complete_1h_1d_7d_30d": len(long_complete_30),
                 "complete_15m_1h_7d": len(recent_7),
                 "complete_15m_1h_1d_1d": len(recent_1),
             },
             "fixed_windows_all": all_window_stats,
             "fixed_windows_30d": recent_30_stats,
+            "fixed_windows_long_all": long_all_stats,
+            "fixed_windows_long_30d": long_30_stats,
             "fixed_windows_7d": recent_7_stats,
             "fixed_windows_1d": recent_1_stats,
             "best_window_counts_all": best_window_counts,
@@ -153,6 +177,7 @@ class HoldingWindowAdvisor:
                 "Samples: "
                 f"all={_as_dict(advice.get('sample_counts')).get('complete_15m_1h_1d', 0)}"
                 f" | 30d={_as_dict(advice.get('sample_counts')).get('complete_15m_1h_1d_30d', 0)}"
+                f" | 1h/1d/7d={_as_dict(advice.get('sample_counts')).get('complete_1h_1d_7d', 0)}"
                 f" | 7d={_as_dict(advice.get('sample_counts')).get('complete_15m_1h_7d', 0)}"
                 f" | 1d={_as_dict(advice.get('sample_counts')).get('complete_15m_1h_1d_1d', 0)}"
             ),
@@ -160,6 +185,11 @@ class HoldingWindowAdvisor:
         ]
         for window, metrics in _as_dict(advice.get("fixed_windows_all")).items():
             lines.append(f"- {window}: {self._metrics_text(metrics)}")
+
+        if int(_as_dict(advice.get("sample_counts")).get("complete_1h_1d_7d", 0) or 0) > 0:
+            lines.append("Extended checkpoints, all complete 1h/1d/7d proposals:")
+            for window, metrics in _as_dict(advice.get("fixed_windows_long_all")).items():
+                lines.append(f"- {window}: {self._metrics_text(metrics)}")
 
         lines.append("Fixed windows, recent 7d 15m/1h proposals:")
         for window, metrics in _as_dict(advice.get("fixed_windows_7d")).items():

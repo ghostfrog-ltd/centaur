@@ -6,10 +6,13 @@ from datetime import datetime
 from centaur.backfill import HistoricalBackfillRunner
 from centaur.config import load_runtime_config
 from centaur.control import ControlPipelineRunner
+from centaur.crypto_health_report import CryptoHealthReport
 from centaur.dashboard_snapshot import write_dashboard_snapshot
 from centaur.holding_window_advisor import HoldingWindowAdvisor
+from centaur.paper_exit_review import PaperExitReview
 from centaur.replay import HistoricalReplayRunner
 from centaur.status import StatusReporter
+from centaur.strategy_health_report import StrategyHealthReport
 from centaur.threshold_advisor import ThresholdAdvisor
 from centaur.usage import UsageLedger
 
@@ -59,6 +62,21 @@ def parse_args() -> argparse.Namespace:
         "--holding-window-advice",
         action="store_true",
         help="Run the recommendation-only adviser for strategy holding-window fitness.",
+    )
+    parser.add_argument(
+        "--paper-exit-review",
+        action="store_true",
+        help="Run a read-only post-mortem that compares paper exits to stored shadow checkpoints.",
+    )
+    parser.add_argument(
+        "--strategy-health",
+        action="store_true",
+        help="Run a read-only strategy health report that bundles paper P/L, exits, proposals, and signal flow.",
+    )
+    parser.add_argument(
+        "--crypto-health",
+        action="store_true",
+        help="Run a read-only crypto health report focused on overnight crypto scan activity and signal visibility.",
     )
     parser.add_argument(
         "--strategy-id",
@@ -153,6 +171,37 @@ def main() -> None:
         print(advisor.render(advice=advisor.build_advice(strategy_id=args.strategy_id)), flush=True)
         return
 
+    if args.paper_exit_review:
+        reviewer = PaperExitReview()
+        print(
+            reviewer.render(
+                review=reviewer.build_review(strategy_id=args.strategy_id)
+            ),
+            flush=True,
+        )
+        return
+
+    if args.strategy_health:
+        reporter = StrategyHealthReport()
+        print(
+            reporter.render(
+                report=reporter.build_report(strategy_id=args.strategy_id)
+            ),
+            flush=True,
+        )
+        return
+
+    if args.crypto_health:
+        reporter = CryptoHealthReport()
+        lookback_hours = max(1, args.days * 24) if args.days > 0 else 36
+        print(
+            reporter.render(
+                report=reporter.build_report(lookback_hours=lookback_hours)
+            ),
+            flush=True,
+        )
+        return
+
     if args.dashboard:
         from centaur.web_dashboard import run_web_dashboard
 
@@ -225,7 +274,8 @@ def main() -> None:
         )
         return
 
-    runner = ControlPipelineRunner()
+    config = load_runtime_config()
+    runner = ControlPipelineRunner(config=config)
 
     if args.loop:
         max_ticks = None if args.max_ticks <= 0 else args.max_ticks
@@ -238,10 +288,11 @@ def main() -> None:
     try:
         runner.run_tick()
     finally:
-        try:
-            write_dashboard_snapshot()
-        except Exception as exc:  # pragma: no cover - best-effort operator surface
-            print(f"Dashboard snapshot refresh failed: {exc}", flush=True)
+        if config.control_refresh_dashboard_snapshot:
+            try:
+                write_dashboard_snapshot()
+            except Exception as exc:  # pragma: no cover - best-effort operator surface
+                print(f"Dashboard snapshot refresh failed: {exc}", flush=True)
 
 
 def _parse_csv_argument(value: str) -> tuple[str, ...] | None:

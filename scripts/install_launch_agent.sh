@@ -25,6 +25,7 @@ echo "[$(date)] Wrapper starting..." >> "$LOGFILE"
 PROJECT_ROOT="/Volumes/Bob/www/ghostfrog-centaur"
 RUNTIME_DIR="$HOME/.centaur/runtime"
 PROJECT_LOG="$RUNTIME_DIR/control_tick.log"
+LOCK_DIR="/tmp/ghostfrog-centaur-control.lock"
 WAIT_RETRIES=30
 WAIT_SECONDS=2
 
@@ -90,6 +91,17 @@ cd "$PROJECT_ROOT" || {
 export PATH="/Library/Frameworks/Python.framework/Versions/Current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[$(date)] Skip: previous control tick is still running." >> "$LOGFILE"
+  exit 0
+fi
+
+cleanup() {
+  rmdir "$LOCK_DIR"
+}
+
+trap cleanup EXIT INT TERM
 
 echo "[$(date)] Found $TARGET, executing Centaur control tick with runtime log $PROJECT_LOG..." >> "$LOGFILE"
 set +e

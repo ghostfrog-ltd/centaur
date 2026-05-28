@@ -225,6 +225,10 @@ class ThresholdAdvisor:
             "hard_floor": hard_floor,
             "hard_ceiling": hard_ceiling,
             "band_width": round(band_width, 3),
+            "cliff_safety_gap": round(
+                max(0.0, float(self.config.strategy_threshold_adaptive_cliff_safety_gap)),
+                3,
+            ),
             "max_step": round(max_step, 3),
             "min_confidence": min_confidence,
             "cooldown_minutes": cooldown_minutes,
@@ -272,7 +276,10 @@ class ThresholdAdvisor:
             hard_floor=hard_floor,
             hard_ceiling=hard_ceiling,
             max_step=max_step,
-            safety_gap=max(0.05, band_width),
+            safety_gap=max(
+                0.0,
+                float(self.config.strategy_threshold_adaptive_cliff_safety_gap),
+            ),
         )
         result["cliff_governor"] = cliff_governor
         if cliff_governor.get("action") == "loosen":
@@ -687,7 +694,7 @@ class ThresholdAdvisor:
         proposal_viable = (
             paper_allowed
             and signal_score >= float(self.config.shadow_min_opportunity_score)
-            and target_return_pct >= float(self.config.paper_execution_min_projected_gain_pct)
+            and target_return_pct >= self._paper_min_projected_gain_pct(item)
         )
         return CandidateSignal(
             strategy_id=strategy_id,
@@ -700,6 +707,12 @@ class ThresholdAdvisor:
             paper_allowed=paper_allowed,
             proposal_viable=proposal_viable,
         )
+
+    def _paper_min_projected_gain_pct(self, item: dict[str, Any]) -> float:
+        asset_class = str(item.get("asset_class", "")).strip().lower()
+        if asset_class == "crypto":
+            return float(self.config.paper_execution_crypto_min_projected_gain_pct)
+        return float(self.config.paper_execution_min_projected_gain_pct)
 
     def _evaluate_gene(
         self,

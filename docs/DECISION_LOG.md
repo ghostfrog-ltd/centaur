@@ -2,7 +2,378 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-05-20
+Last updated: 2026-05-28
+
+## 2026-05-28
+
+### Potential breakthrough: treat paper as a micro system
+Decision:
+- record the 2026-05-28 operating hypothesis as a potential breakthrough, not a proven edge
+- evaluate the paper lane as `$10` micro entries with small exits and many repetitions
+- keep larger targets in shadow/counterfactual learning unless later evidence supports using them for real paper exits
+
+Why:
+- the operator clarified the intended model: "we only do big profit when we do big trades"
+- the system had been mixing a micro trade size with entry/exit behavior that often acted as though it needed larger-trade moves
+- once high-score near-miss entries were allowed and `1.25%` profit capture was active, the system resumed placing paper trades and showed visible small green P/L
+- the suspected failure mode is that hard fitness suppression and oversized exits had been preventing the micro edge from expressing itself
+
+Validation plan:
+- measure how often `1.25%` profit capture fires
+- compare average win, average loss, and stop-hit frequency
+- use the profit-target ladder to see whether `2%`, `3%`, `4%`, or `6%` would have hit after the actual small capture
+- do not raise notional, widen live execution, or remove stops based on this observation alone
+
+### Record profit-target ladder counterfactuals
+Decision:
+- record a shadow profit-target ladder for each evaluated checkpoint using `SHADOW_PROFIT_TARGET_LADDER_PCT=1.25,2,3,4,6`
+- keep the actual paper managed exit at `1.25%`
+- surface target-hit counts in the paper-exit review so the operator can see whether higher exits would have worked
+
+Why:
+- taking the small profit is the operating rule, but the system must learn whether waiting for `3%`, `4%`, or the old larger target would have been better
+- this gives that answer without risking open paper positions or changing broker behavior
+
+Implementation notes:
+- `evaluate_shadow_checkpoint()` now stores `profit_target_ladder` in `shadow_trade_outcomes.raw_json`
+- `PaperExitReview` now reads those ladder outcomes and reports `target_hits`
+
+### Add paper-only high-score near-miss override
+Decision:
+- by explicit human override, allow already approved paper strategies with raw `signal_score >= 90.0` to survive fitness suppression when their composite fitness is within `0.25` of the active suppress threshold
+- keep `$10` notional, one-order-per-tick, stop requirements, projected-gain floors, broker routing, the paper strategy allowlist, daily protection, and live execution unchanged
+- keep disallowed strategies blocked even when their signal score is high
+
+Why:
+- the current `$10` micro-trade plan is to take small paper entries and bank a `1.25%` profit capture, but the fitness gate was still vetoing high-scoring near misses before CFO could size them
+- on 2026-05-28, a `mean_reversion.snapback` signal scored `92` but was suppressed because fitness `-6.889` was only slightly below the active `-6.800` threshold
+- this treats fitness as a guardrail for near misses rather than a total veto when the current setup score is strong
+
+Implementation notes:
+- `PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_ENABLED=true`
+- `PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE=90.0`
+- `PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN=0.25`
+- the allocator records `allocation_status=high_score_override` and counts `high_score_overrides` for status visibility
+
+### Extend crypto paper exits to a 1d backstop
+Decision:
+- by explicit human override, change `crypto_momentum.trend` paper managed exits from the prior `60m` time exit to `profit_capture_else_1d`
+- keep the `1.25%` profit capture, existing stop loss, existing larger target, `$10` notional, Alpaca Paper routing, one-order-per-tick cap, strategy allowlist, daily protector, and live safe-off policy unchanged
+- allow crypto positions that hit neither stop, profit capture, nor target to remain open until a `1d` max-hold backstop
+
+Why:
+- the 2026-05-28 SOL trade exited slightly down with `holding_window_elapsed` after the old `60m` crypto window, even though the new operating theory is to take small wins but avoid forcing otherwise intact crypto trades out too early
+- if the stop is still valid and the position has not hit the profit capture, a `60m` forced exit can realize noise instead of giving the trade room under the defined risk plan
+- this aligns crypto with the same capital-preservation spirit as `mean_reversion.snapback`: bank profits when available, keep stops active, and use a finite `1d` backstop rather than an open-ended hold
+
+Implementation notes:
+- `_paper_managed_exit_policy()` now returns `profit_capture_else_1d` for `crypto_momentum.trend`
+- `_paper_exit_policy_holding_window_minutes()` and `_paper_max_hold_window_minutes()` now return `1440` minutes for `crypto_momentum.trend`
+- entry approval, notional, projected-gain floors, and live execution policy are unchanged
+
+### First profitability check: exits before entries
+Decision:
+- make exit-target and holding-window review the first profitability diagnosis when Centaur is not compounding
+- before loosening entries, suppress thresholds, strategy allowlists, discovery knobs, or broker behavior, inspect whether paper trades are giving back small meaningful wins because the configured target is too high or the hold is too long
+- use actual paper exits, `--paper-exit-review`, `--holding-window-advice`, and filled exit reasons to answer this before changing entry rules
+
+Why:
+- live crypto observation on 2026-05-28 showed AAVE was meaningfully up well before the old `~6%` crypto target
+- recent non-crypto `mean_reversion.snapback` review showed several cases where `15m` shadow outcomes were better than later outcomes
+- this means weak profitability can come from exit design even when entry scanning, broker routing, and CFO approval are functioning
+- changing entry thresholds first can admit weaker trades while leaving the real leak untouched
+
+Implementation notes:
+- the immediate runtime change from this diagnosis is the `1.25%` paper profit capture
+- the durable operating habit is broader: review exit realism first whenever paper P/L looks poor or idle trading is followed by small wins fading away
+- this note is intentionally prominent so future diagnostics start at the right layer
+
+### Add a 1.25 percent paper profit capture
+Decision:
+- by explicit human override, set `PAPER_EXECUTION_PROFIT_CAPTURE_PCT=0.0125`
+- allow paper managed exits for both equities and crypto to sell when the latest bar reaches `1.25%` above the filled/average entry reference
+- keep entry projected-gain floors unchanged: equities still require `1.5%` projected gain and crypto still requires `2.0%` projected gain before entry approval
+- preserve notional, stops, broker routing, strategy allowlists, slot caps, daily protection, and live execution policy
+
+Why:
+- operator review of the live crypto positions showed small meaningful gains, such as roughly `+1.15%` on AAVE, could appear well before the old `~6%` crypto target
+- recent non-crypto snapback review also showed evidence that some early positive moves later faded or stopped out
+- a `1.25%` capture is above the micro-friction floor and lets Centaur bank a meaningful `$10`-scale win without changing the entry gate into a lower-quality trade filter
+
+Implementation notes:
+- `RuntimeConfig` now exposes `paper_execution_profit_capture_pct`
+- `_build_exit_order_request()` checks the configured capture level before the larger strategy target
+- submitted exit audit payloads persist `planned_profit_capture_pct` and `planned_profit_capture_price`
+
+### Normalize crypto symbols for managed exits
+Decision:
+- normalize Alpaca crypto symbols in paper managed-exit lookups
+- allow slashless position symbols such as `AAVEUSD` and `SOLUSD` to match stored entry plans and latest bars keyed as `AAVE/USD` and `SOL/USD`
+- keep the existing crypto stop, target, and `60` minute time-exit policy unchanged
+
+Why:
+- live diagnosis found filled crypto paper positions were being reported by Alpaca without slashes while Centaur's entry plans and bars retained slash-separated symbols
+- the paper exit monitor therefore skipped at least one crypto position with `missing_entry_plan`
+- capital preservation requires managed exits to find their original stop/target/time plan reliably
+
+Implementation notes:
+- `_latest_bars_by_symbol()` now indexes both exact and normalized symbols
+- `_find_latest_managed_entry_order()` compares normalized symbols
+- paper and dormant live exit paths use normalized symbols when checking open exits and latest bars
+
+### Split paper crypto limit buffer to 25 bps
+Decision:
+- by explicit human override, add `PAPER_EXECUTION_CRYPTO_LIMIT_BUFFER_BPS=25.0` for paper crypto marketable-limit orders
+- keep the shared `PAPER_EXECUTION_LIMIT_BUFFER_BPS=5.0` for non-crypto paper orders
+- preserve `$10` notional, Alpaca Paper routing, one order per tick, slot caps, strategy allowlists, projected-gain floors, daily protection, and all live-execution gates
+
+Why:
+- same-day diagnosis found that Centaur approved and submitted three paper crypto IOC buy orders, but Alpaca Paper canceled each one with `filled_qty=0`
+- widening only the crypto limit buffer makes those IOC limits more marketable while keeping the actual order size and risk envelope unchanged
+- equities were not given this wider buffer because their current blocker is shadow-fitness suppression, not IOC fillability
+
+Implementation notes:
+- `RuntimeConfig` now exposes `paper_execution_crypto_limit_buffer_bps`
+- paper entry approval uses the crypto buffer only when `asset_class=crypto`; equities continue to use the shared buffer
+- paper managed exits also resolve the paper buffer by asset class, so any future crypto paper exit can use the crypto-specific marketable-limit buffer while live exits remain unchanged
+
+### Lower the crypto-only discovery floor to 2.5
+Decision:
+- by explicit human override, lower `CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE` from `4.5` to `2.5`
+- keep the rest of the crypto-specific lane unchanged: stop loss `3.0%`, target multiple `2.0`, min signal score `60`, min movement `0.15%`, min trade count `2`, crypto suppress threshold `-6.90`, and the crypto-specific projected-gain floor `2.0%`
+
+Why:
+- overnight diagnosis showed crypto was scanning normally across the widened `11`-pair universe and selecting candidates, but `strategy.signals` kept ending with `signals_generated=0` and `signals_suppressed=0`
+- that meant the crypto candidates were dying inside `crypto_momentum.trend` before suppression or CFO review
+- recent overnight top discovery scores around `1.3` to `3.0` were consistently below the prior `4.5` floor, so loosening the crypto discovery gate was the cleanest direct way to allow more candidates to reach actual signal generation
+
+Implementation notes:
+- `.env` and `.env.example` now expose `CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE=2.5`
+- no strategy code change was required because `crypto_momentum.trend` already reads that value from runtime config
+- this is a crypto-only entry-rule relaxation; it does not widen equity rules, notional, broker routing, or the paper/live risk envelope
+
+## 2026-05-27
+
+### Tighten the unattended cadence to thirty seconds with busy-skip locking
+Decision:
+- by explicit human override, change the unattended `launchd` interval from `60` seconds to `30` seconds
+- ensure the installed wrapper takes a lock and exits cleanly when a previous control tick is still running
+- keep dashboard snapshot refresh off the critical path so the faster scheduler is spending its time on trading, not UI work
+
+Why:
+- once the dashboard snapshot work was removed from the control path, the real trading pipeline was measuring around `22` to `25` seconds, which made a `30` second scheduler a reasonable next experiment
+- a faster schedule is only safe if overlapping launches do not stack, so the wrapper needs an explicit skip-if-busy guard
+- this change increases how often Centaur can look without widening order size, risk limits, or strategy allowlists
+
+Implementation notes:
+- `.env` and `.env.example` now set `CONTROL_TICK_INTERVAL_SECONDS=30`
+- `ops/com.ghostfrog.centaur.control.plist` now uses `StartInterval=30`
+- `scripts/install_launch_agent.sh` now installs a wrapper that creates a lock directory and skips if another tick is already running
+- the live launch agent must be reinstalled/restarted so the active wrapper and plist pick up the new cadence
+
+### Disable automatic dashboard snapshot refresh during headless trading
+Decision:
+- by explicit human override, disable automatic `var/dashboard_snapshot.json` refresh after each normal control tick in the current headless trading mode
+- keep `write_dashboard_snapshot()` and `scripts/dashboard_snapshot.py` available as manual or separately scheduled operator actions
+
+Why:
+- recent runtime investigation showed the trading pipeline itself was finishing in roughly `22` to `25` seconds, while the full process was taking much longer to exit
+- the post-tick snapshot path rebuilds a large `StatusReporter().snapshot()` payload and was the clearest non-trading candidate for stretching the effective cadence beyond the intended `60` seconds
+- when Centaur is simply being left to trade, operator-surface refresh should not block the control loop and risk missing faster opportunities
+
+Implementation notes:
+- `.env`, `.env.example`, and `RuntimeConfig` now expose `CONTROL_REFRESH_DASHBOARD_SNAPSHOT=false`
+- `main.py` now guards the `write_dashboard_snapshot()` call behind that config flag
+- the manual snapshot script remains in place for on-demand dashboard refreshes
+
+### Split the suppress threshold by asset class
+Decision:
+- by explicit human override, keep the existing adaptive suppress-threshold lane for equities
+- add a separate fixed crypto suppress threshold and loosen it to `STRATEGY_ALLOCATION_CRYPTO_SUPPRESS_THRESHOLD=-6.90`
+- keep the same `$10` notional, one-order-per-tick cap, broker routing, daily protector, and crypto-specific entry knobs
+
+Why:
+- crypto had gained its own entry filters and projected-gain floor, but it was still being judged against the same global suppress line as equities
+- overnight checks confirmed the widened crypto universe was live and fetching bars, but crypto still rarely surfaced and remained suppressed
+- after the split was added, the current `crypto_momentum.trend` fitness still sat around `-6.85`, so the first crypto-specific line at `-6.20` was still too strict to admit the current lane
+- loosening the crypto threshold to `-6.90` is the narrowest simple change that should let the current crypto fitness band survive without touching equity thresholds
+
+Implementation notes:
+- `.env`, `.env.example`, and `RuntimeConfig` now expose `STRATEGY_ALLOCATION_CRYPTO_SUPPRESS_THRESHOLD=-6.90`
+- the allocator now accepts per-asset-class suppress thresholds
+- equities still use the current adaptive effective threshold, while crypto now uses the fixed crypto-specific threshold
+- status/adaptive diagnostics now show the separate crypto suppress threshold so the split is visible to the operator
+
+### Add a single-command overnight crypto health report
+Decision:
+- add a read-only `main.py --crypto-health` command
+- make it summarize recent `crypto_only_window` ticks, crypto bar-fetch activity, raw-vs-suppressed crypto strategy visibility, selected overnight crypto candidate symbols, and the latest crypto fitness snapshot
+- keep it observability-only; it must not change runtime behavior or any paper/live policy
+
+Why:
+- the operator now needs a fast answer to "is Centaur actually seeing crypto overnight?" without repeating ad hoc PostgreSQL checks
+- overnight crypto questions are different from the broader strategy-health report because they depend on market-window behavior, bar fetches, candidate flow, and suppression patterns
+- a single command gives a stable operator workflow for checking whether widened crypto coverage is translating into real signal flow
+
+Implementation notes:
+- the report lives in `centaur/crypto_health_report.py`
+- it is exposed through `main.py --crypto-health`
+- it reports the configured crypto universe, recent overnight tick counts, crypto bar-fetch counts, raw/suppressed crypto preview symbol counts, selected overnight candidate symbols, and the latest crypto fitness rows
+
+### Widen the crypto universe from five to eleven USD pairs
+Decision:
+- by explicit human override, expand both the Alpaca crypto list and the live discovery list from `5` to `11` USD pairs
+- add `LTC/USD`, `BCH/USD`, `LINK/USD`, `AVAX/USD`, `UNI/USD`, and `AAVE/USD` to the existing `BTC/USD`, `ETH/USD`, `SOL/USD`, `XRP/USD`, and `DOGE/USD`
+- keep the same paper envelope: `$10` notional, `1` order per tick, the daily protector, broker routing, and the stricter crypto-specific knobs all stay unchanged
+
+Why:
+- the current crypto universe was genuinely capped at five pairs, which limits how many opportunities `crypto_momentum.trend` can even see
+- expanding the universe is a reasonable way to give crypto more chances without changing size or loosening risk gates
+- this should be treated as an opportunity-set expansion, not as proof that the current crypto strategy is suddenly good; its stored fitness still needs to improve
+
+Implementation notes:
+- `.env`, `.env.example`, and the runtime default in `centaur/config.py` now all list the same `11` USD pairs
+- the market scan and crypto bar-fetch paths already read `discovery_crypto_symbols`, so no new execution logic was needed
+- this change widens observability and candidate generation only; whether a crypto trade reaches paper execution still depends on fitness, projected-gain, and the existing CFO gate
+
+### Split crypto_momentum.trend onto its own conservative runtime knobs
+Decision:
+- by explicit human override, give `crypto_momentum.trend` its own config knobs instead of relying only on the shared shadow defaults
+- keep the shared paper envelope unchanged: `$10` notional, `1` order per tick, shared suppress-threshold rails, broker routing, and the `$5.00` daily protector all stay in place
+- add a crypto-specific paper projected-gain floor of `2.0%` while leaving the equity floor at `1.5%`
+
+Why:
+- crypto does not trade on the same market-hours rhythm or microstructure as the equity strategies, so it deserves its own entry-quality controls even if it remains under the same capital-preservation envelope
+- recent evidence showed `crypto_momentum.trend` was weak and fully suppressed, so the right first step is to make its lane configurable and conservative rather than silently loosening it
+- separate knobs let future tuning happen without distorting the equity strategy defaults
+
+Implementation notes:
+- `.env` now exposes `CRYPTO_MOMENTUM_STOP_LOSS_PCT=0.03`
+- `.env` now exposes `CRYPTO_MOMENTUM_TARGET_MULTIPLE=2.0`
+- `.env` now exposes `CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE=60.0`
+- `.env` now exposes `CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT=0.15`
+- `.env` now exposes `CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE=4.5`
+- `.env` now exposes `CRYPTO_MOMENTUM_MIN_TRADE_COUNT=2`
+- `.env` now exposes `PAPER_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT=0.02`
+- `crypto_momentum.trend` now reads those dedicated settings from `RuntimeConfig`
+- paper trade approval and the threshold adviser now both use the crypto-specific projected-gain floor for crypto proposals so observability and runtime approval stay aligned
+
+### Add a single-command strategy health report for operator diagnosis
+Decision:
+- add a read-only `main.py --strategy-health --strategy-id <strategy>` command
+- make it bundle actual paper P/L by strategy, recent closed-trade drift, exit-reason damage, proposal counts, signal visibility, the paper-exit post-mortem, and holding-window advice
+- keep it observability-only; it must not change runtime behavior or paper/live policy
+
+Why:
+- the operator kept needing the same cluster of answers: who actually made the money, whether `snapback` is weakening, whether exits are the problem, and whether other strategies are absent or suppressed
+- running several separate commands and ad hoc SQL checks is too fragile for routine use
+- a single deterministic report lowers the friction to diagnose future red stretches quickly and consistently
+
+Implementation notes:
+- the report lives in `centaur/strategy_health_report.py`
+- it is exposed through `main.py --strategy-health --strategy-id <strategy>`
+- the command reuses the existing paper-exit and holding-window advisers and adds direct ledger summaries for paper P/L, proposals, candidate signals, and recent tick-preview activity
+
+### Tighten the paper-only threshold rails after the recent red drift
+Decision:
+- by explicit human override, raise the fixed suppress threshold from `-5.70` to `-5.60`
+- raise the adaptive fallback floor from `-6.50` to `-6.40`
+- restore the adaptive cliff-governor safety gap from `0.05` to `0.10`
+- keep `$10` notional, broker routing, allowed strategies, projected-gain gate, stop loss, target logic, and managed exit policy unchanged
+
+Why:
+- recent paper weakness was driven more by weak newly admitted `mean_reversion.snapback` entries hitting stop loss than by obviously bad exit timing
+- the current weak tradeable cliff was clustering around composite fitness `-6.77`, which had only become admissible after the same-day relaxation to the `0.05` cliff gap
+- the operator wants Centaur to keep trading, but not by continuing to admit the weakest recent band
+
+Implementation notes:
+- `.env` now sets `STRATEGY_ALLOCATION_SUPPRESS_THRESHOLD=-5.60`
+- `.env` now sets `STRATEGY_THRESHOLD_ADAPTIVE_FLOOR=-6.40`
+- `.env` now sets `STRATEGY_THRESHOLD_ADAPTIVE_CEILING=-5.60` to keep the adaptive ceiling aligned with the fixed suppress threshold
+- `.env` now sets `STRATEGY_THRESHOLD_ADAPTIVE_CLIFF_SAFETY_GAP=0.10`
+- this is an entry-selection tightening only; it does not change exit timing or any paper/live capital rules
+
+### Add a default 7d shadow checkpoint for longer-hold post-mortems
+Decision:
+- extend the default shadow checkpoint trail from `15m,1h,1d` to `15m,1h,1d,7d`
+- surface the `7d` outcome in the read-only paper-exit post-mortem and holding-window advice outputs
+- keep this change observability-only; it must not alter live paper exits, notional, broker routing, or CFO approval rules
+
+Why:
+- the operator needs a durable answer to "what if we had held longer?" before changing exit policy
+- recent review showed that `1d` sometimes improves on `1h`, but that still does not tell us whether a longer recovery window would have helped
+- recording a default `7d` checkpoint gives that evidence without widening risk or silently changing behavior
+
+Implementation notes:
+- `.env` and the runtime default now include `SHADOW_CHECKPOINT_WINDOWS=15m,1h,1d,7d`
+- the shadow evaluator already supports day-based checkpoints, so this adds no new live execution path
+- status, the web dashboard summary, and `main.py --paper-exit-review` now surface the longer checkpoint when enough data exists
+
+### Reduce the adaptive cliff-governor safety gap to restart paper entries
+Decision:
+- by explicit human override, reduce the paper-only adaptive cliff-governor safety gap from `0.10` to `0.05`
+- keep the current `-6.50` fallback floor, `0.10` max step, `$10` notional, broker routing, strategy allowlist, projected-gain gate, and daily protector unchanged
+- leave the GA confidence gate and cooldown unchanged
+
+Why:
+- on 2026-05-26, live market-open ticks were still scanning the full equity universe and generating raw signals, but every current proposal-viable `mean_reversion.snapback` signal was being suppressed around composite fitness `-6.768817`
+- the cliff governor refused to loosen because the nearest blocked cliff was `-6.859063`, and the old `0.10` safety-gap rule required a minimum safe threshold of `-6.75`
+- reducing the gap to `0.05` is the narrowest policy relaxation that can admit the current allowed cliff without reopening the much weaker `-11` / `-12` momentum bands
+
+Implementation notes:
+- the adaptive controller now reads a dedicated `STRATEGY_THRESHOLD_ADAPTIVE_CLIFF_SAFETY_GAP` setting instead of implicitly tying the cliff-governor gap to the local band width
+- the configured value on this Mac is now `0.05`
+- status output now shows the active cliff-gap setting alongside the other adaptive-threshold rails
+
+## 2026-05-26
+
+### Replace the blunt 1h paper exit for mean_reversion.snapback
+Decision:
+- by explicit human override, replace the old `holding_window_elapsed` paper exit for `mean_reversion.snapback`
+- keep the current stop-loss and target logic unchanged
+- allow profitable positions to exit after `1` hour
+- allow non-profitable positions to continue until the `1d` max-hold backstop
+
+Why:
+- dumping purely because one hour elapsed is too blunt and was no longer trusted
+- recent review suggested the old `1h` timeout was not clearly defensible as the main exit reason
+- this changes only managed exit timing for one already-allowed paper strategy; it does not widen notional, broker routing, or entry approval rules
+
+Implementation notes:
+- the managed paper exit plan is now persisted as `profit_after_1h_else_1d` for new `mean_reversion.snapback` entries
+- status and the web dashboard now show the active managed-exit policy for open positions
+- the one-day backstop remains in place, so this is not an open-ended hold override
+
+### Refresh stale managed paper exits
+Decision:
+- allow paper managed exits to cancel and replace an open sell exit when its limit is no longer marketable or has gone stale
+- persist the cancellation and replacement in the paper-order audit trail
+
+Why:
+- an old sell limit can hold the fractional quantity and cause the exit monitor to skip with `exit_order_already_open`
+- if price moves below that sell limit, the order no longer gets us out of the position
+- capital preservation needs the managed exit to keep trying with a fresh marketable limit rather than silently waiting
+
+Implementation notes:
+- this applies to paper sell exits only
+- it does not change entry approvals, notional, broker routing, stop/target rules, or live activation
+- status now reports refreshed exit count in the trade diagnostics path
+
+### Add a repeatable paper-exit post-mortem command
+Decision:
+- add an on-demand CLI review that compares actual paper exits with stored `15m` / `1h` / `1d` shadow outcomes for the same proposal ids
+- keep the review read-only and recommendation-only
+- reuse the existing `--strategy-id` selector so the same operator flow works for any strategy with enough history
+
+Why:
+- recent exit-quality review was useful, but ad hoc SQL is too fragile for normal operations
+- the operator needs a deterministic way to separate entry quality, exit timing, and execution drift
+- exit review should be easy to rerun without changing live paper behavior or widening risk
+
+Implementation notes:
+- `python3 main.py --paper-exit-review --strategy-id mean_reversion.snapback` now renders recent and all-time summaries plus recent example trades
+- the review joins filled paper entries, the latest persisted paper exit per proposal, and stored shadow checkpoint returns
+- this is observability and learning only; it does not alter the current `1h` managed paper exit rule
 
 ## 2026-05-20
 

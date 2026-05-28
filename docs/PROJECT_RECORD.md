@@ -4,7 +4,7 @@ This file is the durable, chat-independent record of what Project Centaur is, wh
 
 If future conversations lose context, this file should be treated as the first place to recover project intent.
 
-Last updated: 2026-05-07
+Last updated: 2026-05-27
 
 ## Purpose
 Project Centaur is a trading research and automation system aimed at growing capital safely, legally, and repeatably through trading.
@@ -40,11 +40,12 @@ The project exists for three reasons:
 - Runtime model: pipeline-first control flow, designed to map cleanly to LangGraph
 
 ## Current Reality
-As of 2026-05-01, Centaur is primarily a training and evaluation system with an active micro paper-execution path and a scaffold-only Alpaca Live readiness lane.
+As of 2026-05-27, Centaur is primarily a training and evaluation system with an active micro paper-execution path, a scaffold-only Alpaca Live readiness lane, and a headless unattended `launchd` cadence currently targeted at `30` second starts with skip-if-busy wrapper protection.
 
 It can:
 - run a control tick manually and via a verified `launchd` wrapper on this Mac
 - show a one-shot status summary via `.venv-mac/bin/python main.py --status`
+- run a repeatable paper-exit post-mortem via `.venv-mac/bin/python main.py --paper-exit-review --strategy-id mean_reversion.snapback`
 - fetch Alpaca paper account, clock, positions, recent orders, and latest bars
 - collect stock and crypto market data
 - continue collecting crypto and generating crypto shadow proposals outside US equity hours
@@ -77,6 +78,9 @@ Each `launchd` tick currently does this:
 5. Evaluate older shadow checkpoints that are now due.
 6. Recompute strategy fitness from accumulated outcomes.
 7. Discover current candidates from the latest market data.
+
+Current default crypto universe:
+- crypto: `BTC/USD`, `ETH/USD`, `SOL/USD`, `XRP/USD`, `DOGE/USD`, `LTC/USD`, `BCH/USD`, `LINK/USD`, `AVAX/USD`, `UNI/USD`, `AAVE/USD`
 8. Run deterministic strategy profiles on those candidates.
 9. Optionally run Gemini analysis as commentary support when it is enabled; otherwise skip it and stay function-only.
 10. Create new shadow proposals from strategy signals.
@@ -95,8 +99,17 @@ Current micro paper mode rules:
 - one order max per tick
 - default size is `$10`
 - allowed strategies are currently `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`
-- projected gain must be at least `1.5%`
+- projected gain must be at least `1.5%` for equities and `2.0%` for crypto
 - paper entries and exits use marketable limit orders rather than raw market orders
+- already allowed paper strategies may use a high-score near-miss override when raw `signal_score >= 90.0` and composite fitness is within `0.25` of the active suppress threshold; this does not change notional, stops, projected-gain floors, broker routing, max orders, or live execution
+- paper managed exits may capture profit at `1.25%` for both equity and crypto positions while preserving the higher entry projected-gain gates
+- shadow outcomes record a profit-target ladder of `1.25%`, `2%`, `3%`, `4%`, and `6%` so the project can learn whether waiting for higher exits would have worked without changing the actual paper capture rule
+- `crypto_momentum.trend` paper exits use `profit_capture_else_1d`: stop, `1.25%` capture, and target remain active, with a finite `1d` max-hold backstop instead of the old `60m` forced time exit
+- non-crypto paper orders use a `5` bps marketable-limit buffer, while paper crypto orders use a separate `25` bps buffer by explicit human override on 2026-05-28
+- crypto managed exits normalize Alpaca symbols with and without slashes so positions such as `AAVEUSD` match entry plans and bars stored as `AAVE/USD`
+- `mean_reversion.snapback` paper exits now use an explicit override: profitable positions may exit after `1` hour, while non-profitable positions continue under the same stop/target protection until a `1d` max-hold backstop
+- equities now use the paper-only adaptive suppress-threshold lane anchored at `-5.60`, while crypto uses its own fixed suppress threshold `-6.90`
+- the adaptive paper-only cliff governor now uses a dedicated `0.10` safety gap by explicit human override on 2026-05-27 so weak `mean_reversion.snapback` cliffs near `-6.77` are blocked again
 - new paper entries are disabled for the session once the persisted equity drawdown reaches `$5.00`
 - untouched equity entry limits older than `5` minutes are canceled by the in-pipeline stale-order reaper
 - orders are logged into `paper_trade_orders`
@@ -106,9 +119,23 @@ Current micro paper mode rules:
 - Alpaca Live is scaffold-only and cannot submit/cancel real-money orders
 - IG is scaffold-only for now and is not active in live execution
 
+First profitability check:
+- when Centaur is not making profit, first check whether exits are too ambitious before changing entry logic
+- for `$10` micro trades, a large percentage target can be unrealistic even when the dollar value looks small
+- review whether trades were briefly up by a meaningful amount before later going flat or red
+- use `--paper-exit-review`, `--holding-window-advice`, recent filled exit reasons, and shadow windows before loosening thresholds or widening risk
+- the 2026-05-28 operating lesson is that the system may fail to compound because it waits for oversized exits, not because it needs weaker entries
+
+Potential micro-edge breakthrough:
+- Centaur's current paper lane should be judged as a micro system: `$10` entries, small profit capture, repeated attempts, and strict loss control
+- big percentage targets belong to bigger trades, longer holds, or shadow learning; they should not be assumed suitable for `$10` paper scalps
+- on 2026-05-28, after adding the paper-only high-score near-miss override and setting the real paper capture to `1.25%`, Centaur immediately began placing more intended micro trades and showed multiple small green positions
+- the working hypothesis is that a hard fitness veto plus oversized targets had been suppressing or wasting the micro edge
+- this is not treated as proof yet; validate it through win rate, average win/loss, stop frequency, profit-capture frequency, and shadow target-ladder results before increasing risk
+
 Current discovery universe:
 - equities: full Nasdaq-100 constituent list
-- crypto: `BTC/USD`, `ETH/USD`, `SOL/USD`, `XRP/USD`, `DOGE/USD`
+- crypto: `BTC/USD`, `ETH/USD`, `SOL/USD`, `XRP/USD`, `DOGE/USD`, `LTC/USD`, `BCH/USD`, `LINK/USD`, `AVAX/USD`, `UNI/USD`, `AAVE/USD`
 
 Current shadow-learning strategy set includes:
 - `momentum.balanced`
@@ -134,6 +161,7 @@ Operational visibility now also includes:
 - `scripts/centaur-agent.sh status` for launch agent details, tail logs, and the same summary
 - `scripts/centaur-agent.sh dashboard` as a convenience launcher for the DDEV-routed dashboard
 - explicit paper-execution alerts in status and dashboard output so broker failures are visible with reasons
+- a read-only paper-exit post-mortem command that compares actual paper exits to stored `15m`, `1h`, and `1d` shadow outcomes for the same proposal ids
 - strategy-coverage graphs so newly installed strategies can be seen even before they have fitness rows
 - a ranked strategy leaderboard that orders all strategies by current best fitness and explains, in plain English, why the current leader is on top
 - separate recent-window strategy counts from all-time training volume so the dashboard does not understate replay sample size
@@ -156,7 +184,7 @@ Operational visibility now also includes:
 - the recent-activity panel is also temporarily disabled there, leaving a very minimal core monitor view
 - the dashboard now also uses a lighter snapshot path and reuses that same snapshot for its rendered summary, instead of taking a second full status snapshot every refresh
 - the primary operator dashboard surface is now the DDEV/OrbStack-routed web app rather than the Tk window
-- each host control tick now refreshes `var/dashboard_snapshot.json` from the same `StatusReporter` snapshot, and the DDEV dashboard serves that file through its `/api/snapshot.php` route
+- the DDEV dashboard still reads `var/dashboard_snapshot.json` through its `/api/snapshot.php` route, but automatic refresh after each control tick is currently disabled in headless trading mode so dashboard work does not slow the trade loop; snapshot generation remains available as a separate manual operator action
 
 For this Mac-hosted setup, operations data should now be treated as `Postgres only`.
 SQLite remains in the repo only as legacy bootstrap/fallback scaffolding and should not be relied on for live monitoring or scheduler-backed operation.
@@ -235,6 +263,8 @@ Later on 2026-05-18, after explicit human approval, the adaptive controller's ab
 Also on 2026-05-18, Centaur gained a recommendation-only holding-window fitness adviser. It compares `mean_reversion.snapback` fixed-window outcomes at `15m`, `1h`, and `1d`, plus simple dynamic policies such as selling profitable `1h` trades and extending losing `1h` trades to the `1d` checkpoint. The adviser is visible through `main.py --holding-window-advice`, status output, and dashboard snapshots. It does not change managed exits automatically; changing the current `1h` paper exit rule still requires a separate explicit override and decision update.
 
 On 2026-05-19, Centaur gained a current-tick cliff governor for the adaptive threshold controller. Before allocation, the pipeline now annotates the current raw strategy signals with their fitness scores, then the governor compares the nearest paper-allowed, proposal-viable cliff against the nearest blocked or disallowed cliff. It may step below the configured `-6.50` fallback floor only when a clean safety gap remains, only by the configured max step, and only far enough to admit the allowed cliff. This is intended to remove the daily manual-threshold problem without admitting weak liquidity-probe or momentum bands. It still does not change `$10` notional, Alpaca Paper routing, live execution, strategy allowlists, max slots, market-hours, projected-gain, stale-order, daily-protection, or long-only rules.
+
+On 2026-05-27, after a new flatline with healthy scans but no surviving paper-allowed signals, an explicit human override reduced that cliff-governor safety gap from `0.10` to `0.05`. The narrow goal was to admit the current `mean_reversion.snapback` cliff around `-6.768817` without reopening the blocked `-6.859063` liquidity-probe band. The fallback floor, max step, `$10` notional, broker routing, strategy allowlist, projected-gain gate, and daily protector were all left unchanged.
 
 On 2026-05-20, the Alpaca Live lane moved from pure scaffold to a dormant side-by-side follower path. It is still off by default and API keys alone are deliberately insufficient. The live lane can only consider trades that the paper CFO gate approved on the same tick, then it applies separate live account state, live daily-loss, live slot, live allowlist, kill-switch, activation acknowledgement, and broker-validation gates before any entry order submission. A dormant live managed-exit step also uses the same persisted entry plan fields as paper for future stop/target/holding-window exits. This prepares a future go-live review without changing the current paper-only operating posture.
 

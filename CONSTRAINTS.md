@@ -36,7 +36,7 @@ Current paper approval rules from the live code:
 - valid entry price
 - valid stop loss
 - valid target above entry
-- projected gain must be at least `1.5%` of entry price
+- projected gain must be at least `1.5%` of entry price for equities and `2.0%` for crypto
 - daily equity drawdown must remain under the configured `$5.00` protector
 - notional is exactly the configured micro size, currently `$10`
 - the selected broker adapter must be able to build the order without widening size or leverage
@@ -59,6 +59,11 @@ Current paper approval rules from the live code:
 - Exit management: internal managed exits
 - Fractional equities use `DAY` limit orders because Alpaca does not support `IOC` for fractional equity orders
 - Crypto entries and exits may use `IOC` limit orders
+- By explicit human override on 2026-05-28, paper crypto marketable-limit orders use a separate `25` bps buffer via `PAPER_EXECUTION_CRYPTO_LIMIT_BUFFER_BPS=25.0`; equities keep the shared `PAPER_EXECUTION_LIMIT_BUFFER_BPS=5.0`, and notional, broker routing, strategy allowlist, projected-gain floors, max orders, slots, daily protector, and live execution remain unchanged
+- By explicit human override on 2026-05-28, paper managed exits may capture profit at `1.25%` via `PAPER_EXECUTION_PROFIT_CAPTURE_PCT=0.0125` for both equity and crypto positions; this does not lower the paper entry projected-gain floors or change notional, broker routing, stops, strategy allowlist, slot caps, or live execution
+- Shadow outcomes must record the profit-target ladder configured by `SHADOW_PROFIT_TARGET_LADDER_PCT` so Centaur can learn whether waiting for `2%`, `3%`, `4%`, or `6%` would have worked while still taking the live paper `1.25%` capture
+- By explicit human override on 2026-05-28, `crypto_momentum.trend` paper managed exits now use `profit_capture_else_1d`: stop loss, profit capture, and target remain active, and positions that hit none of those may hold until a `1d` max-hold backstop instead of being forced out after `60` minutes
+- By explicit human override on 2026-05-28, paper allocation may override a near-miss fitness suppression only for already allowed paper strategies when the raw signal score is at least `90.0` and composite fitness is within `0.25` of the active suppress threshold; this remains paper-only and does not change notional, stops, projected-gain floors, broker routing, max orders, strategy allowlist, daily protector, or live execution
 - Daily equity drawdown protector: `$5.00`
 - Stale unfilled equity entry orders are reaped after `5` minutes
 - Max orders per tick: `1`
@@ -68,15 +73,25 @@ Current paper approval rules from the live code:
 - Default notional: `$10`
 - Allowed paper strategies at time of writing: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`
 - Asset classes currently allowed for paper execution: equities and crypto
-- Strategy-allocation suppress threshold in `.env`: `-5.70`; last manually lowered by explicit human override on 2026-05-11
+- By explicit human override on 2026-05-28, `crypto_momentum.trend` keeps its crypto-only runtime knobs but lowers `CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE` from `4.5` to `2.5` so overnight crypto candidates with decent movement can qualify for signal generation more often; stop loss stays `3.0%`, target multiple `2.0`, min signal score `60`, min movement `0.15%`, min trade count `2`, and the crypto-specific paper projected-gain floor stays `2.0%`
+- By explicit human override on 2026-05-27, the crypto discovery universe was widened from `5` to `11` USD pairs: `BTC/USD`, `ETH/USD`, `SOL/USD`, `XRP/USD`, `DOGE/USD`, `LTC/USD`, `BCH/USD`, `LINK/USD`, `AVAX/USD`, `UNI/USD`, and `AAVE/USD`, while keeping the same `$10` notional, one-order-per-tick cap, broker routing, and stricter crypto entry knobs
+- Strategy-allocation suppress threshold in `.env`: `-5.60`; last manually tightened by explicit human override on 2026-05-27 to reduce weak `mean_reversion.snapback` entries while keeping paper execution active
+- By explicit human override on 2026-05-27, crypto now has its own fixed suppress threshold of `-6.90` via `STRATEGY_ALLOCATION_CRYPTO_SUPPRESS_THRESHOLD`, while equities continue to use the existing paper-only adaptive suppress threshold rails
 - Adaptive paper-only strategy threshold controller: enabled by explicit human override on 2026-05-13
-- Adaptive controller rails: the default effective threshold may move from `-5.70` down to the configured fallback floor `-6.50`, at no more than `0.10` per adjustment, with at least `medium` GA confidence, at least `120` evidence ticks, and a `30` minute cooldown
-- Adaptive cliff governor: when the current tick has a clean paper-allowed, proposal-viable strategy cliff just below the configured fallback floor, the controller may step below `-6.50` only far enough to admit that allowed cliff, only by the configured max step, and only if the nearest blocked/disallowed cliff remains at least `0.10` lower
+- Adaptive controller rails: the default effective threshold may move from `-5.60` down to the configured fallback floor `-6.40`, at no more than `0.10` per adjustment, with at least `medium` GA confidence, at least `120` evidence ticks, and a `30` minute cooldown
+- By explicit human override on 2026-05-27, the adaptive cliff-governor safety gap was restored from `0.05` to `0.10`, the fixed suppress threshold was tightened to `-5.60`, and the fallback floor was tightened to `-6.40` so paper stays active but the recent weak `mean_reversion.snapback` cliff near `-6.77` is no longer admitted
+- Adaptive cliff governor: when the current tick has a clean paper-allowed, proposal-viable strategy cliff just below the configured fallback floor, the controller may step below `-6.40` only far enough to admit that allowed cliff, only by the configured max step, and only if the nearest blocked/disallowed cliff remains at least the configured `0.10` safety gap lower
 - Adaptive controller band: the trade-aware GA tracks a local cliff band of `+/-0.10` around the current recommended threshold, while the cliff governor prevents chasing very weak `-11`/`-12` style signals and keeps the current `-6.86` liquidity-probe band blocked
 - Adaptive catch-up: when the GA has already met the confidence/evidence gates and is moving toward the same tradeable local cliff with no non-tradeable survivors, it may continue taking `0.10` catch-up steps without waiting for the cooldown; the configured fallback floor still applies unless the current-tick cliff governor has a clean allowed-vs-blocked safety gap
 - Adaptive controller state is persisted in PostgreSQL and must not mutate `.env`, notional, broker routing, live readiness, max slots, projected-gain, daily-protection, stale-order, market-hours, long-only, or strategy-allowlist policy
+- The adaptive controller remains the equity suppress-threshold controller; it does not mutate the separate fixed crypto suppress threshold
 - GA threshold advice outside those adaptive rails remains recommendation-only and must not change paper/live execution policy without a separate explicit human override
-- Holding-window fitness advice is recommendation-only; it may compare `15m`, `1h`, `1d`, and simple dynamic policies from shadow outcomes, but it must not change managed paper exits without a separate explicit human override
+- Holding-window fitness advice is recommendation-only; it may compare `15m`, `1h`, `1d`, `7d`, and simple dynamic policies from shadow outcomes, but it must not change managed paper exits without a separate explicit human override
+- By explicit human override on 2026-05-26, `mean_reversion.snapback` paper managed exits now use `profit_after_1h_else_1d`: stop loss and target remain active as before, profitable positions may be sold after `1` hour, and non-profitable positions may continue until the `1d` max-hold backstop
+- Open paper sell exits may be canceled and refreshed when the limit is no longer marketable or has gone stale, so a protective/managed exit cannot silently strand a losing position behind an old unfilled limit
+- Paper managed exits normalize Alpaca crypto symbols with and without slashes, e.g. `AAVEUSD` positions can match `AAVE/USD` entry plans and bars, so crypto stop/target/time exits are not skipped as `missing_entry_plan`
+- By explicit human override on 2026-05-27, automatic `var/dashboard_snapshot.json` refresh after each control tick is disabled in the current headless trading mode; snapshot generation remains available as a separate manual operator action and must not slow the trade loop
+- By explicit human override on 2026-05-27, the unattended `launchd` schedule is tightened from `60` seconds to `30` seconds, with a wrapper-level lock so overlapping launches skip cleanly instead of stacking
 
 ## Current Live Execution Lane
 - Alpaca Live broker id: `alpaca_live`

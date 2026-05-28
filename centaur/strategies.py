@@ -543,14 +543,17 @@ class CryptoMomentumStrategy(StrategyDefinition):
                 asset_classes=("crypto",),
                 holding_window_code="1h",
                 holding_window_minutes=_window_code_to_minutes("1h"),
-                stop_loss_pct=max(config.shadow_stop_loss_pct * 1.5, 0.02),
-                target_multiple=max(config.shadow_target_multiple, 2.0),
+                stop_loss_pct=max(float(config.crypto_momentum_stop_loss_pct), 0.02),
+                target_multiple=max(float(config.crypto_momentum_target_multiple), 1.5),
                 max_signals_per_tick=2,
-                min_signal_score=max(58.0, config.shadow_min_opportunity_score),
+                min_signal_score=max(
+                    float(config.crypto_momentum_min_signal_score),
+                    config.shadow_min_opportunity_score,
+                ),
                 parameters={
-                    "min_movement_pct": 0.12,
-                    "min_discovery_score": 4.0,
-                    "min_trade_count": 1,
+                    "min_movement_pct": float(config.crypto_momentum_min_movement_pct),
+                    "min_discovery_score": float(config.crypto_momentum_min_discovery_score),
+                    "min_trade_count": max(1, int(config.crypto_momentum_min_trade_count)),
                 },
             )
         ]

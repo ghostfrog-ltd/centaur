@@ -401,12 +401,13 @@ def _positions_table(rows: list[Any]) -> str:
             f"<td>{_fmt_signed_currency(row.get('unrealized_pl_usd'))} {_fmt_signed_pct(row.get('unrealized_pl_pct'))}</td>"
             f"<td>{_fmt_currency(row.get('stop_loss_price'), 4)}</td>"
             f"<td>{_fmt_currency(row.get('target_price'), 4)}</td>"
+            f"<td>{_html(str(row.get('managed_exit_policy', '-') or '-'))}</td>"
             f"<td>{_html(str(row.get('exit_state', '-') or '-'))}</td>"
             "</tr>"
         )
     return (
         "<table><thead><tr>"
-        "<th>Symbol</th><th>Qty</th><th>Value</th><th>Entry</th><th>Current</th><th>Unrealized</th><th>Stop</th><th>Target</th><th>Exit</th>"
+        "<th>Symbol</th><th>Qty</th><th>Value</th><th>Entry</th><th>Current</th><th>Unrealized</th><th>Stop</th><th>Target</th><th>Policy</th><th>Exit</th>"
         "</tr></thead><tbody>"
         + "".join(body)
         + "</tbody></table>"
@@ -541,9 +542,10 @@ def _render_holding_window_summary(advice: dict[str, Any]) -> list[str]:
     recommendation = _as_dict(advice.get("recommendation"))
     sample_counts = _as_dict(advice.get("sample_counts"))
     fixed_all = _as_dict(advice.get("fixed_windows_all"))
+    fixed_long_all = _as_dict(advice.get("fixed_windows_long_all"))
     fixed_7d = _as_dict(advice.get("fixed_windows_7d"))
     policy_all = _as_dict(advice.get("policy_stats_all"))
-    return [
+    rows = [
         (
             f"strategy={advice.get('strategy_id', '-')}"
             f" | current={advice.get('current_window', '-')}"
@@ -555,6 +557,7 @@ def _render_holding_window_summary(advice: dict[str, Any]) -> list[str]:
             "samples"
             f" | all={sample_counts.get('complete_15m_1h_1d', 0)}"
             f" | 30d={sample_counts.get('complete_15m_1h_1d_30d', 0)}"
+            f" | 1h/1d/7d={sample_counts.get('complete_1h_1d_7d', 0)}"
             f" | 7d={sample_counts.get('complete_15m_1h_7d', 0)}"
         ),
         (
@@ -571,6 +574,17 @@ def _render_holding_window_summary(advice: dict[str, Any]) -> list[str]:
         f"dynamic | 1h_profit_else_1d {_holding_metric_text(_as_dict(policy_all.get('take_1h_profit_else_1d')))}",
         str(recommendation.get("reason", "-")),
     ]
+    if int(sample_counts.get("complete_1h_1d_7d", 0) or 0) > 0:
+        rows.insert(
+            4,
+            (
+                "long hold"
+                f" | 1h {_holding_metric_text(_as_dict(fixed_long_all.get('1h')))}"
+                f" | 1d {_holding_metric_text(_as_dict(fixed_long_all.get('1d')))}"
+                f" | 7d {_holding_metric_text(_as_dict(fixed_long_all.get('7d')))}"
+            ),
+        )
+    return rows
 
 
 def _holding_metric_text(metrics: dict[str, Any]) -> str:

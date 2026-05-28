@@ -16,7 +16,10 @@ DEFAULT_NASDAQ_100_SYMBOLS = (
     "PDD,PEP,PLTR,PYPL,QCOM,REGN,ROP,ROST,SBUX,SHOP,SNPS,STX,TEAM,TMUS,TRI,"
     "TSLA,TTWO,TXN,VRSK,VRTX,WBD,WDAY,WDC,WMT,XEL,ZS"
 )
-DEFAULT_DISCOVERY_CRYPTO_SYMBOLS = "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD"
+DEFAULT_DISCOVERY_CRYPTO_SYMBOLS = (
+    "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD,"
+    "LTC/USD,BCH/USD,LINK/USD,AVAX/USD,UNI/USD,AAVE/USD"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +39,7 @@ class RuntimeConfig:
     control_tick_interval_seconds: int
     control_max_tick_runtime_seconds: int
     control_enable_profiling: bool
+    control_refresh_dashboard_snapshot: bool
     control_lock_name: str
     operations_db_backend_preference: str
     usage_ledger_db_path: Path
@@ -79,7 +83,14 @@ class RuntimeConfig:
     shadow_min_opportunity_score: float
     shadow_stop_loss_pct: float
     shadow_target_multiple: float
+    crypto_momentum_stop_loss_pct: float
+    crypto_momentum_target_multiple: float
+    crypto_momentum_min_signal_score: float
+    crypto_momentum_min_movement_pct: float
+    crypto_momentum_min_discovery_score: float
+    crypto_momentum_min_trade_count: int
     shadow_checkpoint_windows: tuple[str, ...]
+    shadow_profit_target_ladder_pct: tuple[float, ...]
     shadow_execution_spread_bps: float
     shadow_entry_slippage_bps: float
     shadow_exit_slippage_bps: float
@@ -89,10 +100,12 @@ class RuntimeConfig:
     strategy_allocation_min_checkpoints: int
     strategy_allocation_favor_threshold: float
     strategy_allocation_suppress_threshold: float
+    strategy_allocation_crypto_suppress_threshold: float
     strategy_threshold_adaptive_enabled: bool
     strategy_threshold_adaptive_floor: float
     strategy_threshold_adaptive_ceiling: float
     strategy_threshold_adaptive_band_width: float
+    strategy_threshold_adaptive_cliff_safety_gap: float
     strategy_threshold_adaptive_max_step: float
     strategy_threshold_adaptive_min_confidence: str
     strategy_threshold_adaptive_cooldown_minutes: int
@@ -107,7 +120,13 @@ class RuntimeConfig:
     paper_execution_max_daily_drawdown_usd: float
     paper_execution_stale_order_minutes: int
     paper_execution_min_projected_gain_pct: float
+    paper_execution_crypto_min_projected_gain_pct: float
+    paper_execution_profit_capture_pct: float
     paper_execution_limit_buffer_bps: float
+    paper_execution_crypto_limit_buffer_bps: float
+    paper_execution_high_score_override_enabled: bool
+    paper_execution_high_score_override_min_score: float
+    paper_execution_high_score_override_fitness_margin: float
     paper_execution_equity_broker_id: str
     paper_execution_crypto_broker_id: str
     paper_execution_allowed_strategies: tuple[str, ...]
@@ -166,6 +185,10 @@ def load_runtime_config() -> RuntimeConfig:
         control_enable_profiling=_parse_bool(
             os.getenv("CONTROL_ENABLE_PROFILING"),
             default=True,
+        ),
+        control_refresh_dashboard_snapshot=_parse_bool(
+            os.getenv("CONTROL_REFRESH_DASHBOARD_SNAPSHOT"),
+            default=False,
         ),
         control_lock_name=os.getenv("CONTROL_LOCK_NAME", "centaur_control_tick"),
         operations_db_backend_preference=_normalize_backend_preference(
@@ -306,8 +329,36 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("SHADOW_TARGET_MULTIPLE"),
             default=2.0,
         ),
+        crypto_momentum_stop_loss_pct=_parse_float(
+            os.getenv("CRYPTO_MOMENTUM_STOP_LOSS_PCT"),
+            default=0.03,
+        ),
+        crypto_momentum_target_multiple=_parse_float(
+            os.getenv("CRYPTO_MOMENTUM_TARGET_MULTIPLE"),
+            default=2.0,
+        ),
+        crypto_momentum_min_signal_score=_parse_float(
+            os.getenv("CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE"),
+            default=60.0,
+        ),
+        crypto_momentum_min_movement_pct=_parse_float(
+            os.getenv("CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT"),
+            default=0.15,
+        ),
+        crypto_momentum_min_discovery_score=_parse_float(
+            os.getenv("CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE"),
+            default=4.5,
+        ),
+        crypto_momentum_min_trade_count=_parse_int(
+            os.getenv("CRYPTO_MOMENTUM_MIN_TRADE_COUNT"),
+            default=2,
+        ),
         shadow_checkpoint_windows=_parse_shadow_windows(
-            os.getenv("SHADOW_CHECKPOINT_WINDOWS", "15m,1h,1d")
+            os.getenv("SHADOW_CHECKPOINT_WINDOWS", "15m,1h,1d,7d")
+        ),
+        shadow_profit_target_ladder_pct=_parse_float_csv(
+            os.getenv("SHADOW_PROFIT_TARGET_LADDER_PCT"),
+            default=(1.25, 2.0, 3.0, 4.0, 6.0),
         ),
         shadow_execution_spread_bps=_parse_float(
             os.getenv("SHADOW_EXECUTION_SPREAD_BPS"),
@@ -345,6 +396,10 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("STRATEGY_ALLOCATION_SUPPRESS_THRESHOLD"),
             default=-5.0,
         ),
+        strategy_allocation_crypto_suppress_threshold=_parse_float(
+            os.getenv("STRATEGY_ALLOCATION_CRYPTO_SUPPRESS_THRESHOLD"),
+            default=-6.2,
+        ),
         strategy_threshold_adaptive_enabled=_parse_bool(
             os.getenv("STRATEGY_THRESHOLD_ADAPTIVE_ENABLED"),
             default=False,
@@ -360,6 +415,10 @@ def load_runtime_config() -> RuntimeConfig:
         strategy_threshold_adaptive_band_width=_parse_float(
             os.getenv("STRATEGY_THRESHOLD_ADAPTIVE_BAND_WIDTH"),
             default=0.1,
+        ),
+        strategy_threshold_adaptive_cliff_safety_gap=_parse_float(
+            os.getenv("STRATEGY_THRESHOLD_ADAPTIVE_CLIFF_SAFETY_GAP"),
+            default=0.05,
         ),
         strategy_threshold_adaptive_max_step=_parse_float(
             os.getenv("STRATEGY_THRESHOLD_ADAPTIVE_MAX_STEP"),
@@ -419,9 +478,34 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("PAPER_EXECUTION_MIN_PROJECTED_GAIN_PCT"),
             default=0.015,
         ),
+        paper_execution_crypto_min_projected_gain_pct=_parse_float(
+            os.getenv("PAPER_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"),
+            default=0.02,
+        ),
+        paper_execution_profit_capture_pct=_parse_float(
+            os.getenv("PAPER_EXECUTION_PROFIT_CAPTURE_PCT"),
+            default=0.0,
+        ),
         paper_execution_limit_buffer_bps=_parse_float(
             os.getenv("PAPER_EXECUTION_LIMIT_BUFFER_BPS"),
             default=5.0,
+        ),
+        paper_execution_crypto_limit_buffer_bps=_parse_float(
+            os.getenv("PAPER_EXECUTION_CRYPTO_LIMIT_BUFFER_BPS")
+            or os.getenv("PAPER_EXECUTION_LIMIT_BUFFER_BPS"),
+            default=5.0,
+        ),
+        paper_execution_high_score_override_enabled=_parse_bool(
+            os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_ENABLED"),
+            default=False,
+        ),
+        paper_execution_high_score_override_min_score=_parse_float(
+            os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
+            default=90.0,
+        ),
+        paper_execution_high_score_override_fitness_margin=_parse_float(
+            os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN"),
+            default=0.25,
         ),
         paper_execution_equity_broker_id=(
             os.getenv("PAPER_EXECUTION_EQUITY_BROKER_ID", "alpaca_paper").strip().lower()
@@ -707,6 +791,17 @@ def _parse_shadow_windows(value: str | None) -> tuple[str, ...]:
         if item:
             windows.append(item)
     return tuple(windows)
+
+
+def _parse_float_csv(value: str | None, *, default: tuple[float, ...]) -> tuple[float, ...]:
+    if value is None or not value.strip():
+        return default
+    parsed: list[float] = []
+    for raw_item in value.split(","):
+        item = raw_item.strip()
+        if item:
+            parsed.append(float(item))
+    return tuple(parsed) if parsed else default
 
 
 def _parse_bool(value: str | None, *, default: bool) -> bool:

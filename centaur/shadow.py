@@ -160,6 +160,7 @@ def evaluate_shadow_checkpoint(
     exit_slippage_bps: float = 0.0,
     fixed_round_trip_cost_usd: float = 0.0,
     reference_notional_usd: float = 0.0,
+    profit_target_ladder_pct: tuple[float, ...] = (),
 ) -> dict[str, Any] | None:
     raw_checkpoint = checkpoint.get("raw_json", {})
     if not isinstance(raw_checkpoint, dict):
@@ -383,6 +384,19 @@ def evaluate_shadow_checkpoint(
         if min_low is not None
         else None
     )
+    profit_target_ladder = _profit_target_ladder_outcomes(
+        entry_price=entry_price,
+        entry_price_gbp=entry_price_gbp,
+        stop_loss_price=stop_loss_price,
+        bars=normalized_bars,
+        due_at=due_at,
+        target_pcts=profit_target_ladder_pct,
+        execution_spread_bps=execution_spread_bps,
+        entry_slippage_bps=entry_slippage_bps,
+        exit_slippage_bps=exit_slippage_bps,
+        fixed_round_trip_cost_usd=fixed_round_trip_cost_usd,
+        trade_notional_usd=trade_notional_usd,
+    )
 
     return {
         "proposal_id": checkpoint["proposal_id"],
@@ -410,6 +424,7 @@ def evaluate_shadow_checkpoint(
         "realized_return_pct": realized_return_pct,
         "max_favorable_excursion_pct": max_favorable_excursion_pct,
         "max_adverse_excursion_pct": max_adverse_excursion_pct,
+        "profit_target_ladder": profit_target_ladder,
         "effective_risk_pct": effective_risk_pct,
         "execution_spread_bps": round(float(execution_spread_bps), 6),
         "entry_slippage_bps": round(float(entry_slippage_bps), 6),
@@ -470,6 +485,148 @@ def _merge_checkpoint_windows(
             minutes=holding_window_minutes,
         )
     return sorted(merged.values(), key=lambda item: item.minutes)
+
+
+def _profit_target_ladder_outcomes(
+    *,
+    entry_price: float,
+    entry_price_gbp: float | None,
+    stop_loss_price: float | None,
+    bars: list[dict[str, Any]],
+    due_at: datetime,
+    target_pcts: tuple[float, ...],
+    execution_spread_bps: float,
+    entry_slippage_bps: float,
+    exit_slippage_bps: float,
+    fixed_round_trip_cost_usd: float,
+    trade_notional_usd: float,
+) -> list[dict[str, Any]]:
+    if entry_price <= 0:
+        return []
+
+    effective_entry_price = _apply_long_entry_friction(
+        price=entry_price,
+        spread_bps=execution_spread_bps,
+        slippage_bps=entry_slippage_bps,
+    )
+    if effective_entry_price <= 0:
+        return []
+
+    clean_targets = sorted({round(float(value), 6) for value in target_pcts if float(value) > 0})
+    outcomes: list[dict[str, Any]] = []
+    for target_pct in clean_targets:
+        target_price = entry_price * (1.0 + (target_pct / 100.0))
+        exit_at: datetime | None = None
+        exit_price: float | None = None
+        exit_price_gbp: float | None = None
+        status = "not_hit_by_checkpoint"
+
+        for bar in bars:
+            captured_at = bar.get("captured_at")
+            if not isinstance(captured_at, datetime) or captured_at >= due_at:
+                break
+
+            stop_hit = (
+                stop_loss_price is not None
+                and bar.get("low_price") is not None
+                and float(bar["low_price"]) <= stop_loss_price
+            )
+            target_hit = (
+                bar.get("high_price") is not None
+                and float(bar["high_price"]) >= target_price
+            )
+            if stop_hit and target_hit:
+                status = "ambiguous_stop_and_target"
+                exit_at = captured_at
+                exit_price = _to_float(bar.get("close_price")) or entry_price
+                exit_price_gbp = _to_float(bar.get("close_price_gbp")) or entry_price_gbp
+                break
+            if stop_hit:
+                status = "stop_hit_before_target"
+                exit_at = captured_at
+                exit_price = stop_loss_price
+                exit_price_gbp = _convert_like_for_gbp(
+                    entry_price=entry_price,
+                    target_price=stop_loss_price,
+                    entry_price_gbp=entry_price_gbp,
+                )
+                break
+            if target_hit:
+                status = "target_hit"
+                exit_at = captured_at
+                exit_price = target_price
+                exit_price_gbp = _convert_like_for_gbp(
+                    entry_price=entry_price,
+                    target_price=target_price,
+                    entry_price_gbp=entry_price_gbp,
+                )
+                break
+
+        if exit_price is None:
+            exit_bar = next(
+                (
+                    bar
+                    for bar in bars
+                    if isinstance(bar.get("captured_at"), datetime)
+                    and bar["captured_at"] >= due_at
+                ),
+                None,
+            )
+            if exit_bar is not None:
+                exit_at = exit_bar["captured_at"]
+                exit_price = _to_float(exit_bar.get("close_price")) or entry_price
+                exit_price_gbp = _to_float(exit_bar.get("close_price_gbp")) or entry_price_gbp
+
+        effective_exit_price = (
+            _apply_long_exit_friction(
+                price=exit_price,
+                spread_bps=execution_spread_bps,
+                slippage_bps=exit_slippage_bps,
+            )
+            if exit_price is not None
+            else None
+        )
+        realized_return_pct = None
+        net_profit_usd = None
+        if effective_exit_price is not None:
+            before_fixed_cost = (
+                (effective_exit_price - effective_entry_price) / effective_entry_price
+            ) * 100.0
+            fixed_cost_return_pct = (
+                (max(0.0, fixed_round_trip_cost_usd) / trade_notional_usd) * 100.0
+                if trade_notional_usd > 0
+                else 0.0
+            )
+            realized_return_pct = round(before_fixed_cost - fixed_cost_return_pct, 6)
+            net_profit_usd = (
+                round(trade_notional_usd * realized_return_pct / 100.0, 6)
+                if trade_notional_usd > 0
+                else None
+            )
+
+        outcomes.append(
+            {
+                "target_pct": target_pct,
+                "target_price": round(target_price, 8),
+                "target_price_gbp": _convert_like_for_gbp(
+                    entry_price=entry_price,
+                    target_price=target_price,
+                    entry_price_gbp=entry_price_gbp,
+                ),
+                "status": status,
+                "target_hit": status == "target_hit",
+                "ambiguous": status == "ambiguous_stop_and_target",
+                "stop_hit_before_target": status == "stop_hit_before_target",
+                "exit_at": exit_at.isoformat() if exit_at is not None else None,
+                "exit_price": round(exit_price, 8) if exit_price is not None else None,
+                "exit_price_gbp": (
+                    round(exit_price_gbp, 8) if exit_price_gbp is not None else None
+                ),
+                "realized_return_pct": realized_return_pct,
+                "net_profit_usd_on_reference_notional": net_profit_usd,
+            }
+        )
+    return outcomes
 
 
 def _build_proposal_id(

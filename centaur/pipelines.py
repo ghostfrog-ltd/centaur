@@ -29,6 +29,37 @@ PipelineResult = dict[str, Any]
 PipelineRunner = Callable[[TickContext], PipelineResult]
 
 
+def _paper_min_projected_gain_pct(config: Any, asset_class: str) -> float:
+    asset = str(asset_class).strip().lower()
+    if asset == "crypto":
+        return float(config.paper_execution_crypto_min_projected_gain_pct)
+    return float(config.paper_execution_min_projected_gain_pct)
+
+
+def _paper_limit_buffer_bps(config: Any, asset_class: str) -> float:
+    asset = str(asset_class).strip().lower()
+    if asset == "crypto":
+        return float(
+            getattr(
+                config,
+                "paper_execution_crypto_limit_buffer_bps",
+                config.paper_execution_limit_buffer_bps,
+            )
+        )
+    return float(config.paper_execution_limit_buffer_bps)
+
+
+def _paper_allocation_suppress_thresholds(
+    context: TickContext,
+    *,
+    equity_threshold: float,
+) -> dict[str, float]:
+    return {
+        "equity": float(equity_threshold),
+        "crypto": float(context.config.strategy_allocation_crypto_suppress_threshold),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class StepDefinition:
     name: str
@@ -797,8 +828,8 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
     recent_orders = context.usage_ledger.list_recent_paper_trade_orders(limit=100)
     raw_open_orders = list(context.state.get("alpaca_orders", {}).get("raw", []))
     latest_bars = _latest_bars_by_symbol(context)
-    open_exit_symbols = {
-        str(order.get("symbol", "")).upper()
+    open_exit_by_symbol = {
+        _normalized_symbol_key(str(order.get("symbol", "")).upper()): order
         for order in raw_open_orders
         if str(order.get("symbol", "")).strip()
         and str(order.get("side", "")).strip().lower() == "sell"
@@ -807,13 +838,12 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
 
     exit_requests: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    refreshed_exit_orders: list[dict[str, Any]] = []
+    refresh_errors: list[dict[str, Any]] = []
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
         broker_id = str(position.get("broker_id", "alpaca_paper")).strip().lower() or "alpaca_paper"
         if not symbol:
-            continue
-        if symbol in open_exit_symbols:
-            skipped.append({"symbol": symbol, "reason": "exit_order_already_open"})
             continue
 
         entry_order = _find_latest_managed_entry_order(
@@ -825,10 +855,52 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
             skipped.append({"symbol": symbol, "reason": "missing_entry_plan"})
             continue
 
-        latest_bar = latest_bars.get(symbol)
+        symbol_key = _normalized_symbol_key(symbol)
+        latest_bar = latest_bars.get(symbol) or latest_bars.get(symbol_key)
         if latest_bar is None:
             skipped.append({"symbol": symbol, "reason": "latest_bar_unavailable"})
             continue
+
+        open_exit_order = open_exit_by_symbol.get(symbol_key)
+        if open_exit_order is not None:
+            refresh_reason = _open_exit_order_refresh_reason(
+                order=open_exit_order,
+                position=position,
+                latest_bar=latest_bar,
+                as_of=context.started_at,
+                stale_after_minutes=max(1, int(context.config.paper_execution_stale_order_minutes)),
+            )
+            if refresh_reason is None:
+                skipped.append({"symbol": symbol, "reason": "exit_order_already_open"})
+                continue
+            order_id = str(
+                open_exit_order.get("id") or open_exit_order.get("order_id") or ""
+            ).strip()
+            if not order_id:
+                skipped.append({"symbol": symbol, "reason": "open_exit_order_missing_id"})
+                continue
+            try:
+                adapter = get_broker_adapter(context, broker_id)
+                adapter.cancel_order(context, order_id=order_id)
+                refreshed_exit_orders.append(
+                    {
+                        **open_exit_order,
+                        "status": "canceled",
+                        "updated_at": context.started_at.isoformat(),
+                        "exit_refresh_reason": refresh_reason,
+                    }
+                )
+            except BrokerAdapterError as exc:
+                refresh_errors.append(
+                    {
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "reason": refresh_reason,
+                        "error": str(exc),
+                    }
+                )
+                skipped.append({"symbol": symbol, "reason": "exit_order_refresh_failed"})
+                continue
 
         entry_started_at = _coerce_datetime(
             entry_order.get("submitted_at") or entry_order.get("captured_at")
@@ -837,7 +909,7 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
         if entry_started_at is not None:
             bar_history = context.usage_ledger.get_market_bars_for_window(
                 source=str(entry_order.get("source", "")).strip(),
-                symbol=symbol,
+                symbol=str(entry_order.get("symbol") or symbol).strip(),
                 start_at=entry_started_at - timedelta(minutes=5),
                 end_at=context.started_at,
             )
@@ -850,27 +922,50 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
             latest_bar=latest_bar,
             bar_history=bar_history,
             as_of=context.started_at,
-            limit_buffer_bps=context.config.paper_execution_limit_buffer_bps,
+            limit_buffer_bps=_paper_limit_buffer_bps(
+                context.config,
+                str(entry_order.get("asset_class", "")),
+            ),
         )
         if exit_request is None:
             skipped.append({"symbol": symbol, "reason": skip_reason or "exit_not_due"})
             continue
+        if open_exit_order is not None:
+            exit_request["refreshed_exit_order_id"] = str(
+                open_exit_order.get("id") or open_exit_order.get("order_id") or ""
+            ).strip()
         exit_requests.append(exit_request)
+
+    refreshed_orders_saved = 0
+    if refreshed_exit_orders:
+        refreshed_orders_saved = context.usage_ledger.record_paper_trade_orders(
+            tick_id=context.tick_id,
+            captured_at=context.started_at,
+            orders=refreshed_exit_orders,
+            broker_id="alpaca_paper",
+        )
 
     if not exit_requests:
         result = {
             "broker": "alpaca_paper",
             "positions_checked": len(positions),
             "exit_orders_submitted": 0,
+            "exit_orders_refreshed": len(refreshed_exit_orders),
+            "refreshed_orders_saved": refreshed_orders_saved,
             "mode": "monitoring",
         }
         if skipped:
             result["skip_reason"] = skipped[0]["reason"]
+        if refresh_errors:
+            result["refresh_error_count"] = len(refresh_errors)
+            result["first_refresh_error"] = refresh_errors[0]["error"]
         context.state["paper_exit_management"] = {
             **result,
             "orders": [],
             "errors": [],
             "skipped": skipped,
+            "refreshed_exit_orders": refreshed_exit_orders,
+            "refresh_errors": refresh_errors,
         }
         return result
 
@@ -905,6 +1000,21 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
                     "planned_holding_window_minutes": exit_request.get(
                         "planned_holding_window_minutes"
                     ),
+                    "planned_managed_exit_policy": exit_request.get(
+                        "planned_managed_exit_policy"
+                    ),
+                    "planned_profit_exit_window_minutes": exit_request.get(
+                        "planned_profit_exit_window_minutes"
+                    ),
+                    "planned_max_hold_window_minutes": exit_request.get(
+                        "planned_max_hold_window_minutes"
+                    ),
+                    "planned_profit_capture_pct": exit_request.get(
+                        "planned_profit_capture_pct"
+                    ),
+                    "planned_profit_capture_price": exit_request.get(
+                        "planned_profit_capture_price"
+                    ),
                     "planned_break_even_trigger_price": exit_request.get(
                         "planned_break_even_trigger_price"
                     ),
@@ -913,6 +1023,9 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
                     ),
                     "exit_reason": exit_request["exit_reason"],
                     "linked_order_id": exit_request.get("linked_order_id", ""),
+                    "refreshed_exit_order_id": exit_request.get(
+                        "refreshed_exit_order_id", ""
+                    ),
                 }
             )
         except BrokerAdapterError as exc:
@@ -942,6 +1055,8 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
         "broker": broker_ids[0] if len(broker_ids) == 1 else "multiple",
         "positions_checked": len(positions),
         "exit_orders_submitted": len(submitted_orders),
+        "exit_orders_refreshed": len(refreshed_exit_orders),
+        "refreshed_orders_saved": refreshed_orders_saved,
         "orders_saved": orders_saved,
         "execution_status": _paper_execution_status(
             submitted_count=len(submitted_orders),
@@ -959,6 +1074,9 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
     if submission_errors:
         result["error_count"] = len(submission_errors)
         result["first_error"] = submission_errors[0]["error"]
+    if refresh_errors:
+        result["refresh_error_count"] = len(refresh_errors)
+        result["first_refresh_error"] = refresh_errors[0]["error"]
     if skipped:
         result["skipped_positions"] = len(skipped)
     context.state["paper_exit_management"] = {
@@ -966,6 +1084,8 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
         "orders": submitted_orders,
         "errors": submission_errors,
         "skipped": skipped,
+        "refreshed_exit_orders": refreshed_exit_orders,
+        "refresh_errors": refresh_errors,
     }
     return result
 
@@ -991,7 +1111,7 @@ def live_exit_management(context: TickContext) -> PipelineResult:
     raw_open_orders = list(context.state.get("alpaca_live_orders", {}).get("raw", []))
     latest_bars = _latest_bars_by_symbol(context)
     open_exit_symbols = {
-        str(order.get("symbol", "")).upper()
+        _normalized_symbol_key(str(order.get("symbol", "")).upper())
         for order in raw_open_orders
         if str(order.get("symbol", "")).strip()
         and str(order.get("side", "")).strip().lower() == "sell"
@@ -1005,7 +1125,8 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         broker_id = str(position.get("broker_id", "alpaca_live")).strip().lower() or "alpaca_live"
         if not symbol:
             continue
-        if symbol in open_exit_symbols:
+        symbol_key = _normalized_symbol_key(symbol)
+        if symbol_key in open_exit_symbols:
             skipped.append({"symbol": symbol, "reason": "exit_order_already_open"})
             continue
 
@@ -1018,7 +1139,7 @@ def live_exit_management(context: TickContext) -> PipelineResult:
             skipped.append({"symbol": symbol, "reason": "missing_entry_plan"})
             continue
 
-        latest_bar = latest_bars.get(symbol)
+        latest_bar = latest_bars.get(symbol) or latest_bars.get(symbol_key)
         if latest_bar is None:
             skipped.append({"symbol": symbol, "reason": "latest_bar_unavailable"})
             continue
@@ -1030,7 +1151,7 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         if entry_started_at is not None:
             bar_history = context.usage_ledger.get_market_bars_for_window(
                 source=str(entry_order.get("source", "")).strip(),
-                symbol=symbol,
+                symbol=str(entry_order.get("symbol") or symbol).strip(),
                 start_at=entry_started_at - timedelta(minutes=5),
                 end_at=context.started_at,
             )
@@ -1097,6 +1218,21 @@ def live_exit_management(context: TickContext) -> PipelineResult:
                     ),
                     "planned_holding_window_minutes": exit_request.get(
                         "planned_holding_window_minutes"
+                    ),
+                    "planned_managed_exit_policy": exit_request.get(
+                        "planned_managed_exit_policy"
+                    ),
+                    "planned_profit_exit_window_minutes": exit_request.get(
+                        "planned_profit_exit_window_minutes"
+                    ),
+                    "planned_max_hold_window_minutes": exit_request.get(
+                        "planned_max_hold_window_minutes"
+                    ),
+                    "planned_profit_capture_pct": exit_request.get(
+                        "planned_profit_capture_pct"
+                    ),
+                    "planned_profit_capture_price": exit_request.get(
+                        "planned_profit_capture_price"
                     ),
                     "planned_break_even_trigger_price": exit_request.get(
                         "planned_break_even_trigger_price"
@@ -1194,6 +1330,7 @@ def shadow_trade_outcomes(context: TickContext) -> PipelineResult:
             exit_slippage_bps=context.config.shadow_exit_slippage_bps,
             fixed_round_trip_cost_usd=context.config.shadow_fixed_round_trip_cost_usd,
             reference_notional_usd=context.config.paper_execution_default_notional_usd,
+            profit_target_ladder_pct=context.config.shadow_profit_target_ladder_pct,
         )
         if outcome is not None:
             outcomes.append(outcome)
@@ -1291,6 +1428,7 @@ def strategy_signals(context: TickContext) -> PipelineResult:
         min_checkpoints=context.config.strategy_allocation_min_checkpoints,
         favor_threshold=context.config.strategy_allocation_favor_threshold,
         suppress_threshold=-999.0,
+        asset_class_suppress_thresholds={"equity": -999.0, "crypto": -999.0},
     )
     threshold_state = ThresholdAdvisor(
         config=context.config,
@@ -1306,14 +1444,36 @@ def strategy_signals(context: TickContext) -> PipelineResult:
             context.config.strategy_allocation_suppress_threshold,
         )
     )
+    suppress_thresholds = _paper_allocation_suppress_thresholds(
+        context,
+        equity_threshold=suppress_threshold,
+    )
     signal_dicts, allocation_stats = allocate_strategy_signals(
         signals=base_signal_dicts,
         fitness_summaries=fitness_summaries,
         min_checkpoints=context.config.strategy_allocation_min_checkpoints,
         favor_threshold=context.config.strategy_allocation_favor_threshold,
         suppress_threshold=suppress_threshold,
+        asset_class_suppress_thresholds=suppress_thresholds,
+        high_score_override_enabled=(
+            bool(context.config.paper_execution_enabled)
+            and not bool(context.config.paper_execution_kill_switch)
+            and bool(context.config.paper_execution_high_score_override_enabled)
+        ),
+        high_score_override_min_score=(
+            context.config.paper_execution_high_score_override_min_score
+        ),
+        high_score_override_fitness_margin=(
+            context.config.paper_execution_high_score_override_fitness_margin
+        ),
+        high_score_override_allowed_strategies={
+            strategy_id.lower()
+            for strategy_id in context.config.paper_execution_allowed_strategies
+            if strategy_id
+        },
     )
     allocation_stats["suppress_threshold"] = suppress_threshold
+    allocation_stats["suppress_thresholds"] = suppress_thresholds
     allocation_stats["threshold_adaptive"] = threshold_state
     context.usage_ledger.record_strategy_candidate_signals(
         tick_id=context.tick_id,
@@ -1325,9 +1485,11 @@ def strategy_signals(context: TickContext) -> PipelineResult:
         "candidates_evaluated": len(candidates),
         "signals_generated": len(signal_dicts),
         "signals_suppressed": allocation_stats["suppressed"],
+        "signals_high_score_overridden": allocation_stats["high_score_overrides"],
         "signals_favored": allocation_stats["favored"],
         "allocation_min_checkpoints": context.config.strategy_allocation_min_checkpoints,
         "allocation_suppress_threshold": suppress_threshold,
+        "allocation_suppress_thresholds": suppress_thresholds,
         "threshold_adaptive": threshold_state,
         "mode": "fitness_weighted_rule_based",
     }
@@ -1830,6 +1992,16 @@ def execution_paper(context: TickContext) -> PipelineResult:
                     "planned_holding_window_minutes": approval.get(
                         "holding_window_minutes"
                     ),
+                    "planned_managed_exit_policy": approval.get(
+                        "managed_exit_policy"
+                    ),
+                    "planned_profit_exit_window_minutes": approval.get(
+                        "profit_exit_window_minutes"
+                    ),
+                    "planned_max_hold_window_minutes": approval.get(
+                        "max_hold_window_minutes"
+                    ),
+                    "planned_profit_capture_pct": context.config.paper_execution_profit_capture_pct,
                     "planned_break_even_trigger_price": approval.get(
                         "break_even_trigger_price"
                     ),
@@ -1925,6 +2097,16 @@ def execution_live(context: TickContext) -> PipelineResult:
                     "planned_holding_window_minutes": approval.get(
                         "holding_window_minutes"
                     ),
+                    "planned_managed_exit_policy": approval.get(
+                        "managed_exit_policy"
+                    ),
+                    "planned_profit_exit_window_minutes": approval.get(
+                        "profit_exit_window_minutes"
+                    ),
+                    "planned_max_hold_window_minutes": approval.get(
+                        "max_hold_window_minutes"
+                    ),
+                    "planned_profit_capture_pct": context.config.paper_execution_profit_capture_pct,
                 }
             )
         except BrokerAdapterError as exc:
@@ -2008,6 +2190,7 @@ def _build_tick_blocker_summary(context: TickContext) -> dict[str, Any]:
         )
         or 0
     )
+    high_score_overrides = int(allocation_state.get("high_score_overrides", 0) or 0)
     surviving_signals = int(
         allocation_state.get(
             "signals_out",
@@ -2039,6 +2222,7 @@ def _build_tick_blocker_summary(context: TickContext) -> dict[str, Any]:
         "cfo_reason": primary_entry_blocker,
         "raw_signals": raw_signals,
         "suppressed_signals": suppressed_signals,
+        "high_score_overrides": high_score_overrides,
         "surviving_signals": surviving_signals,
         "proposals_created": proposals_created,
         "approved_trades": approved_trades,
@@ -2157,7 +2341,8 @@ def _build_paper_trade_approval(
     if target_price is None or target_price <= entry_price:
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "invalid_target_price"}
     projected_gain_pct = (target_price - entry_price) / entry_price
-    if projected_gain_pct < float(config.paper_execution_min_projected_gain_pct):
+    min_projected_gain_pct = _paper_min_projected_gain_pct(config, asset_class)
+    if projected_gain_pct < min_projected_gain_pct:
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
@@ -2206,7 +2391,7 @@ def _build_paper_trade_approval(
             proposal=proposal,
             client_order_id=client_order_id,
             notional_usd=notional_usd,
-            limit_buffer_bps=float(config.paper_execution_limit_buffer_bps),
+            limit_buffer_bps=_paper_limit_buffer_bps(config, asset_class),
             usd_to_gbp=_as_float(context.state.get("fx_gbp_reference", {}).get("usd_to_gbp")),
         )
     except BrokerAdapterError:
@@ -2232,8 +2417,22 @@ def _build_paper_trade_approval(
             "stop_loss_price": stop_loss_price,
             "target_price": target_price,
             "projected_gain_pct": round(projected_gain_pct, 6),
-            "holding_window_code": str(proposal.get("holding_window_code", "")),
-            "holding_window_minutes": int(proposal.get("holding_window_minutes", 0) or 0),
+            "holding_window_code": _paper_exit_policy_holding_window_code(
+                strategy_id=strategy_id,
+                proposal=proposal,
+            ),
+            "holding_window_minutes": _paper_exit_policy_holding_window_minutes(
+                strategy_id=strategy_id,
+                proposal=proposal,
+            ),
+            "managed_exit_policy": _paper_managed_exit_policy(strategy_id=strategy_id),
+            "profit_exit_window_minutes": _paper_profit_exit_window_minutes(
+                strategy_id=strategy_id,
+            ),
+            "max_hold_window_minutes": _paper_max_hold_window_minutes(
+                strategy_id=strategy_id,
+                proposal=proposal,
+            ),
             "order_request": order_request,
         },
         None,
@@ -2361,8 +2560,22 @@ def _build_live_trade_approval(
             "stop_loss_price": stop_loss_price,
             "target_price": target_price,
             "projected_gain_pct": round(projected_gain_pct, 6),
-            "holding_window_code": str(proposal.get("holding_window_code", "")),
-            "holding_window_minutes": int(proposal.get("holding_window_minutes", 0) or 0),
+            "holding_window_code": _paper_exit_policy_holding_window_code(
+                strategy_id=strategy_id,
+                proposal=proposal,
+            ),
+            "holding_window_minutes": _paper_exit_policy_holding_window_minutes(
+                strategy_id=strategy_id,
+                proposal=proposal,
+            ),
+            "managed_exit_policy": _paper_managed_exit_policy(strategy_id=strategy_id),
+            "profit_exit_window_minutes": _paper_profit_exit_window_minutes(
+                strategy_id=strategy_id,
+            ),
+            "max_hold_window_minutes": _paper_max_hold_window_minutes(
+                strategy_id=strategy_id,
+                proposal=proposal,
+            ),
             "order_request": order_request,
         },
         None,
@@ -2483,8 +2696,14 @@ def _latest_bars_by_symbol(context: TickContext) -> dict[str, dict[str, Any]]:
         if isinstance(raw, dict):
             for symbol, bar in raw.items():
                 if isinstance(symbol, str) and isinstance(bar, dict):
-                    bars[symbol.upper()] = bar
+                    symbol_upper = symbol.upper()
+                    bars[symbol_upper] = bar
+                    bars[_normalized_symbol_key(symbol_upper)] = bar
     return bars
+
+
+def _normalized_symbol_key(symbol: str) -> str:
+    return str(symbol or "").upper().replace("/", "").replace("-", "").strip()
 
 
 def _latest_raw_bars_by_key(context: TickContext) -> dict[tuple[str, str], dict[str, Any]]:
@@ -2561,9 +2780,11 @@ def _find_latest_managed_entry_order(
     broker_id: str | None = None,
 ) -> dict[str, Any] | None:
     symbol_upper = symbol.upper()
+    symbol_key = _normalized_symbol_key(symbol_upper)
     broker_filter = str(broker_id or "").strip().lower()
     for order in orders:
-        if str(order.get("symbol", "")).upper() != symbol_upper:
+        order_symbol = str(order.get("symbol", "")).upper()
+        if order_symbol != symbol_upper and _normalized_symbol_key(order_symbol) != symbol_key:
             continue
         if broker_filter and str(order.get("broker_id", "")).strip().lower() != broker_filter:
             continue
@@ -2603,6 +2824,7 @@ def _build_exit_order_request(
     limit_buffer_bps: float,
 ) -> tuple[dict[str, Any] | None, str | None]:
     symbol = str(position.get("symbol", "")).upper()
+    broker_symbol = str(entry_order.get("symbol") or symbol).upper()
     raw_qty = str(position.get("qty", "")).strip()
     qty = _as_float(raw_qty)
     if qty is None or qty <= 0:
@@ -2664,6 +2886,64 @@ def _build_exit_order_request(
         holding_window_minutes = int(proposal_raw.get("holding_window_minutes", 0) or 0)
     if not holding_window_code:
         holding_window_code = str(proposal_raw.get("holding_window_code", "") or "").strip()
+    strategy_id = str(entry_order.get("strategy_id", "")).strip()
+    managed_exit_policy = str(
+        raw.get(
+            "planned_managed_exit_policy",
+            proposal_raw.get(
+                "managed_exit_policy",
+                _paper_managed_exit_policy(strategy_id=strategy_id),
+            ),
+        )
+        or ""
+    ).strip()
+    profit_exit_window_minutes = int(
+        raw.get(
+            "planned_profit_exit_window_minutes",
+            proposal_raw.get(
+                "profit_exit_window_minutes",
+                _paper_profit_exit_window_minutes(strategy_id=strategy_id),
+            ),
+        )
+        or 0
+    )
+    max_hold_window_minutes = int(
+        raw.get(
+            "planned_max_hold_window_minutes",
+            proposal_raw.get(
+                "max_hold_window_minutes",
+                _paper_max_hold_window_minutes(
+                    strategy_id=strategy_id,
+                    proposal=proposal_plan,
+                ),
+            ),
+        )
+        or holding_window_minutes
+        or 0
+    )
+    if strategy_id == "crypto_momentum.trend":
+        managed_exit_policy = _paper_managed_exit_policy(strategy_id=strategy_id)
+        holding_window_code = _paper_exit_policy_holding_window_code(
+            strategy_id=strategy_id,
+            proposal=proposal_plan,
+        )
+        holding_window_minutes = _paper_exit_policy_holding_window_minutes(
+            strategy_id=strategy_id,
+            proposal=proposal_plan,
+        )
+        max_hold_window_minutes = _paper_max_hold_window_minutes(
+            strategy_id=strategy_id,
+            proposal=proposal_plan,
+        )
+    profit_capture_pct = _as_float(
+        raw.get(
+            "planned_profit_capture_pct",
+            proposal_raw.get(
+                "profit_capture_pct",
+                getattr(context.config, "paper_execution_profit_capture_pct", 0.0),
+            ),
+        )
+    )
     entry_submitted_at = _coerce_datetime(
         entry_order.get("submitted_at") or entry_order.get("captured_at")
     )
@@ -2693,21 +2973,66 @@ def _build_exit_order_request(
             or stop_loss_price
         )
 
+    entry_reference_price = (
+        _as_float(entry_order.get("filled_avg_price"))
+        or _as_float(position.get("avg_entry_price"))
+        or _as_float(raw.get("entry_price"))
+        or _as_float(proposal_plan.get("entry_price"))
+    )
+    profit_capture_price = (
+        round(entry_reference_price * (1.0 + profit_capture_pct), 8)
+        if entry_reference_price is not None
+        and profit_capture_pct is not None
+        and profit_capture_pct > 0
+        else None
+    )
+
     exit_reason: str | None = None
     if effective_stop_loss is not None and low_price is not None and low_price <= effective_stop_loss:
         exit_reason = "stop_loss_hit"
+    elif (
+        profit_capture_price is not None
+        and high_price is not None
+        and high_price >= profit_capture_price
+    ):
+        exit_reason = "profit_capture_hit"
     elif target_price is not None and high_price is not None and high_price >= target_price:
         exit_reason = "take_profit_hit"
+    elif (
+        managed_exit_policy == "profit_after_1h_else_1d"
+        and entry_submitted_at is not None
+        and profit_exit_window_minutes > 0
+        and as_of >= entry_submitted_at + timedelta(minutes=profit_exit_window_minutes)
+    ):
+        profit_reference_price = (
+            close_price
+            or current_price
+        )
+        if (
+            profit_reference_price is not None
+            and entry_reference_price is not None
+            and profit_reference_price > entry_reference_price
+        ):
+            exit_reason = "profit_after_one_hour"
+        elif (
+            max_hold_window_minutes > 0
+            and as_of >= entry_submitted_at + timedelta(minutes=max_hold_window_minutes)
+        ):
+            exit_reason = "max_holding_window_elapsed"
+        else:
+            return None, "exit_not_due"
     elif (
         holding_window_minutes > 0
         and entry_submitted_at is not None
         and as_of >= entry_submitted_at + timedelta(minutes=holding_window_minutes)
     ):
-        exit_reason = "holding_window_elapsed"
+        if managed_exit_policy == "profit_capture_else_1d":
+            exit_reason = "max_holding_window_elapsed"
+        else:
+            exit_reason = "holding_window_elapsed"
     else:
         return None, "exit_not_due"
 
-    strategy_id = str(entry_order.get("strategy_id", "")).strip()
     asset_class = str(entry_order.get("asset_class", "")).strip().lower()
     reference_exit_price = (
         close_price
@@ -2729,7 +3054,7 @@ def _build_exit_order_request(
     try:
         adapter = get_broker_adapter(context, broker_id)
         order_request = adapter.build_exit_order_request(
-            symbol=symbol,
+            symbol=broker_symbol,
             asset_class=asset_class,
             qty=raw_qty,
             reference_price=reference_exit_price,
@@ -2749,13 +3074,18 @@ def _build_exit_order_request(
             "strategy_family": str(entry_order.get("strategy_family", "")).strip(),
             "profile_id": str(entry_order.get("profile_id", "")).strip(),
             "source": str(entry_order.get("source", "")).strip(),
-            "symbol": symbol,
+            "symbol": broker_symbol,
             "asset_class": asset_class,
             "linked_order_id": str(entry_order.get("order_id", "")).strip(),
             "planned_take_profit_price": target_price,
             "planned_stop_loss_price": effective_stop_loss,
             "planned_holding_window_code": holding_window_code,
             "planned_holding_window_minutes": holding_window_minutes,
+            "planned_managed_exit_policy": managed_exit_policy,
+            "planned_profit_exit_window_minutes": profit_exit_window_minutes,
+            "planned_max_hold_window_minutes": max_hold_window_minutes,
+            "planned_profit_capture_pct": profit_capture_pct,
+            "planned_profit_capture_price": profit_capture_price,
             "planned_break_even_trigger_price": break_even_trigger_price,
             "planned_trailing_stop_mode": trailing_stop_mode,
             "exit_reason": exit_reason,
@@ -2780,6 +3110,52 @@ def _lookup_entry_proposal_plan(
     except Exception:
         return {}
     return proposal if isinstance(proposal, dict) else {}
+
+
+def _paper_managed_exit_policy(*, strategy_id: str) -> str:
+    if strategy_id == "mean_reversion.snapback":
+        return "profit_after_1h_else_1d"
+    if strategy_id == "crypto_momentum.trend":
+        return "profit_capture_else_1d"
+    return "time_exit"
+
+
+def _paper_profit_exit_window_minutes(*, strategy_id: str) -> int:
+    if strategy_id == "mean_reversion.snapback":
+        return 60
+    return 0
+
+
+def _paper_max_hold_window_minutes(*, strategy_id: str, proposal: dict[str, Any]) -> int:
+    if strategy_id == "mean_reversion.snapback":
+        return 1440
+    if strategy_id == "crypto_momentum.trend":
+        return 1440
+    return int(proposal.get("holding_window_minutes", 0) or 0)
+
+
+def _paper_exit_policy_holding_window_code(
+    *,
+    strategy_id: str,
+    proposal: dict[str, Any],
+) -> str:
+    if strategy_id == "mean_reversion.snapback":
+        return "profit_after_1h_else_1d"
+    if strategy_id == "crypto_momentum.trend":
+        return "profit_capture_else_1d"
+    return str(proposal.get("holding_window_code", ""))
+
+
+def _paper_exit_policy_holding_window_minutes(
+    *,
+    strategy_id: str,
+    proposal: dict[str, Any],
+) -> int:
+    if strategy_id == "mean_reversion.snapback":
+        return 1440
+    if strategy_id == "crypto_momentum.trend":
+        return 1440
+    return int(proposal.get("holding_window_minutes", 0) or 0)
 
 
 def _break_even_active_before_bar(
@@ -2880,6 +3256,45 @@ def _is_stale_entry_order(
     if submitted_at is None:
         return False
     return as_of >= submitted_at + timedelta(minutes=max(1, stale_after_minutes))
+
+
+def _open_exit_order_refresh_reason(
+    *,
+    order: dict[str, Any],
+    position: dict[str, Any],
+    latest_bar: dict[str, Any],
+    as_of: datetime,
+    stale_after_minutes: int,
+) -> str | None:
+    status = str(order.get("status", "")).strip().lower()
+    side = str(order.get("side", "")).strip().lower()
+    order_type = str(order.get("type") or order.get("order_type") or "").strip().lower()
+    if not _order_status_is_open(status):
+        return None
+    if side != "sell" or order_type != "limit":
+        return None
+
+    limit_price = _as_float(order.get("limit_price"))
+    current_price = (
+        _as_float(position.get("current_price"))
+        or _as_float(latest_bar.get("c"))
+    )
+    if (
+        limit_price is not None
+        and current_price is not None
+        and limit_price > current_price
+    ):
+        return "exit_limit_not_marketable"
+
+    submitted_at = _coerce_datetime(
+        order.get("submitted_at") or order.get("created_at") or order.get("captured_at")
+    )
+    if (
+        submitted_at is not None
+        and as_of >= submitted_at + timedelta(minutes=max(1, stale_after_minutes))
+    ):
+        return "exit_limit_stale"
+    return None
 
 
 def _order_status_is_open(status: str) -> bool:
