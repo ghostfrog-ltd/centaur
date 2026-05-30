@@ -1,8 +1,8 @@
 # Project Centaur Constraints
 
 ## Hard Nos
-- No live-money trading.
-- No Alpaca Live order submission while the live lane is scaffold-only.
+- No live-money trading outside the explicit 2026-05-29 Alpaca Live go-live override and its recorded same-as-paper micro envelope.
+- No Alpaca Live entry submission unless the explicit go-live override is recorded, the live enable flag is set, the entry kill switch is clear, credentials are configured, the activation acknowledgement is set, and the go-live record remains current.
 - No paper trade bigger than `$10` notional without explicit human override.
 - No silent broker switch away from the currently configured execution broker ids.
 - No non-equity paper execution while `PAPER_EXECUTION_EQUITY_ONLY=true`.
@@ -14,6 +14,7 @@
 - No silent fallback from PostgreSQL to SQLite for live operation or monitoring.
 - No raw chain-of-thought logging.
 - No logic changes that contradict this file or the decision log without asking first.
+- No safety-critical trading path without docstrings or nearby comments explaining its gating, capital-protection intent, and audit trail. This applies especially to live execution, broker adapters, risk gates, daily protection, stale-order handling, managed exits, and persistence writes.
 
 ## CFO Gate
 The CFO gate must hold unless all of the following are true:
@@ -46,7 +47,7 @@ Current paper approval rules from the live code:
 - Current active routing:
   - equities -> `alpaca_paper`
   - crypto -> `alpaca_paper`
-- `Alpaca Live` now exists as a scaffold/readiness lane only; it must not submit or cancel live orders until a go-live override updates this file and the decision log.
+- `Alpaca Live` exists as a dormant readiness lane; entry submission remains blocked by default, while guarded cancellation and managed sell-exit plumbing are prepared for a future go-live so the lane can be operated with the same protective mechanics as paper.
 - `IG` is scaffold-only for now and is not active for execution.
 - No IG trade may pass if the minimum spread-bet size would exceed the fixed `$10` notional cap.
 - No IG trade may pass if the implied exposure would exceed `1x` leverage.
@@ -95,15 +96,29 @@ Current paper approval rules from the live code:
 
 ## Current Live Execution Lane
 - Alpaca Live broker id: `alpaca_live`
-- Default status: disabled with kill switch on
+- Status after explicit 2026-05-29 operator override: approved for activation as a same-as-paper follower lane
 - Prepared bankroll model: `$10` x `10` slots = `$100`
-- Default live strategy allowlist: empty
+- Current observed Alpaca Live balance after funding check: `$132.05`; this does not widen the prepared `$10 x 10` envelope or the `$5.00` daily protector
+- First-live plan has been recorded as a same-as-paper follower lane, by operator request, rather than the safer generic one-strategy launch default
+- First-live operating bankroll is `$100` from the observed `$132.05` account; the extra `$32.05` is launch buffer only and does not create more slots
+- Prepared live strategy allowlist now mirrors paper for readiness only: `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`
+- Prepared live asset classes now mirror paper for readiness only: equities and crypto
+- Prepared live entry economics mirror paper: `$10` notional, `1` order per tick, `10` base slots, `$5.00` daily drawdown protector, `1.5%` equity projected-gain floor, `2.0%` crypto projected-gain floor, `5` bps equity limit buffer, and `25` bps crypto limit buffer
 - Earned-slot compounding mirrors paper for live once live has its own baseline and P/L, but API keys alone still cannot activate live trading
-- Live order submission remains blocked by configuration unless all live go-live gates pass
-- API keys alone must not activate live trading
-- Live may only follow a trade that the paper CFO gate has already approved on the same tick
-- Required live activation gates: live execution enabled, kill switch off, Alpaca Live credentials configured, `LIVE_EXECUTION_ACTIVATION_ACK=LIVE_TRADING_APPROVED`, at least one live allowed strategy, available live slots, live daily drawdown below the configured limit, and broker validation success
-- A future go-live override must record the strategy, starting slot count, daily loss limit, kill-switch rule, and rollback conditions before any real-money order path is turned on in configuration
+- Live entry submission is allowed only while all recorded live go-live gates pass
+- Live cancellation, stale-entry reaping, and managed sell exits are guarded by credentials plus activation acknowledgement, and are prepared so a future live lane can refresh stale/non-marketable orders instead of stranding positions
+- API keys plus `LIVE_EXECUTION_ENABLED=true` alone must not activate live trading
+- Live may only follow a trade that the paper CFO gate approved and the paper execution step actually submitted on the same tick
+- Required live entry activation gates: live execution enabled, kill switch off, Alpaca Live credentials configured, `LIVE_EXECUTION_ACTIVATION_ACK=LIVE_TRADING_APPROVED`, at least one live allowed strategy, available live slots, live daily drawdown below the configured limit, and broker validation success
+- Live strategy intelligence remains shared with paper/shadow fitness; the separate live intelligence lane is read-only execution monitoring for fill drift, status mismatch, and unmatched-order diagnostics, not an independent live strategy scorer
+- The first-live plan records strategy policy, starting slot count, daily loss limit, kill-switch rule, and rollback conditions; the 2026-05-29 explicit operator override authorizes flipping the activation flags within that envelope only
+- First-live rollback triggers include unexpected live positions/orders, account blocks or suspensions, live orders that do not match same-proposal submitted paper orders, abnormal live-vs-paper fill/status drift, stale live orders that cannot be refreshed, unavailable account equity, the `$5.00` live protector triggering, or operator discomfort
+
+## Documentation And Auditability
+- Safety-critical functions must have docstrings or compact comments that explain why they exist and which risk boundary they protect.
+- Comments must clarify non-obvious trading intent, not narrate obvious assignments.
+- If a future change touches live execution, risk gates, broker order submission/cancellation, daily protection, stale-order reaping, managed exits, strategy fitness admission, or persistent trade/account records, update the relevant doc block or nearby comment in the same change.
+- Documentation must stay honest about the current mode: paper active, Alpaca Live dormant/readiness unless a recorded go-live override says otherwise.
 
 ## Replay / Learning Constraints
 - Historical replay is allowed and preferred for fast training.

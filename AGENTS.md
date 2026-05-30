@@ -29,7 +29,7 @@ If a request conflicts with `CONSTRAINTS.md` or a logged architectural decision,
 - LLM layer: Gemini API only
 - Operations database: PostgreSQL only for live operation
 - Scheduler direction: macOS `launchd` wrapper on this Mac
-- Broker: Alpaca Paper active; Alpaca Live scaffold only
+- Broker: Alpaca Paper active; Alpaca Live explicitly approved for same-as-paper follower activation on 2026-05-29
 - FX reporting: ECB GBP reference rate
 
 ## Non-Negotiable Working Style
@@ -37,7 +37,7 @@ If a request conflicts with `CONSTRAINTS.md` or a logged architectural decision,
 - Do not silently widen risk.
 - Do not silently change broker behavior.
 - Do not silently reintroduce SQLite as a live operations source.
-- Do not enable Alpaca Live order submission without an explicit go-live override and checklist update.
+- Do not enable or widen Alpaca Live order submission outside the explicit 2026-05-29 go-live override and checklist record.
 - Do not enable a new strategy for paper execution without explicit approval if it is not already allowed.
 
 ## Task Handling Standard

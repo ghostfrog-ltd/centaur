@@ -49,6 +49,32 @@ def _paper_limit_buffer_bps(config: Any, asset_class: str) -> float:
     return float(config.paper_execution_limit_buffer_bps)
 
 
+def _live_min_projected_gain_pct(config: Any, asset_class: str) -> float:
+    asset = str(asset_class).strip().lower()
+    if asset == "crypto":
+        return float(
+            getattr(
+                config,
+                "live_execution_crypto_min_projected_gain_pct",
+                config.live_execution_min_projected_gain_pct,
+            )
+        )
+    return float(config.live_execution_min_projected_gain_pct)
+
+
+def _live_limit_buffer_bps(config: Any, asset_class: str) -> float:
+    asset = str(asset_class).strip().lower()
+    if asset == "crypto":
+        return float(
+            getattr(
+                config,
+                "live_execution_crypto_limit_buffer_bps",
+                config.live_execution_limit_buffer_bps,
+            )
+        )
+    return float(config.live_execution_limit_buffer_bps)
+
+
 def _paper_allocation_suppress_thresholds(
     context: TickContext,
     *,
@@ -350,11 +376,15 @@ def daily_protection(context: TickContext) -> PipelineResult:
 
 
 def live_daily_protection(context: TickContext) -> PipelineResult:
+    """Persist and latch Alpaca Live daily drawdown protection by session.
+
+    Paper already has a durable daily protector; live readiness needs the same
+    audit trail so a future real-money lane cannot reset its baseline mid-session
+    or forget that protection has already triggered.
+    """
     account_state = context.state.get("alpaca_live_account", {})
     summary = account_state.get("summary", {}) if isinstance(account_state, dict) else {}
-    raw = account_state.get("raw", {}) if isinstance(account_state, dict) else {}
     current_equity = _as_float(summary.get("equity"))
-    baseline_equity = _as_float(raw.get("last_equity"))
     max_drawdown = float(context.config.live_execution_max_daily_drawdown_usd)
     if current_equity is None or current_equity <= 0:
         result = {
@@ -365,20 +395,53 @@ def live_daily_protection(context: TickContext) -> PipelineResult:
         }
         context.state["live_daily_protection"] = result
         return result
+
+    session_date, market_open_at = _current_market_session(
+        started_at=context.started_at,
+        market_timezone=context.config.market_timezone,
+    )
+    existing = context.usage_ledger.get_broker_daily_protection_state(
+        session_date=session_date,
+        broker_id="alpaca_live",
+    )
+    baseline_equity = _as_float(existing.get("baseline_equity")) if existing else None
     if baseline_equity is None or baseline_equity <= 0:
         baseline_equity = current_equity
     equity_drawdown_usd = max(0.0, baseline_equity - current_equity)
-    protected = equity_drawdown_usd >= max_drawdown
+    protection_already_active = (
+        str(existing.get("system_status", "")).lower() == "protected"
+        if existing
+        else False
+    )
+    protected = protection_already_active or equity_drawdown_usd >= max_drawdown
+    notes = "daily_drawdown_limit_reached" if protected else ""
+    row = context.usage_ledger.upsert_broker_daily_protection_state(
+        session_date=session_date,
+        broker_id="alpaca_live",
+        market_open_at=market_open_at,
+        tick_id=context.tick_id,
+        checked_at=context.started_at,
+        current_equity=current_equity,
+        max_daily_drawdown_usd=max_drawdown,
+        system_status="protected" if protected else "active",
+        notes=notes,
+    )
     result = {
-        "baseline_equity": baseline_equity,
-        "current_equity": current_equity,
-        "equity_drawdown_usd": round(equity_drawdown_usd, 6),
-        "max_daily_drawdown_usd": max_drawdown,
-        "system_status": "protected" if protected else "active",
-        "entries_blocked": protected,
+        "session_date": row.get("session_date"),
+        "market_open_at": row.get("market_open_at"),
+        "baseline_equity": _as_float(row.get("baseline_equity")),
+        "current_equity": _as_float(row.get("latest_equity")),
+        "equity_drawdown_usd": _as_float(row.get("equity_drawdown_usd")) or 0.0,
+        "max_daily_drawdown_usd": _as_float(row.get("max_daily_drawdown_usd")) or max_drawdown,
+        "system_status": str(row.get("system_status", "active")).lower(),
+        "entries_blocked": str(row.get("system_status", "active")).lower() == "protected",
+        "baseline_created": existing is None,
+        "stale_orders_reaped_count": int(row.get("stale_orders_reaped_count", 0) or 0),
         "reason": "daily_drawdown_limit_reached" if protected else "active",
     }
-    context.state["live_daily_protection"] = result
+    if row.get("protection_triggered_at") is not None:
+        result["protection_triggered_at"] = row.get("protection_triggered_at")
+    context.state["live_daily_protection"] = {**result, "raw": row}
     return result
 
 
@@ -491,24 +554,158 @@ def stale_order_reaper(context: TickContext) -> PipelineResult:
     return result
 
 
+def live_stale_order_reaper(context: TickContext) -> PipelineResult:
+    """Cancel stale untouched live equity entry limits after activation gates.
+
+    This mirrors the paper stale-order reaper for the future live lane. It only
+    targets unfilled equity buy limits, records the cancellation in the order
+    audit trail, and relies on the live adapter to enforce credentials and
+    activation acknowledgement before any live account mutation.
+    """
+    raw_orders = list(context.state.get("alpaca_live_orders", {}).get("raw", []))
+    stale_after_minutes = max(1, int(context.config.paper_execution_stale_order_minutes))
+    if not raw_orders:
+        result = {
+            "broker": "alpaca_live",
+            "mode": "idle",
+            "orders_checked": 0,
+            "stale_candidates": 0,
+            "orders_canceled": 0,
+        }
+        context.state["live_stale_order_reaper"] = {
+            **result,
+            "canceled_orders": [],
+            "errors": [],
+        }
+        return result
+
+    canceled_orders: list[dict[str, Any]] = []
+    cancel_errors: list[dict[str, Any]] = []
+    stale_candidates: list[dict[str, Any]] = []
+    updated_orders: list[dict[str, Any]] = []
+
+    for order in raw_orders:
+        symbol = str(order.get("symbol", "")).upper()
+        if not _is_stale_entry_order(
+            order=order,
+            as_of=context.started_at,
+            stale_after_minutes=stale_after_minutes,
+        ):
+            updated_orders.append(order)
+            continue
+        stale_candidates.append(
+            {
+                "symbol": symbol,
+                "order_id": str(order.get("id", "")).strip(),
+                "broker_id": "alpaca_live",
+            }
+        )
+        order_id = str(order.get("id", "")).strip()
+        if not order_id:
+            cancel_errors.append({"symbol": symbol, "error": "missing_order_id"})
+            updated_orders.append(order)
+            continue
+        try:
+            adapter = get_broker_adapter(context, "alpaca_live")
+            adapter.cancel_order(context, order_id=order_id)
+            canceled_order = {
+                **order,
+                "broker_id": "alpaca_live",
+                "status": "canceled",
+                "updated_at": context.started_at.isoformat(),
+            }
+            canceled_orders.append(canceled_order)
+            updated_orders.append(canceled_order)
+        except BrokerAdapterError as exc:
+            cancel_errors.append({"symbol": symbol, "error": str(exc)})
+            updated_orders.append(order)
+
+    orders_saved = 0
+    if canceled_orders:
+        orders_saved = context.usage_ledger.record_paper_trade_orders(
+            tick_id=context.tick_id,
+            captured_at=context.started_at,
+            orders=canceled_orders,
+            broker_id="alpaca_live",
+        )
+        protection = context.state.get("live_daily_protection", {})
+        session_date = protection.get("session_date") if isinstance(protection, dict) else None
+        if session_date:
+            stale_count = context.usage_ledger.increment_broker_daily_stale_order_count(
+                session_date=date.fromisoformat(str(session_date)),
+                broker_id="alpaca_live",
+                tick_id=context.tick_id,
+                checked_at=context.started_at,
+                count=len(canceled_orders),
+            )
+            if isinstance(protection, dict):
+                protection["stale_orders_reaped_count"] = stale_count
+                if isinstance(protection.get("raw"), dict):
+                    protection["raw"]["stale_orders_reaped_count"] = stale_count
+
+    prior_summary = context.state.get("alpaca_live_orders", {}).get("summary", {})
+    revised_summary = get_broker_adapter(context, "alpaca_live").summarize_orders(updated_orders)
+    context.state["alpaca_live_orders"] = {
+        "summary": {
+            **revised_summary,
+            "orders_saved": int(prior_summary.get("orders_saved", 0) or 0) + orders_saved,
+            "mode": str(prior_summary.get("mode", "recent_orders")),
+        },
+        "raw": updated_orders,
+    }
+
+    result = {
+        "broker": "alpaca_live",
+        "mode": "monitoring",
+        "orders_checked": len(raw_orders),
+        "stale_candidates": len(stale_candidates),
+        "orders_canceled": len(canceled_orders),
+        "orders_saved": orders_saved,
+        "stale_after_minutes": stale_after_minutes,
+    }
+    if stale_candidates:
+        result["first_stale_symbol"] = stale_candidates[0]["symbol"]
+    if cancel_errors:
+        result["error_count"] = len(cancel_errors)
+        result["first_error"] = cancel_errors[0]["error"]
+    context.state["live_stale_order_reaper"] = {
+        **result,
+        "canceled_orders": canceled_orders,
+        "errors": cancel_errors,
+        "stale_candidates_detail": stale_candidates,
+    }
+    return result
+
+
+def _account_trade_ready(summary: dict[str, Any]) -> tuple[bool, str]:
+    """Normalize Alpaca account readiness checks for paper and live gates."""
+    status = str(summary.get("status", "")).upper()
+    account_active = status == "ACTIVE"
+    trading_blocked = bool(
+        summary.get("trading_blocked") or summary.get("account_blocked")
+    )
+    user_suspended = bool(summary.get("trade_suspended_by_user"))
+    if not account_active:
+        return False, "account_not_active"
+    if trading_blocked:
+        return False, "account_blocked"
+    if user_suspended:
+        return False, "user_trade_suspension"
+    return True, "account_trade_ready"
+
+
 def market_gate(context: TickContext) -> PipelineResult:
     account = context.state["alpaca_account"]["summary"]
     clock = context.state["alpaca_clock"]["summary"]
     is_open = bool(clock["is_open"])
-    account_active = str(account["status"]).upper() == "ACTIVE"
-    trading_blocked = bool(account["trading_blocked"] or account["account_blocked"])
-    user_suspended = bool(account["trade_suspended_by_user"])
-
-    account_trade_ready = account_active and not trading_blocked and not user_suspended
+    account_status = str(account.get("status", "")).upper()
+    account_active = account_status == "ACTIVE"
+    account_trade_ready, account_ready_reason = _account_trade_ready(account)
     equity_scan_ready = account_trade_ready and is_open
     crypto_scan_ready = account_trade_ready and bool(context.config.discovery_crypto_symbols)
     can_scan = equity_scan_ready or crypto_scan_ready
-    if not account_active:
-        reason = "account_not_active"
-    elif trading_blocked:
-        reason = "account_blocked"
-    elif user_suspended:
-        reason = "user_trade_suspension"
+    if not account_trade_ready:
+        reason = account_ready_reason
     elif equity_scan_ready:
         reason = "market_open"
     elif crypto_scan_ready:
@@ -516,15 +713,9 @@ def market_gate(context: TickContext) -> PipelineResult:
     else:
         reason = "market_closed"
 
-    if not account_active:
-        equity_reason = "account_not_active"
-        crypto_reason = "account_not_active"
-    elif trading_blocked:
-        equity_reason = "account_blocked"
-        crypto_reason = "account_blocked"
-    elif user_suspended:
-        equity_reason = "user_trade_suspension"
-        crypto_reason = "user_trade_suspension"
+    if not account_trade_ready:
+        equity_reason = account_ready_reason
+        crypto_reason = account_ready_reason
     else:
         equity_reason = "market_open" if equity_scan_ready else "market_closed"
         crypto_reason = "crypto_open" if crypto_scan_ready else "crypto_unavailable"
@@ -534,7 +725,7 @@ def market_gate(context: TickContext) -> PipelineResult:
         "reason": reason,
         "market_open": is_open,
         "account_active": account_active,
-        "account_status": account["status"],
+        "account_status": account.get("status"),
         "account_trade_ready": account_trade_ready,
         "equity_scan_ready": equity_scan_ready,
         "equity_reason": equity_reason,
@@ -1091,6 +1282,13 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
 
 
 def live_exit_management(context: TickContext) -> PipelineResult:
+    """Manage future live exits from the same persisted plan fields as paper.
+
+    The live lane should not be weaker than paper after activation: existing
+    sell exits are refreshed if stale or non-marketable, replacement orders keep
+    the original stop/target/holding policy, and every broker response is saved
+    under `alpaca_live` for later live-vs-paper drift review.
+    """
     positions = list(context.state.get("alpaca_live_positions", {}).get("raw", []))
     if not positions:
         result = {
@@ -1110,8 +1308,8 @@ def live_exit_management(context: TickContext) -> PipelineResult:
     recent_orders = context.usage_ledger.list_recent_paper_trade_orders(limit=100)
     raw_open_orders = list(context.state.get("alpaca_live_orders", {}).get("raw", []))
     latest_bars = _latest_bars_by_symbol(context)
-    open_exit_symbols = {
-        _normalized_symbol_key(str(order.get("symbol", "")).upper())
+    open_exit_by_symbol = {
+        _normalized_symbol_key(str(order.get("symbol", "")).upper()): order
         for order in raw_open_orders
         if str(order.get("symbol", "")).strip()
         and str(order.get("side", "")).strip().lower() == "sell"
@@ -1120,15 +1318,14 @@ def live_exit_management(context: TickContext) -> PipelineResult:
 
     exit_requests: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    refreshed_exit_orders: list[dict[str, Any]] = []
+    refresh_errors: list[dict[str, Any]] = []
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
         broker_id = str(position.get("broker_id", "alpaca_live")).strip().lower() or "alpaca_live"
         if not symbol:
             continue
         symbol_key = _normalized_symbol_key(symbol)
-        if symbol_key in open_exit_symbols:
-            skipped.append({"symbol": symbol, "reason": "exit_order_already_open"})
-            continue
 
         entry_order = _find_latest_managed_entry_order(
             symbol=symbol,
@@ -1143,6 +1340,48 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         if latest_bar is None:
             skipped.append({"symbol": symbol, "reason": "latest_bar_unavailable"})
             continue
+
+        open_exit_order = open_exit_by_symbol.get(symbol_key)
+        if open_exit_order is not None:
+            refresh_reason = _open_exit_order_refresh_reason(
+                order=open_exit_order,
+                position=position,
+                latest_bar=latest_bar,
+                as_of=context.started_at,
+                stale_after_minutes=max(1, int(context.config.paper_execution_stale_order_minutes)),
+            )
+            if refresh_reason is None:
+                skipped.append({"symbol": symbol, "reason": "exit_order_already_open"})
+                continue
+            order_id = str(
+                open_exit_order.get("id") or open_exit_order.get("order_id") or ""
+            ).strip()
+            if not order_id:
+                skipped.append({"symbol": symbol, "reason": "open_exit_order_missing_id"})
+                continue
+            try:
+                adapter = get_broker_adapter(context, broker_id)
+                adapter.cancel_order(context, order_id=order_id)
+                refreshed_exit_orders.append(
+                    {
+                        **open_exit_order,
+                        "broker_id": broker_id,
+                        "status": "canceled",
+                        "updated_at": context.started_at.isoformat(),
+                        "exit_refresh_reason": refresh_reason,
+                    }
+                )
+            except BrokerAdapterError as exc:
+                refresh_errors.append(
+                    {
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "reason": refresh_reason,
+                        "error": str(exc),
+                    }
+                )
+                skipped.append({"symbol": symbol, "reason": "exit_order_refresh_failed"})
+                continue
 
         entry_started_at = _coerce_datetime(
             entry_order.get("submitted_at") or entry_order.get("captured_at")
@@ -1164,27 +1403,50 @@ def live_exit_management(context: TickContext) -> PipelineResult:
             latest_bar=latest_bar,
             bar_history=bar_history,
             as_of=context.started_at,
-            limit_buffer_bps=context.config.live_execution_limit_buffer_bps,
+            limit_buffer_bps=_live_limit_buffer_bps(
+                context.config,
+                str(entry_order.get("asset_class", "")),
+            ),
         )
         if exit_request is None:
             skipped.append({"symbol": symbol, "reason": skip_reason or "exit_not_due"})
             continue
+        if open_exit_order is not None:
+            exit_request["refreshed_exit_order_id"] = str(
+                open_exit_order.get("id") or open_exit_order.get("order_id") or ""
+            ).strip()
         exit_requests.append(exit_request)
+
+    refreshed_orders_saved = 0
+    if refreshed_exit_orders:
+        refreshed_orders_saved = context.usage_ledger.record_paper_trade_orders(
+            tick_id=context.tick_id,
+            captured_at=context.started_at,
+            orders=refreshed_exit_orders,
+            broker_id="alpaca_live",
+        )
 
     if not exit_requests:
         result = {
             "broker": "alpaca_live",
             "positions_checked": len(positions),
             "exit_orders_submitted": 0,
+            "exit_orders_refreshed": len(refreshed_exit_orders),
+            "refreshed_orders_saved": refreshed_orders_saved,
             "mode": "monitoring",
         }
         if skipped:
             result["skip_reason"] = skipped[0]["reason"]
+        if refresh_errors:
+            result["refresh_error_count"] = len(refresh_errors)
+            result["first_refresh_error"] = refresh_errors[0]["error"]
         context.state["live_exit_management"] = {
             **result,
             "orders": [],
             "errors": [],
             "skipped": skipped,
+            "refreshed_exit_orders": refreshed_exit_orders,
+            "refresh_errors": refresh_errors,
         }
         return result
 
@@ -1242,6 +1504,9 @@ def live_exit_management(context: TickContext) -> PipelineResult:
                     ),
                     "exit_reason": exit_request["exit_reason"],
                     "linked_order_id": exit_request.get("linked_order_id", ""),
+                    "refreshed_exit_order_id": exit_request.get(
+                        "refreshed_exit_order_id", ""
+                    ),
                 }
             )
         except BrokerAdapterError as exc:
@@ -1265,6 +1530,8 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         "broker": "alpaca_live",
         "positions_checked": len(positions),
         "exit_orders_submitted": len(submitted_orders),
+        "exit_orders_refreshed": len(refreshed_exit_orders),
+        "refreshed_orders_saved": refreshed_orders_saved,
         "orders_saved": orders_saved,
         "execution_status": _paper_execution_status(
             submitted_count=len(submitted_orders),
@@ -1280,6 +1547,9 @@ def live_exit_management(context: TickContext) -> PipelineResult:
     if submission_errors:
         result["error_count"] = len(submission_errors)
         result["first_error"] = submission_errors[0]["error"]
+    if refresh_errors:
+        result["refresh_error_count"] = len(refresh_errors)
+        result["first_refresh_error"] = refresh_errors[0]["error"]
     if skipped:
         result["skipped_positions"] = len(skipped)
     context.state["live_exit_management"] = {
@@ -1287,6 +1557,8 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         "orders": submitted_orders,
         "errors": submission_errors,
         "skipped": skipped,
+        "refreshed_exit_orders": refreshed_exit_orders,
+        "refresh_errors": refresh_errors,
     }
     return result
 
@@ -1807,16 +2079,36 @@ def risk_cfo_gate(context: TickContext) -> PipelineResult:
 
 
 def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
+    """Gate live entry follows after paper has actually submitted the trade.
+
+    Live uses the same strategy/fitness brain as paper, but it still has its own
+    account, slot, drawdown, allowlist, activation, and broker-validation checks.
+    Requiring a submitted paper order prevents live from following a proposal
+    that paper approved but failed to place.
+    """
     config = context.config
     gate = context.state["market_gate"]
     protection = context.state.get("live_daily_protection", {})
     paper_approvals = list(context.state.get("risk_cfo", {}).get("approved_order_requests", []))
+    paper_submitted_orders = list(context.state.get("execution", {}).get("orders", []))
+    submitted_paper_proposal_ids = {
+        str(order.get("proposal_id", "")).strip()
+        for order in paper_submitted_orders
+        if str(order.get("proposal_id", "")).strip()
+    }
+    submitted_paper_approvals = [
+        approval
+        for approval in paper_approvals
+        if str(approval.get("proposal_id", "")).strip() in submitted_paper_proposal_ids
+    ]
     proposals = list(context.state.get("shadow_trade_proposals", {}).get("proposals", []))
     proposal_by_id = {
         str(proposal.get("proposal_id", "")): proposal
         for proposal in proposals
         if str(proposal.get("proposal_id", ""))
     }
+    live_account_summary = context.state.get("alpaca_live_account", {}).get("summary", {})
+    live_account_trade_ready, live_account_reason = _account_trade_ready(live_account_summary)
     positions_summary = context.state.get("alpaca_live_positions", {}).get("summary", {})
     orders_summary = context.state.get("alpaca_live_orders", {}).get("summary", {})
     open_positions = int(positions_summary.get("open_positions", 0) or 0)
@@ -1846,12 +2138,16 @@ def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
         reason = "activation_ack_missing"
     elif str(protection.get("system_status", "unknown")).lower() != "active":
         reason = str(protection.get("reason", "live_daily_protection_blocked"))
+    elif not live_account_trade_ready:
+        reason = f"live_{live_account_reason}"
     elif not gate["account_trade_ready"]:
         reason = gate["reason"]
     elif not config.live_execution_allowed_strategies:
         reason = "no_live_strategies_allowed"
     elif not paper_approvals:
         reason = "no_paper_approved_trade_to_follow"
+    elif not submitted_paper_approvals:
+        reason = "no_submitted_paper_order_to_follow"
     elif available_slots <= 0:
         reason = "max_live_positions_reached"
     else:
@@ -1870,7 +2166,7 @@ def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
             for strategy_id in config.live_execution_allowed_strategies
             if strategy_id
         }
-        for paper_approval in paper_approvals:
+        for paper_approval in submitted_paper_approvals:
             proposal = proposal_by_id.get(str(paper_approval.get("proposal_id", "")))
             if proposal is None:
                 rejected.append(
@@ -1925,6 +2221,7 @@ def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
         "decision": decision,
         "reason": reason,
         "watch_candidates": len(paper_approvals),
+        "submitted_paper_follow_candidates": len(submitted_paper_approvals),
         "open_positions": open_positions,
         "open_orders": open_orders,
         "available_slots": available_slots,
@@ -2275,6 +2572,7 @@ def build_default_pipeline() -> list[StepDefinition]:
         StepDefinition(name="risk.daily_protection", runner=daily_protection),
         StepDefinition(name="risk.live_daily_protection", runner=live_daily_protection),
         StepDefinition(name="maintenance.stale_orders", runner=stale_order_reaper),
+        StepDefinition(name="maintenance.live_stale_orders", runner=live_stale_order_reaper),
         StepDefinition(name="market.gate", runner=market_gate),
         StepDefinition(name="fx.gbp_reference", runner=fx_gbp_reference),
         StepDefinition(name="market.latest_bars", runner=market_latest_bars),
@@ -2484,7 +2782,8 @@ def _build_live_trade_approval(
     if target_price is None or target_price <= entry_price:
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "invalid_target_price"}
     projected_gain_pct = (target_price - entry_price) / entry_price
-    if projected_gain_pct < float(config.live_execution_min_projected_gain_pct):
+    min_projected_gain_pct = _live_min_projected_gain_pct(config, asset_class)
+    if projected_gain_pct < min_projected_gain_pct:
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
@@ -2534,7 +2833,7 @@ def _build_live_trade_approval(
             proposal=proposal,
             client_order_id=client_order_id,
             notional_usd=notional_usd,
-            limit_buffer_bps=float(config.live_execution_limit_buffer_bps),
+            limit_buffer_bps=_live_limit_buffer_bps(config, asset_class),
             usd_to_gbp=_as_float(context.state.get("fx_gbp_reference", {}).get("usd_to_gbp")),
         )
     except BrokerAdapterError:

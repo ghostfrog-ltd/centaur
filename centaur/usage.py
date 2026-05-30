@@ -200,6 +200,107 @@ class UsageLedger:
             return None
         return self._normalize_daily_protection_row(row)
 
+    def upsert_broker_daily_protection_state(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+        market_open_at: datetime,
+        tick_id: str,
+        checked_at: datetime,
+        current_equity: float,
+        max_daily_drawdown_usd: float,
+        system_status: str,
+        notes: str = "",
+    ) -> dict[str, Any]:
+        """Create/update a broker-specific daily drawdown protection row.
+
+        Live readiness uses this instead of the paper-only table so each broker
+        can keep an independent session baseline, protection latch, stale-order
+        count, and audit note trail.
+        """
+        if self.backend == "postgres":
+            row = self._upsert_broker_daily_protection_state_postgres(
+                session_date=session_date,
+                broker_id=broker_id,
+                market_open_at=market_open_at,
+                tick_id=tick_id,
+                checked_at=checked_at,
+                current_equity=current_equity,
+                max_daily_drawdown_usd=max_daily_drawdown_usd,
+                system_status=system_status,
+                notes=notes,
+            )
+        else:
+            row = self._upsert_broker_daily_protection_state_sqlite(
+                session_date=session_date,
+                broker_id=broker_id,
+                market_open_at=market_open_at,
+                tick_id=tick_id,
+                checked_at=checked_at,
+                current_equity=current_equity,
+                max_daily_drawdown_usd=max_daily_drawdown_usd,
+                system_status=system_status,
+                notes=notes,
+            )
+        return self._normalize_daily_protection_row(row)
+
+    def get_broker_daily_protection_state(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the broker-specific session protection row if it exists."""
+        if self.backend == "postgres":
+            row = self._get_broker_daily_protection_state_postgres(
+                session_date=session_date,
+                broker_id=broker_id,
+            )
+        else:
+            row = self._get_broker_daily_protection_state_sqlite(
+                session_date=session_date,
+                broker_id=broker_id,
+            )
+        if row is None:
+            return None
+        return self._normalize_daily_protection_row(row)
+
+    def increment_broker_daily_stale_order_count(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+        tick_id: str,
+        checked_at: datetime,
+        count: int,
+    ) -> int:
+        """Record broker-specific stale-order cleanup in the protection audit."""
+        if count <= 0:
+            row = self.get_broker_daily_protection_state(
+                session_date=session_date,
+                broker_id=broker_id,
+            )
+            return int(row.get("stale_orders_reaped_count", 0) or 0) if row else 0
+        if self.backend == "postgres":
+            row = self._increment_broker_daily_stale_order_count_postgres(
+                session_date=session_date,
+                broker_id=broker_id,
+                tick_id=tick_id,
+                checked_at=checked_at,
+                count=count,
+            )
+        else:
+            row = self._increment_broker_daily_stale_order_count_sqlite(
+                session_date=session_date,
+                broker_id=broker_id,
+                tick_id=tick_id,
+                checked_at=checked_at,
+                count=count,
+            )
+        normalized = self._normalize_daily_protection_row(row) if row else {}
+        return int(normalized.get("stale_orders_reaped_count", 0) or 0)
+
     def backfill_api_costs(self) -> dict[str, Any]:
         if self.backend == "postgres":
             return self._backfill_api_costs_postgres()
@@ -1628,6 +1729,34 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS broker_daily_protection_state (
+                    session_date TEXT NOT NULL,
+                    broker_id TEXT NOT NULL,
+                    market_open_at TEXT NOT NULL,
+                    baseline_tick_id TEXT NOT NULL,
+                    baseline_equity REAL NOT NULL DEFAULT 0,
+                    first_checked_at TEXT NOT NULL,
+                    last_tick_id TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL,
+                    latest_equity REAL NOT NULL DEFAULT 0,
+                    equity_drawdown_usd REAL NOT NULL DEFAULT 0,
+                    max_daily_drawdown_usd REAL NOT NULL DEFAULT 0,
+                    system_status TEXT NOT NULL DEFAULT 'active',
+                    protection_triggered_at TEXT,
+                    stale_orders_reaped_count INTEGER NOT NULL DEFAULT 0,
+                    notes TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (session_date, broker_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_broker_daily_protection_state_status
+                ON broker_daily_protection_state (broker_id, session_date, system_status)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS strategy_threshold_adaptive_state (
                     state_id TEXT PRIMARY KEY,
                     effective_threshold REAL NOT NULL,
@@ -2115,6 +2244,34 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_daily_protection_state_status
                     ON daily_protection_state (session_date, system_status)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS broker_daily_protection_state (
+                        session_date DATE NOT NULL,
+                        broker_id TEXT NOT NULL,
+                        market_open_at TIMESTAMPTZ NOT NULL,
+                        baseline_tick_id TEXT NOT NULL,
+                        baseline_equity DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        first_checked_at TIMESTAMPTZ NOT NULL,
+                        last_tick_id TEXT NOT NULL,
+                        last_checked_at TIMESTAMPTZ NOT NULL,
+                        latest_equity DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        equity_drawdown_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        max_daily_drawdown_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        system_status TEXT NOT NULL DEFAULT 'active',
+                        protection_triggered_at TIMESTAMPTZ,
+                        stale_orders_reaped_count INTEGER NOT NULL DEFAULT 0,
+                        notes TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (session_date, broker_id)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_broker_daily_protection_state_status
+                    ON broker_daily_protection_state (broker_id, session_date, system_status)
                     """
                 )
                 cursor.execute(
@@ -5528,6 +5685,277 @@ class UsageLedger:
                         f"stale_orders_reaped+={count}",
                         f"stale_orders_reaped+={count}",
                         session_date,
+                    ),
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_broker_daily_protection_state_sqlite(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM broker_daily_protection_state
+                WHERE session_date = ? AND broker_id = ?
+                LIMIT 1
+                """,
+                (session_date.isoformat(), str(broker_id).strip().lower()),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_broker_daily_protection_state_postgres(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM broker_daily_protection_state
+                    WHERE session_date = %s AND broker_id = %s
+                    LIMIT 1
+                    """,
+                    (session_date, str(broker_id).strip().lower()),
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def _upsert_broker_daily_protection_state_sqlite(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+        market_open_at: datetime,
+        tick_id: str,
+        checked_at: datetime,
+        current_equity: float,
+        max_daily_drawdown_usd: float,
+        system_status: str,
+        notes: str,
+    ) -> dict[str, Any]:
+        normalized_broker_id = str(broker_id).strip().lower()
+        protection_triggered_at = checked_at.isoformat() if system_status == "protected" else None
+        with self._connect_sqlite() as connection:
+            # Preserve the first baseline and latch `protected` once reached for
+            # the session; later equity recovery must not silently re-enable entries.
+            connection.execute(
+                """
+                INSERT INTO broker_daily_protection_state (
+                    session_date, broker_id, market_open_at, baseline_tick_id, baseline_equity,
+                    first_checked_at, last_tick_id, last_checked_at, latest_equity,
+                    equity_drawdown_usd, max_daily_drawdown_usd, system_status,
+                    protection_triggered_at, stale_orders_reaped_count, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT(session_date, broker_id) DO UPDATE SET
+                    last_tick_id = excluded.last_tick_id,
+                    last_checked_at = excluded.last_checked_at,
+                    latest_equity = excluded.latest_equity,
+                    equity_drawdown_usd = ROUND(MAX(0, broker_daily_protection_state.baseline_equity - excluded.latest_equity), 6),
+                    max_daily_drawdown_usd = excluded.max_daily_drawdown_usd,
+                    system_status = CASE
+                        WHEN broker_daily_protection_state.system_status = 'protected' OR excluded.system_status = 'protected'
+                        THEN 'protected'
+                        ELSE excluded.system_status
+                    END,
+                    protection_triggered_at = CASE
+                        WHEN broker_daily_protection_state.protection_triggered_at IS NOT NULL
+                        THEN broker_daily_protection_state.protection_triggered_at
+                        WHEN excluded.system_status = 'protected'
+                        THEN excluded.protection_triggered_at
+                        ELSE NULL
+                    END,
+                    notes = CASE
+                        WHEN excluded.notes <> '' THEN excluded.notes
+                        ELSE broker_daily_protection_state.notes
+                    END
+                """,
+                (
+                    session_date.isoformat(),
+                    normalized_broker_id,
+                    market_open_at.isoformat(),
+                    tick_id,
+                    current_equity,
+                    checked_at.isoformat(),
+                    tick_id,
+                    checked_at.isoformat(),
+                    current_equity,
+                    0.0,
+                    max_daily_drawdown_usd,
+                    system_status,
+                    protection_triggered_at,
+                    notes,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT *
+                FROM broker_daily_protection_state
+                WHERE session_date = ? AND broker_id = ?
+                LIMIT 1
+                """,
+                (session_date.isoformat(), normalized_broker_id),
+            ).fetchone()
+        return dict(row) if row is not None else {}
+
+    def _upsert_broker_daily_protection_state_postgres(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+        market_open_at: datetime,
+        tick_id: str,
+        checked_at: datetime,
+        current_equity: float,
+        max_daily_drawdown_usd: float,
+        system_status: str,
+        notes: str,
+    ) -> dict[str, Any]:
+        normalized_broker_id = str(broker_id).strip().lower()
+        protection_triggered_at = checked_at if system_status == "protected" else None
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                # Match the SQLite behavior: first baseline wins and protected
+                # status stays latched for the broker/session.
+                cursor.execute(
+                    """
+                    INSERT INTO broker_daily_protection_state (
+                        session_date, broker_id, market_open_at, baseline_tick_id, baseline_equity,
+                        first_checked_at, last_tick_id, last_checked_at, latest_equity,
+                        equity_drawdown_usd, max_daily_drawdown_usd, system_status,
+                        protection_triggered_at, stale_orders_reaped_count, notes
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, 0, %s
+                    )
+                    ON CONFLICT(session_date, broker_id) DO UPDATE SET
+                        last_tick_id = EXCLUDED.last_tick_id,
+                        last_checked_at = EXCLUDED.last_checked_at,
+                        latest_equity = EXCLUDED.latest_equity,
+                        equity_drawdown_usd = GREATEST(0, broker_daily_protection_state.baseline_equity - EXCLUDED.latest_equity),
+                        max_daily_drawdown_usd = EXCLUDED.max_daily_drawdown_usd,
+                        system_status = CASE
+                            WHEN broker_daily_protection_state.system_status = 'protected' OR EXCLUDED.system_status = 'protected'
+                            THEN 'protected'
+                            ELSE EXCLUDED.system_status
+                        END,
+                        protection_triggered_at = CASE
+                            WHEN broker_daily_protection_state.protection_triggered_at IS NOT NULL
+                            THEN broker_daily_protection_state.protection_triggered_at
+                            WHEN EXCLUDED.system_status = 'protected'
+                            THEN EXCLUDED.protection_triggered_at
+                            ELSE NULL
+                        END,
+                        notes = CASE
+                            WHEN EXCLUDED.notes <> '' THEN EXCLUDED.notes
+                            ELSE broker_daily_protection_state.notes
+                        END
+                    RETURNING *
+                    """,
+                    (
+                        session_date,
+                        normalized_broker_id,
+                        market_open_at,
+                        tick_id,
+                        current_equity,
+                        checked_at,
+                        tick_id,
+                        checked_at,
+                        current_equity,
+                        0.0,
+                        max_daily_drawdown_usd,
+                        system_status,
+                        protection_triggered_at,
+                        notes,
+                    ),
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else {}
+
+    def _increment_broker_daily_stale_order_count_sqlite(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+        tick_id: str,
+        checked_at: datetime,
+        count: int,
+    ) -> dict[str, Any] | None:
+        normalized_broker_id = str(broker_id).strip().lower()
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                UPDATE broker_daily_protection_state
+                SET last_tick_id = ?,
+                    last_checked_at = ?,
+                    stale_orders_reaped_count = stale_orders_reaped_count + ?,
+                    notes = CASE
+                        WHEN notes = '' THEN ?
+                        ELSE notes || ' | ' || ?
+                    END
+                WHERE session_date = ? AND broker_id = ?
+                """,
+                (
+                    tick_id,
+                    checked_at.isoformat(),
+                    count,
+                    f"live_stale_orders_reaped+={count}",
+                    f"live_stale_orders_reaped+={count}",
+                    session_date.isoformat(),
+                    normalized_broker_id,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT *
+                FROM broker_daily_protection_state
+                WHERE session_date = ? AND broker_id = ?
+                LIMIT 1
+                """,
+                (session_date.isoformat(), normalized_broker_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _increment_broker_daily_stale_order_count_postgres(
+        self,
+        *,
+        session_date: date,
+        broker_id: str,
+        tick_id: str,
+        checked_at: datetime,
+        count: int,
+    ) -> dict[str, Any] | None:
+        normalized_broker_id = str(broker_id).strip().lower()
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    UPDATE broker_daily_protection_state
+                    SET last_tick_id = %s,
+                        last_checked_at = %s,
+                        stale_orders_reaped_count = stale_orders_reaped_count + %s,
+                        notes = CASE
+                            WHEN notes = '' THEN %s
+                            ELSE notes || ' | ' || %s
+                        END
+                    WHERE session_date = %s AND broker_id = %s
+                    RETURNING *
+                    """,
+                    (
+                        tick_id,
+                        checked_at,
+                        count,
+                        f"live_stale_orders_reaped+={count}",
+                        f"live_stale_orders_reaped+={count}",
+                        session_date,
+                        normalized_broker_id,
                     ),
                 )
                 row = cursor.fetchone()

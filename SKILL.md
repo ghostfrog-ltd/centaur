@@ -10,6 +10,7 @@ Before changing code or behavior:
 4. Read `PROGRESS.txt`
 5. Check the relevant code paths before editing
 6. For unattended scheduler changes, keep the live wrapper, launch agent interval, and lock/skip behavior aligned so the configured cadence matches real operation
+7. For safety-critical trading paths, keep docstrings/comments aligned with the current gate, risk boundary, and audit trail
 
 ## Skill: Safe Paper Execution Checks
 When working on Alpaca paper execution:

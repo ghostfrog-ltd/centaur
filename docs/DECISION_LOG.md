@@ -2,7 +2,201 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-05-28
+Last updated: 2026-05-29
+
+## 2026-05-29
+
+### Activate Alpaca Live by explicit operator override
+Decision:
+- accept the operator's explicit 2026-05-29 go-live instruction to turn on Alpaca Live
+- activate only the already recorded same-as-paper follower lane
+- flip only the three activation controls: `LIVE_EXECUTION_ENABLED=true`, `LIVE_EXECUTION_ACTIVATION_ACK=LIVE_TRADING_APPROVED`, and `LIVE_EXECUTION_KILL_SWITCH=false`
+- keep all other first-live controls unchanged: `$10` entries, `10` base slots, one order per tick, `$5.00` live daily protector, equities plus crypto, current paper strategy allowlist, same-tick submitted-paper-order follow rule, shared paper/shadow strategy fitness, and read-only live execution intelligence
+
+Why:
+- the remaining blocker was not technical readiness; it was explicit operator authorization
+- the operator provided that authorization in plain language after the account was funded and the first-live policy was recorded
+- the small fixed envelope keeps first live bounded while still matching the paper lane as requested
+
+Pre-activation read-only check:
+- checked at about `2026-05-29 10:48 BST`
+- Alpaca Live status: `ACTIVE`
+- trading blocked: `false`
+- account blocked: `false`
+- user trade suspended: `false`
+- cash/equity/buying power: `132.05`
+- live positions: `0`
+- recent live orders: `0`
+- open live orders: `0`
+- live daily protection: `active`
+- live daily-protection baseline: `132.05`
+- live daily drawdown: `0.0`
+- local guard before activation: blocked with `live_execution_disabled`
+- latest scheduler control tick before activation: `OK`
+
+Rollback rule:
+- immediately set `LIVE_EXECUTION_KILL_SWITCH=true` if any live behavior is surprising
+- set `LIVE_EXECUTION_ENABLED=false` as the hard rollback if needed
+- do not widen notional, slots, strategy allowlist, asset classes, projected-gain floors, or daily loss limits without a separate explicit override
+
+### Record first-live activation plan
+Decision:
+- record the first-live policy before any live flags are changed
+- use a same-as-paper Alpaca Live follower lane by operator request, rather than the safer generic one-strategy default
+- allow only the current paper execution strategies for first live: `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`
+- keep the live lane dependent on same-tick paper approval and same-proposal paper order submission
+- treat the observed `132.05` account balance as funding readiness, while keeping the launch operating envelope at `$10 x 10 = $100`
+
+Why:
+- the operator explicitly wants live to be "same as paper" once enabled
+- the repo needs the difference between "ready for the final switch" and "live trading enabled" to be auditable
+- same-as-paper is acceptable only because the hard capital envelope remains small and live can only follow paper-submitted orders
+
+Implementation notes:
+- first-live asset classes: equities and crypto
+- first-live notional: `$10`
+- first-live base slots: `10`
+- first-live max orders per tick: `1`
+- first-live daily live drawdown protector: `$5.00`
+- first-live projected-gain floors: `1.5%` equities and `2.0%` crypto
+- first-live limit buffers: `5` bps equities and `25` bps crypto
+- extra funds above `$100` are buffer only and do not create additional launch slots
+- rollback triggers include unexpected live positions/orders, account blocks or suspensions, unmatched live-vs-paper orders, surprising fill/status drift, stale live orders that cannot be refreshed, unavailable account equity, the `$5.00` protector triggering, or operator discomfort
+- rollback action is to set `LIVE_EXECUTION_KILL_SWITCH=true`, set `LIVE_EXECUTION_ENABLED=false` if needed, stop new entries, inspect/manage positions deliberately, and record the reason
+- this records readiness for a final explicit go-live override; it does not enable live trading, clear the kill switch, or set `LIVE_EXECUTION_ACTIVATION_ACK`
+
+Post-activation observation:
+- first fully live-enabled observed tick: `20260529-105313`
+- tick status: `OK`
+- live sync still showed `0` positions and `0` open orders with `132.050` equity/cash
+- live CFO decision was `hold` with reason `no_paper_approved_trade_to_follow`
+- live execution submitted `0` orders and saved `0` orders
+- post-activation read-only check still showed `0` live positions, `0` recent live orders, and `0` open live orders
+
+### Record Alpaca Live funded read-only check
+Decision:
+- record that the initial Alpaca Live funds are visible and read-only funded checks passed
+- keep all live execution gates closed until an explicit go-live override records strategy policy, limits, and rollback rules
+- preserve the intended `$10 x 10` envelope even though the live balance is now above `$100`
+
+Why:
+- funded account visibility is the final external prerequisite before a go-live decision, but it is not itself permission to trade
+- the actual credited balance is slightly above the planned bankroll model, so the docs must state that it does not widen risk
+
+Implementation notes:
+- Alpaca Live account status is `ACTIVE`, not trading-blocked, not account-blocked, and not user-suspended
+- cash, equity, and buying power are `132.05`
+- read-only positions/orders checks returned `0` positions, `0` recent orders, and `0` open orders
+- the local live adapter guard still blocks a test buy with `live_execution_disabled`
+- `alpaca_live.sync` completed in read-only mode; live daily protection is `active` with baseline equity `132.05`, drawdown `0.0`, and max daily drawdown `5.0`
+- this does not enable live execution, clear the kill switch, set the activation acknowledgement, or approve live-money trading
+
+### Record Alpaca Live read-only key check
+Decision:
+- record that Alpaca Live API keys have been added locally and passed the first read-only checks
+- keep all live execution gates closed while waiting for funds to appear
+- treat valid keys and an active account as connectivity/readiness only, not go-live approval
+
+Why:
+- live API access is a real boundary, so the exact read-only result should be auditable before any future activation discussion
+- the account currently has no funds, positions, or orders, which is the expected safe state before the initial deposit credits
+
+Implementation notes:
+- config detects Alpaca Live credentials
+- read-only Alpaca Live account check returned `ACTIVE`, not trading-blocked, not account-blocked, and not user-suspended
+- read-only positions/orders checks returned `0` positions, `0` recent orders, and `0` open orders
+- cash, equity, and buying power were `0.0`, so the next external wait is funds crediting
+- the local live adapter guard still blocks a test buy with `live_execution_disabled`
+- the `alpaca_live.sync` pipeline step completed in read-only mode and live daily protection remained blocked with `live_equity_unavailable`
+- this does not enable live execution, clear the kill switch, set the activation acknowledgement, or approve live-money trading
+
+### Record Alpaca Live account-approval waiting state
+Decision:
+- record that Centaur is waiting for Alpaca Live account approval before any live-money go-live
+- treat account approval as a prerequisite only, not as permission to trade live
+- preserve the dormant live settings until read-only live key/account checks and an explicit go-live override are recorded
+
+Why:
+- the live readiness lane is now mechanically prepared, so the remaining human/process steps need to be written down before account approval arrives
+- account approval can create a false sense of readiness even though API keys, read-only validation, first-live limits, rollback rules, and reliability-stack updates still need to happen
+
+Implementation notes:
+- `docs/GO_LIVE_CHECKLIST.md` now includes a current waiting state and ordered next steps after account approval
+- `PROGRESS.txt` and `docs/PROJECT_RECORD.md` now record that account approval is the current external wait
+- this does not add live credentials, enable live execution, clear the kill switch, set the activation acknowledgement, or approve live-money trading
+
+### Require doc blocks for safety-critical trading paths
+Decision:
+- make docstrings or compact nearby comments mandatory for safety-critical trading paths
+- require those notes to explain the gate, capital-protection reason, and audit trail for live execution, broker adapters, risk gates, daily protection, stale-order handling, managed exits, and persistence writes
+
+Why:
+- the operator wants the system ready enough that live-vs-paper behavior can be audited without guessing intent from code shape alone
+- trading code ages badly when the reason for a guard is separated from the guard itself
+- comments should protect capital by explaining non-obvious boundaries, not cluttering obvious assignments
+
+Implementation notes:
+- `CONSTRAINTS.md` now contains a documentation and auditability rule
+- `SKILL.md` now reminds future work to keep safety-path doc blocks aligned
+- live readiness hardening functions now carry focused docstrings/comments around activation gates, cancellation, stale-order reaping, daily protection, and submitted-paper-order following
+- this changes documentation discipline only; it does not enable live trading or alter risk settings
+
+### Harden Alpaca Live mechanics to match paper while keeping gates closed
+Decision:
+- add the missing live-side protective mechanics so the dormant lane can be called operationally same-as-paper once deliberately activated
+- keep live entries blocked by default with `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_KILL_SWITCH=true`, missing credentials, and empty activation acknowledgement
+- require live entries to follow only same-tick paper approvals that paper execution actually submitted
+
+Why:
+- API keys and a future enable flag should not expose a weaker live lane than paper
+- cancellation, stale-entry reaping, managed exit refresh, live account readiness, and durable daily protection are protective controls, not optional conveniences
+- live should share the same strategy/fitness brain as paper at first while keeping its own broker/account/order safeguards
+
+Implementation notes:
+- Alpaca Live cancellation is now guarded instead of scaffold-blocked, requiring credentials, live enablement, and `LIVE_TRADING_APPROVED`
+- live buy entries remain blocked while the live kill switch is on; guarded sell exits can still be submitted after activation so protective exits are not blocked by the entry kill switch
+- live daily protection now persists and latches by broker/session in `broker_daily_protection_state`
+- the default pipeline now runs `maintenance.live_stale_orders` for stale live equity entry limits
+- live managed exits now cancel and replace stale or non-marketable open sell exits like paper
+- the live CFO gate checks the live account's own trade-ready state and follows only paper orders that were actually submitted on the same tick
+- this does not add live credentials, enable live execution, clear the kill switch, set the activation acknowledgement, or approve live-money trading
+
+### Add read-only live execution intelligence
+Decision:
+- add a separate live execution intelligence surface to status snapshots and the web dashboard
+- keep strategy intelligence shared through the existing shadow-fitness scorecard instead of giving live its own independent strategy scorer
+- compare future `alpaca_live` entry orders against same-proposal paper entry orders by `proposal_id`
+- report recent paper/live entry sample counts, matched live followups, unmatched live entries, status mismatches, average absolute fill drift in bps, example fill pairs, and current live blockers
+
+Why:
+- live and paper should use the same market data and strategy decision brain at first
+- the live lane still needs its own execution intelligence because real fills, rejects, partial fills, and account state can diverge from paper
+- surfacing divergence is safer than letting live learn independently from a tiny and noisy real-money sample
+
+Implementation notes:
+- `StatusReporter.snapshot()` now includes `live_execution_intelligence`
+- CLI status renders a `Live execution intelligence` section
+- the web dashboard renders the same read-only monitor
+- this is observability only; it does not activate live trading, score independent live strategy fitness, change broker routing, or loosen any risk gate
+
+### Prepare Alpaca Live readiness to mirror paper while keeping real orders blocked
+Decision:
+- configure the dormant Alpaca Live readiness envelope to mirror the current paper envelope where live has matching controls
+- set live readiness to equities plus crypto, the same paper strategy allowlist, `$10` notional, `10` base slots, one order per tick, `$5.00` daily drawdown protector, `1.5%` equity projected-gain floor, `2.0%` crypto projected-gain floor, `5` bps equity marketable-limit buffer, and `25` bps crypto marketable-limit buffer
+- add live-specific crypto projected-gain and crypto limit-buffer config fields so the live readiness lane can actually match paper crypto settings instead of using the equity defaults
+- keep live order submission blocked by default with `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_KILL_SWITCH=true`, missing Alpaca Live credentials, and empty `LIVE_EXECUTION_ACTIVATION_ACK`
+
+Why:
+- the operator wants the live lane prepared so only the protected go-live controls remain after live API credentials are added
+- readiness should match the proven paper envelope rather than accidentally using weaker crypto admission or fill settings
+- API keys and the enable flag alone must still be insufficient because the repo requires an explicit go-live override and rollback record before live-money submission
+
+Implementation notes:
+- `.env` and `.env.example` now expose `LIVE_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT=0.02` and `LIVE_EXECUTION_CRYPTO_LIMIT_BUFFER_BPS=25.0`
+- `_build_live_trade_approval()` now uses the crypto-specific live projected-gain floor for crypto proposals
+- live managed exits now use the crypto-specific live limit buffer for crypto positions
+- status readiness output includes the live crypto projected-gain and limit-buffer fields
+- this does not turn on live trading, lower the live kill switch, add live credentials, set the live activation acknowledgement, or remove the same-tick paper-approved-trade requirement
 
 ## 2026-05-28
 
@@ -398,7 +592,7 @@ Decision:
 - add live account/order sync, live daily-loss checking, live CFO gating, and live execution steps to the default pipeline
 - add a dormant live managed-exit step that reuses the persisted entry plan for stop/target/holding-window exits
 - keep the lane disabled by default and require multiple explicit activation gates before any real-money order submission
-- require a same-tick paper-approved trade before live can consider following it
+- require a same-tick paper-approved trade before live can consider following it; this was later hardened to require a submitted paper order on that same tick
 
 Why:
 - first production should use the same signal/fitness brain as paper rather than invent a separate live strategy
@@ -406,7 +600,7 @@ Why:
 - API keys alone must not be enough to place real-money trades
 
 Implementation notes:
-- current `.env` keeps `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_KILL_SWITCH=true`, and an empty live allowlist
+- at that time, `.env` kept `LIVE_EXECUTION_ENABLED=false`, `LIVE_EXECUTION_KILL_SWITCH=true`, and an empty live allowlist
 - live order submission also requires `LIVE_EXECUTION_ACTIVATION_ACK=LIVE_TRADING_APPROVED`
 - this does not activate live trading, change paper notional, alter paper broker routing, or widen strategy/risk policy
 
@@ -1111,7 +1305,7 @@ Implementation notes:
 Decision:
 - add an `alpaca_live` broker adapter identity and config surface for a possible May 2026 go-live discussion
 - keep Alpaca Paper as the only active execution broker
-- keep Alpaca Live order submission and cancellation blocked in the adapter
+- keep Alpaca Live order submission and cancellation blocked in the adapter at that stage; this was later superseded by guarded live cancellation/readiness plumbing while live entries stayed disabled by default
 - expose live-readiness state in status/dashboard output without polling or trading the live account by default
 
 Why:

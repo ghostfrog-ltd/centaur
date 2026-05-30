@@ -70,14 +70,14 @@ Danger signs:
 - Operations store: PostgreSQL
 - Dashboard: DDEV/OrbStack web dashboard at `https://ghostfrog-centaur.ddev.site`
 - Active broker: Alpaca Paper
-- Live broker: Alpaca Live scaffold/dormant follower lane, safe-off by default
+- Live broker: Alpaca Live same-as-paper follower lane approved for activation on 2026-05-29
 - Trade size: `$10` paper notional
 - Base paper slots: `10`
 - Earned slots: each full `$10` of tracked paper P/L earns one extra `$10` slot
 - Allowed paper strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`
 - Paper exit capture: `1.25%`
 - Shadow target ladder: `1.25%`, `2%`, `3%`, `4%`, `6%`
-- Live-money trading: off
+- Live-money trading: approved only inside the recorded `$10 x 10` Alpaca Live envelope
 
 API keys alone must not activate live trading.
 
@@ -93,7 +93,7 @@ Read these before changing behavior:
 
 Important current constraints:
 
-- No live-money order submission without a separate go-live override.
+- No live-money order submission outside the recorded 2026-05-29 go-live override.
 - No paper trade above `$10` notional without explicit approval.
 - No silent broker switch.
 - No silent risk widening.
@@ -120,10 +120,10 @@ Each control tick is an explicit sequence:
 11. Create shadow proposals.
 12. Apply paper CFO/risk approval.
 13. Submit Alpaca Paper orders.
-14. Keep the dormant live lane safe-off.
+14. Let Alpaca Live follow only submitted same-tick paper trades if every live gate passes.
 15. Persist diagnostics for status and review.
 
-Paper and future live can see the same signal, but each lane must pass its own checks.
+Paper and live can see the same signal, but each lane must pass its own checks.
 
 ## How The Current Paper Rules Work
 
@@ -528,7 +528,14 @@ These live in `.env`. Use `.env.example` as the template.
 
 ### Live Execution
 
-Live execution has its own variables and is safe-off by default.
+Live execution has its own variables and remains bounded by explicit activation gates.
+Strategy fitness remains shared through shadow outcomes. The live execution
+intelligence surface is read-only and monitors future live-vs-paper fill drift,
+status mismatch, unmatched live orders, and blockers. The live mechanics are
+prepared to mirror paper, including live account readiness, persisted daily
+protection, stale-entry cleanup, and managed sell-exit refresh. The 2026-05-29
+operator override authorizes activation only inside the recorded same-as-paper
+micro envelope.
 
 `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY`
 : Alpaca Live credentials. Credentials alone are insufficient.
@@ -561,10 +568,16 @@ Live execution has its own variables and is safe-off by default.
 : Live daily loss limit.
 
 `LIVE_EXECUTION_MIN_PROJECTED_GAIN_PCT`
-: Live projected-gain floor.
+: Live equity projected-gain floor.
+
+`LIVE_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT`
+: Live crypto projected-gain floor.
 
 `LIVE_EXECUTION_LIMIT_BUFFER_BPS`
-: Live marketable-limit buffer.
+: Live equity marketable-limit buffer.
+
+`LIVE_EXECUTION_CRYPTO_LIMIT_BUFFER_BPS`
+: Live crypto marketable-limit buffer.
 
 `LIVE_EXECUTION_EQUITY_BROKER_ID` / `LIVE_EXECUTION_CRYPTO_BROKER_ID`
 : Live broker routing ids.
@@ -578,13 +591,32 @@ Live execution has its own variables and is safe-off by default.
 Live trading requires all of these to be intentionally handled:
 
 - live execution enabled
-- live kill switch off
+- live entry kill switch off
 - live credentials present
 - activation acknowledgement set
 - live strategy allowlist configured
 - go-live checklist updated
 
+API keys plus `LIVE_EXECUTION_ENABLED=true` are not enough. Live entries only
+follow paper trades that were approved and actually submitted on the same tick;
+guarded cancellation and managed sell exits exist so a deliberately activated
+live lane can protect positions like paper.
+
 Do not infer live readiness from paper success.
+
+Current funded readiness state: Alpaca Live keys and read-only funded checks
+passed with an active, unblocked account, `132.05` cash/equity/buying power,
+and no positions or recent/open orders. That balance does not widen the `$10 x
+10` live envelope. First-live strategy policy, limits, and rollback rules are
+now recorded: by operator request, live starts as a same-as-paper follower lane
+using the current paper strategy allowlist, equities plus crypto, `$10` entries,
+`10` base slots, one order per tick, the `$5.00` live daily protector, shared
+paper/shadow fitness, and read-only live execution intelligence. The extra
+`32.05` above the `$100` operating envelope is buffer only. On 2026-05-29 at
+about 10:48 BST, the operator explicitly approved turning Alpaca Live on within
+that recorded envelope. That approval does not widen notional, slots, strategy
+allowlist, asset classes, projected-gain floors, limit buffers, or daily loss
+limits.
 
 ## Key Commands
 

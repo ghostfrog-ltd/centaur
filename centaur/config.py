@@ -139,7 +139,9 @@ class RuntimeConfig:
     live_execution_default_notional_usd: float
     live_execution_max_daily_drawdown_usd: float
     live_execution_min_projected_gain_pct: float
+    live_execution_crypto_min_projected_gain_pct: float
     live_execution_limit_buffer_bps: float
+    live_execution_crypto_limit_buffer_bps: float
     live_execution_equity_broker_id: str
     live_execution_crypto_broker_id: str
     live_execution_allowed_strategies: tuple[str, ...]
@@ -557,9 +559,17 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("LIVE_EXECUTION_MIN_PROJECTED_GAIN_PCT"),
             default=0.015,
         ),
+        live_execution_crypto_min_projected_gain_pct=_parse_float(
+            os.getenv("LIVE_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"),
+            default=0.02,
+        ),
         live_execution_limit_buffer_bps=_parse_float(
             os.getenv("LIVE_EXECUTION_LIMIT_BUFFER_BPS"),
             default=5.0,
+        ),
+        live_execution_crypto_limit_buffer_bps=_parse_float(
+            os.getenv("LIVE_EXECUTION_CRYPTO_LIMIT_BUFFER_BPS"),
+            default=25.0,
         ),
         live_execution_equity_broker_id=(
             os.getenv("LIVE_EXECUTION_EQUITY_BROKER_ID", "alpaca_live").strip().lower()

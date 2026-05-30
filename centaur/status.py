@@ -44,6 +44,7 @@ class StatusReporter:
         account_overview = snapshot["account_overview"]
         broker_accounts = snapshot["broker_accounts"]
         live_execution_overview = snapshot["live_execution_overview"]
+        live_execution_intelligence = snapshot["live_execution_intelligence"]
         performance_comparison = snapshot["performance_comparison"]
         open_positions = snapshot["open_positions"]
         cost_overview = snapshot["cost_overview"]
@@ -109,6 +110,11 @@ class StatusReporter:
         lines.append("")
         lines.append("Live readiness:")
         for detail in self._render_live_execution_overview(live_execution_overview):
+            lines.append(f"- {detail}")
+
+        lines.append("")
+        lines.append("Live execution intelligence:")
+        for detail in self._render_live_execution_intelligence(live_execution_intelligence):
             lines.append(f"- {detail}")
 
         lines.append("")
@@ -201,6 +207,7 @@ class StatusReporter:
         recent_broker_account_rows = self.usage_ledger.list_recent_broker_account_snapshots(limit=24)
         cost_overview = self._build_cost_overview(checked_at=checked_at)
         account_overview = self._build_account_overview(latest_tick=latest_tick)
+        live_execution_overview = self._build_live_execution_overview()
         snapshot = {
             "checked_at": checked_at,
             "latest_tick": latest_tick,
@@ -215,7 +222,11 @@ class StatusReporter:
             "broker_accounts": self._build_broker_accounts(
                 broker_snapshot_rows=recent_broker_account_rows,
             ),
-            "live_execution_overview": self._build_live_execution_overview(),
+            "live_execution_overview": live_execution_overview,
+            "live_execution_intelligence": self._build_live_execution_intelligence(
+                recent_orders=recent_order_history,
+                live_execution_overview=live_execution_overview,
+            ),
             "performance_comparison": self._build_performance_comparison(
                 checked_at=checked_at,
                 latest_tick=latest_tick,
@@ -1301,6 +1312,7 @@ class StatusReporter:
         return accounts
 
     def _build_live_execution_overview(self) -> dict[str, Any]:
+        """Summarize live readiness without implying live-money approval."""
         slot_size = float(self.config.live_execution_default_notional_usd)
         max_slots = int(self.config.live_execution_max_open_positions)
         envelope_max_usd = round(slot_size * max_slots, 6)
@@ -1338,15 +1350,123 @@ class StatusReporter:
             "require_market_open": self.config.live_execution_require_market_open,
             "equity_only": self.config.live_execution_equity_only,
             "min_projected_gain_pct": float(self.config.live_execution_min_projected_gain_pct),
+            "crypto_min_projected_gain_pct": float(
+                self.config.live_execution_crypto_min_projected_gain_pct
+            ),
             "limit_buffer_bps": float(self.config.live_execution_limit_buffer_bps),
+            "crypto_limit_buffer_bps": float(
+                self.config.live_execution_crypto_limit_buffer_bps
+            ),
             "equity_broker_id": self.config.live_execution_equity_broker_id,
             "crypto_broker_id": self.config.live_execution_crypto_broker_id,
             "allowed_strategies": list(self.config.live_execution_allowed_strategies),
             "blockers": blockers,
             "note": (
-                "Prepared for side-by-side paper/live operation. Live orders require "
+                "Prepared for side-by-side paper/live operation. Live entries require "
                 "credentials, explicit enablement, kill switch off, activation ack, "
-                "and a live strategy allowlist before they can follow paper-approved trades."
+                "and a live strategy allowlist before they can follow submitted paper trades."
+            ),
+        }
+
+    def _build_live_execution_intelligence(
+        self,
+        *,
+        recent_orders: list[dict[str, Any]],
+        live_execution_overview: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compare future live follower entries with same-proposal paper entries.
+
+        This is deliberately read-only: strategy scoring remains shared shadow
+        fitness, while this surface watches for execution divergence such as
+        fill drift, status mismatch, or unmatched live orders.
+        """
+        paper_brokers = {
+            str(self.config.paper_execution_equity_broker_id or "alpaca_paper").strip().lower(),
+            str(self.config.paper_execution_crypto_broker_id or "alpaca_paper").strip().lower(),
+        }
+        live_brokers = {
+            str(self.config.live_execution_equity_broker_id or "alpaca_live").strip().lower(),
+            str(self.config.live_execution_crypto_broker_id or "alpaca_live").strip().lower(),
+        }
+        paper_entries = [
+            order
+            for order in recent_orders
+            if str(order.get("broker_id", "")).strip().lower() in paper_brokers
+            and str(order.get("side", "")).strip().lower() == "buy"
+        ]
+        live_entries = [
+            order
+            for order in recent_orders
+            if str(order.get("broker_id", "")).strip().lower() in live_brokers
+            and str(order.get("side", "")).strip().lower() == "buy"
+        ]
+        paper_by_proposal = {
+            str(order.get("proposal_id", "")).strip(): order
+            for order in paper_entries
+            if str(order.get("proposal_id", "")).strip()
+        }
+        matched_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        unmatched_live: list[dict[str, Any]] = []
+        for live_order in live_entries:
+            proposal_id = str(live_order.get("proposal_id", "")).strip()
+            paper_order = paper_by_proposal.get(proposal_id)
+            if paper_order is None:
+                unmatched_live.append(live_order)
+            else:
+                matched_pairs.append((paper_order, live_order))
+
+        fill_drifts: list[dict[str, Any]] = []
+        status_mismatches = 0
+        for paper_order, live_order in matched_pairs:
+            paper_fill = self._to_float(paper_order.get("filled_avg_price"))
+            live_fill = self._to_float(live_order.get("filled_avg_price"))
+            paper_status = str(paper_order.get("status", "")).strip().lower()
+            live_status = str(live_order.get("status", "")).strip().lower()
+            if paper_status and live_status and paper_status != live_status:
+                status_mismatches += 1
+            drift_bps = None
+            if paper_fill is not None and live_fill is not None and paper_fill > 0:
+                drift_bps = round(((live_fill - paper_fill) / paper_fill) * 10000.0, 2)
+            fill_drifts.append(
+                {
+                    "symbol": str(live_order.get("symbol") or paper_order.get("symbol") or "").upper(),
+                    "proposal_id": str(live_order.get("proposal_id", "")),
+                    "strategy_id": str(live_order.get("strategy_id") or paper_order.get("strategy_id") or ""),
+                    "paper_status": paper_status,
+                    "live_status": live_status,
+                    "paper_fill": paper_fill,
+                    "live_fill": live_fill,
+                    "fill_drift_bps": drift_bps,
+                }
+            )
+
+        usable_drifts = [
+            float(item["fill_drift_bps"])
+            for item in fill_drifts
+            if item.get("fill_drift_bps") is not None
+        ]
+        average_abs_drift_bps = (
+            round(sum(abs(value) for value in usable_drifts) / len(usable_drifts), 2)
+            if usable_drifts
+            else None
+        )
+        blockers = list(live_execution_overview.get("blockers", []) or [])
+        return {
+            "mode": "read_only_execution_monitor",
+            "strategy_intelligence": "shared_shadow_fitness",
+            "live_independent_strategy_fitness": False,
+            "paper_entry_orders_sampled": len(paper_entries),
+            "live_entry_orders_sampled": len(live_entries),
+            "matched_live_followups": len(matched_pairs),
+            "unmatched_live_entries": len(unmatched_live),
+            "status_mismatches": status_mismatches,
+            "average_abs_fill_drift_bps": average_abs_drift_bps,
+            "latest_fill_drifts": fill_drifts[:5],
+            "blockers": blockers,
+            "note": (
+                "Live uses the shared shadow-fitness strategy brain. This monitor "
+                "checks future live execution quality against same-proposal paper "
+                "orders and remains read-only."
             ),
         }
 
@@ -1754,12 +1874,58 @@ class StatusReporter:
             ),
             (
                 f"Asset scope={asset_scope} | allowed_strategies={strategies} | "
-                f"min_projected_gain={float(overview.get('min_projected_gain_pct') or 0) * 100:.2f}% | "
-                f"limit_buffer={self._fmt_number(overview.get('limit_buffer_bps'), decimals=1)}bps"
+                f"projected_gain=equity {float(overview.get('min_projected_gain_pct') or 0) * 100:.2f}%"
+                f"/crypto {float(overview.get('crypto_min_projected_gain_pct') or 0) * 100:.2f}% | "
+                f"limit_buffer=equity {self._fmt_number(overview.get('limit_buffer_bps'), decimals=1)}bps"
+                f"/crypto {self._fmt_number(overview.get('crypto_limit_buffer_bps'), decimals=1)}bps"
             ),
             f"Blockers={blockers}",
             str(overview.get("note", "") or "").strip(),
         ]
+
+    def _render_live_execution_intelligence(self, overview: dict[str, Any]) -> list[str]:
+        if not overview:
+            return ["No live execution intelligence available yet."]
+
+        shared_brain = str(overview.get("strategy_intelligence", "unknown") or "unknown")
+        independent = "yes" if overview.get("live_independent_strategy_fitness") else "no"
+        blockers = ", ".join(overview.get("blockers", []) or []) or "none"
+        lines = [
+            (
+                f"Mode={overview.get('mode', 'unknown')} | strategy_brain={shared_brain} | "
+                f"independent_live_strategy_fitness={independent}"
+            ),
+            (
+                f"Recent entry sample | paper={overview.get('paper_entry_orders_sampled', 0)} | "
+                f"live={overview.get('live_entry_orders_sampled', 0)} | "
+                f"matched_followups={overview.get('matched_live_followups', 0)} | "
+                f"unmatched_live={overview.get('unmatched_live_entries', 0)}"
+            ),
+            (
+                f"Execution drift | status_mismatches={overview.get('status_mismatches', 0)} | "
+                f"avg_abs_fill_drift={self._fmt_number(overview.get('average_abs_fill_drift_bps'), decimals=2)}bps"
+            ),
+            f"Live blockers currently limiting comparison={blockers}",
+        ]
+        fill_drifts = overview.get("latest_fill_drifts", [])
+        if isinstance(fill_drifts, list) and fill_drifts:
+            for item in fill_drifts[:3]:
+                item = item if isinstance(item, dict) else {}
+                lines.append(
+                    (
+                        f"Pair {item.get('symbol', '-')}: paper={item.get('paper_status', '-')}"
+                        f" @ {self._fmt_number(item.get('paper_fill'), decimals=4)} | "
+                        f"live={item.get('live_status', '-')} @ "
+                        f"{self._fmt_number(item.get('live_fill'), decimals=4)} | "
+                        f"drift={self._fmt_number(item.get('fill_drift_bps'), decimals=2)}bps"
+                    )
+                )
+        else:
+            lines.append("No live/paper fill pairs yet; comparison becomes useful after live follower orders exist.")
+        note = str(overview.get("note", "") or "").strip()
+        if note:
+            lines.append(note)
+        return lines
 
     def _render_capital_envelope_line(self, overview: dict[str, Any]) -> str:
         max_usd = self._to_float(overview.get("capital_envelope_max_usd"))

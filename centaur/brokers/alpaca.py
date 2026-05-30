@@ -172,6 +172,15 @@ class AlpacaBrokerAdapter(BrokerAdapter):
 
 
 class AlpacaLiveBrokerAdapter(AlpacaBrokerAdapter):
+    """Guarded Alpaca Live adapter for the dormant real-money readiness lane.
+
+    Live shares the Alpaca transport with paper, but every order action is
+    re-gated here so credentials or endpoint changes cannot silently turn paper
+    behavior into live-money behavior. Entry buys remain subject to the live
+    kill switch; sell/cancel paths are allowed only after explicit activation so
+    a future go-live lane can protect or flatten positions.
+    """
+
     broker_id = "alpaca_live"
     label = "Alpaca Live"
     native_currency = "USD"
@@ -189,6 +198,7 @@ class AlpacaLiveBrokerAdapter(AlpacaBrokerAdapter):
         notional_usd: float,
         usd_to_gbp: float | None = None,
     ) -> str | None:
+        """Return the first live-entry blocker before building a buy order."""
         if not context.config.live_execution_enabled:
             return "live_execution_disabled"
         if context.config.live_execution_kill_switch:
@@ -210,9 +220,17 @@ class AlpacaLiveBrokerAdapter(AlpacaBrokerAdapter):
         *,
         order_request: dict[str, Any],
     ) -> dict[str, Any]:
+        """Submit a live order only after the explicit go-live gates pass.
+
+        The kill switch is treated as an entry switch: buy orders stay blocked
+        while it is on, but activated sell exits can still protect capital.
+        """
         if not context.config.live_execution_enabled:
             raise BrokerAdapterError("live_execution_disabled")
-        if context.config.live_execution_kill_switch:
+        side = str(order_request.get("side", "")).strip().lower()
+        if context.config.live_execution_kill_switch and side == "buy":
+            raise BrokerAdapterError("live_kill_switch_on")
+        if context.config.live_execution_kill_switch and side != "sell":
             raise BrokerAdapterError("live_kill_switch_on")
         if not context.config.alpaca_live_api_configured:
             raise BrokerAdapterError("alpaca_live_credentials_missing")
@@ -226,10 +244,19 @@ class AlpacaLiveBrokerAdapter(AlpacaBrokerAdapter):
         *,
         order_id: str,
     ) -> None:
-        raise BrokerAdapterError(
-            "Alpaca Live order cancellation is scaffolded only; no live-money "
-            "execution pipeline is active."
-        )
+        """Cancel a live order only after activation gates prove intent.
+
+        Cancellation is risk-reducing for stale entries and exit refreshes, but
+        it still touches a live account, so it requires the same explicit
+        enablement and acknowledgement as the live readiness lane.
+        """
+        if not context.config.live_execution_enabled:
+            raise BrokerAdapterError("live_execution_disabled")
+        if not context.config.alpaca_live_api_configured:
+            raise BrokerAdapterError("alpaca_live_credentials_missing")
+        if context.config.live_execution_activation_ack != "LIVE_TRADING_APPROVED":
+            raise BrokerAdapterError("activation_ack_missing")
+        return super().cancel_order(context, order_id=order_id)
 
 
 def _to_float(value: Any) -> float | None:

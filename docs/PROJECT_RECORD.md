@@ -4,7 +4,7 @@ This file is the durable, chat-independent record of what Project Centaur is, wh
 
 If future conversations lose context, this file should be treated as the first place to recover project intent.
 
-Last updated: 2026-05-27
+Last updated: 2026-05-29
 
 ## Purpose
 Project Centaur is a trading research and automation system aimed at growing capital safely, legally, and repeatably through trading.
@@ -40,7 +40,9 @@ The project exists for three reasons:
 - Runtime model: pipeline-first control flow, designed to map cleanly to LangGraph
 
 ## Current Reality
-As of 2026-05-27, Centaur is primarily a training and evaluation system with an active micro paper-execution path, a scaffold-only Alpaca Live readiness lane, and a headless unattended `launchd` cadence currently targeted at `30` second starts with skip-if-busy wrapper protection.
+As of 2026-05-29, Centaur is primarily a training and evaluation system with an active micro paper-execution path, a dormant Alpaca Live readiness lane configured to mirror the paper envelope, and a headless unattended `launchd` cadence currently targeted at `30` second starts with skip-if-busy wrapper protection.
+
+Alpaca Live API keys have now been added locally and funded read-only checks passed on 2026-05-29. The live account is `ACTIVE`, not blocked, has no positions, recent orders, or open orders, and shows `132.05` cash/equity/buying power. The `$132.05` balance does not widen the intended `$10 x 10` live envelope. The first-live plan is recorded as a same-as-paper follower lane by operator request: current paper strategies only, equities plus crypto, `$10` entries, `10` base slots, one order per tick, `$5.00` live daily protector, shared paper/shadow strategy fitness, read-only live execution intelligence, and explicit rollback triggers. On 2026-05-29 at about 10:48 BST, after a final clean read-only check, the operator explicitly approved turning Alpaca Live on within that envelope. The first fully live-enabled observed tick, `20260529-105313`, completed `OK`; live CFO held because there was no submitted paper trade to follow, live execution submitted no orders, and the post-activation live account check still showed no live positions or orders.
 
 It can:
 - run a control tick manually and via a verified `launchd` wrapper on this Mac
@@ -60,13 +62,14 @@ It can:
 - submit a very small Alpaca paper order when all paper-execution gates pass
 - persist broker-tagged paper-order history so future multi-broker execution can stay separated in the operations store
 - show an Alpaca Live readiness lane for a possible side-by-side paper/live go-live discussion
+- show read-only live execution intelligence that compares future live follower entries against same-proposal paper entries for fill drift, status mismatch, unmatched live orders, and blockers
 
 It does not yet:
 - do meaningful portfolio sizing
 - do full broker reconciliation beyond recent-order polling and persisted broker payloads
 - expose a fully broker-separated account history view yet
 - have a fully implemented genetic algorithm loop
-- submit or cancel Alpaca Live orders
+- activate Alpaca Live entries or live order actions without the explicit go-live gates
 - have proven live profitability
 
 ## How One Live Tick Works
@@ -116,7 +119,12 @@ Current micro paper mode rules:
 - current broker routing is explicit:
   - equities -> `alpaca_paper`
   - crypto -> `alpaca_paper`
-- Alpaca Live is scaffold-only and cannot submit/cancel real-money orders
+- Alpaca Live is approved for same-as-paper follower activation by explicit 2026-05-29 operator override and must not submit real-money entries outside those go-live gates
+- Alpaca Live mirrors paper settings for equities plus crypto, the same three allowed strategies, `$10` notional, `10` base slots, one order per tick, `$5.00` persisted daily protector, `1.5%` equity projected-gain, `2.0%` crypto projected-gain, `5` bps equity buffer, and `25` bps crypto buffer; activation is authorized only inside this recorded envelope
+- The recorded first-live policy is same-as-paper by operator request, but extra account funds above `$100` are launch buffer only and do not create additional first-live slots
+- Alpaca Live protective mechanics now mirror paper readiness: guarded cancellation, stale equity-entry reaping, and stale/non-marketable managed sell-exit refresh are implemented for a future activated lane
+- Live execution intelligence is separate from strategy intelligence: strategy scoring stays shared through shadow fitness, while live diagnostics monitor future live-vs-paper execution quality
+- Safety-critical trading paths must now carry docstrings or compact nearby comments explaining the protected gate, capital-preservation intent, and audit trail
 - IG is scaffold-only for now and is not active in live execution
 
 First profitability check:
@@ -211,20 +219,20 @@ What is true now:
 - the existing Alpaca execution path has been moved behind a broker-adapter interface
 - the live paper path still routes to Alpaca for both equities and crypto
 - persisted paper-order rows now include `broker_id`
-- an `Alpaca Live` adapter identity exists as a scaffold-only sidecar for readiness visibility
+- an `Alpaca Live` adapter identity exists as a dormant readiness sidecar
 - an `IG` spread-betting adapter scaffold exists in the codebase
 
 What is not true yet:
 - Alpaca Live is not active for execution
-- Alpaca Live does not submit or cancel real-money orders
+- Alpaca Live guarded order submission/cancellation code exists for readiness, but current configuration blocks live entries and leaves the activation acknowledgement empty
 - IG is not active for execution
 - there is not yet a dedicated broker-separated account-history view in the dashboard
 - Centaur does not yet submit or cancel IG orders
 
-The current intent of the Alpaca Live scaffold is defensive:
+The current intent of the Alpaca Live readiness lane is defensive:
 - make side-by-side paper/live architecture explicit before any May 2026 go-live decision
 - keep the default live envelope visible as `$10` x `10` slots = `$100`
-- require a separate go-live override, activation acknowledgement, strategy choice, kill-switch rule, daily-loss rule, and rollback conditions before real-money order submission can be added
+- require a separate go-live override, activation acknowledgement, strategy choice, kill-switch rule, daily-loss rule, and rollback conditions before real-money entries can be activated
 
 The current intent of the IG scaffold is defensive:
 - reject any trade where the minimum bet-per-point would exceed the fixed `$10` notional limit

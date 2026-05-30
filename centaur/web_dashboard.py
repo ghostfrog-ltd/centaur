@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from .config import RuntimeConfig, load_runtime_config
 from .status import StatusReporter
 
-APP_BUILD = "2026-05-07-web-dashboard"
+APP_BUILD = "2026-05-29-live-execution-intelligence"
 
 
 def run_web_dashboard(
@@ -327,6 +327,10 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
               body=_bullet_list(_as_list(snapshot.get("live_execution_overview"))),
           )}
           {_panel(
+              title="Live execution intelligence",
+              body=_bullet_list(_render_live_execution_intelligence(_as_dict(snapshot.get("live_execution_intelligence"))), mono=True),
+          )}
+          {_panel(
               title="API cost",
               body=_bullet_list(_render_cost_snapshot(_as_dict(snapshot.get("cost_overview")))),
           )}
@@ -596,6 +600,50 @@ def _holding_metric_text(metrics: dict[str, Any]) -> str:
         f"/win={float(metrics.get('win_rate', 0) or 0) * 100:.1f}%"
         f"/score={_fmt_number(metrics.get('score'), 2)}"
     )
+
+
+def _render_live_execution_intelligence(overview: dict[str, Any]) -> list[str]:
+    """Render the read-only live-vs-paper execution drift monitor."""
+    if not overview:
+        return ["No live execution intelligence available yet."]
+    blockers = ", ".join(_as_list(overview.get("blockers"))) or "none"
+    rows = [
+        (
+            f"mode={overview.get('mode', 'unknown')}"
+            f" | strategy_brain={overview.get('strategy_intelligence', 'unknown')}"
+            f" | independent_live_strategy_fitness={'yes' if overview.get('live_independent_strategy_fitness') else 'no'}"
+        ),
+        (
+            "entry sample"
+            f" | paper={int(overview.get('paper_entry_orders_sampled', 0) or 0)}"
+            f" | live={int(overview.get('live_entry_orders_sampled', 0) or 0)}"
+            f" | matched={int(overview.get('matched_live_followups', 0) or 0)}"
+            f" | unmatched_live={int(overview.get('unmatched_live_entries', 0) or 0)}"
+        ),
+        (
+            "execution drift"
+            f" | status_mismatches={int(overview.get('status_mismatches', 0) or 0)}"
+            f" | avg_abs_fill_drift={_fmt_number(overview.get('average_abs_fill_drift_bps'), 2)}bps"
+        ),
+        f"blockers={blockers}",
+    ]
+    fill_drifts = [row for row in _as_list(overview.get("latest_fill_drifts")) if isinstance(row, dict)]
+    if fill_drifts:
+        for row in fill_drifts[:2]:
+            rows.append(
+                (
+                    f"pair {row.get('symbol', '-')}"
+                    f" | paper={row.get('paper_status', '-')}@{_fmt_number(row.get('paper_fill'), 4)}"
+                    f" | live={row.get('live_status', '-')}@{_fmt_number(row.get('live_fill'), 4)}"
+                    f" | drift={_fmt_number(row.get('fill_drift_bps'), 2)}bps"
+                )
+            )
+    else:
+        rows.append("No live/paper fill pairs yet.")
+    note = str(overview.get("note", "") or "").strip()
+    if note:
+        rows.append(note)
+    return rows
 
 
 def _render_cost_snapshot(overview: dict[str, Any]) -> list[str]:
