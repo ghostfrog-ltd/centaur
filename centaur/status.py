@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ from .config import RuntimeConfig, load_runtime_config
 from .holding_window_advisor import HoldingWindowAdvisor
 from .strategies import build_strategy_registry
 from .threshold_advisor import ThresholdAdvisor
-from .usage import UsageLedger
+from .usage import RealDictCursor, UsageLedger
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +32,7 @@ class StatusReporter:
         self.usage_ledger = usage_ledger or UsageLedger(config=self.config)
 
     def render(self, *, snapshot: dict[str, Any] | None = None) -> str:
-        snapshot = snapshot or self.snapshot()
+        snapshot = snapshot or self.snapshot(include_visuals=False)
         now = snapshot["checked_at"]
         latest_tick = snapshot["latest_tick"]
         alerts = snapshot["alerts"]
@@ -60,6 +61,14 @@ class StatusReporter:
         )
         lines.append(
             (
+                "Runtime: "
+                f"mode={self.config.centaur_mode} | "
+                f"environment={self.config.centaur_environment} | "
+                "live_strategy_brain=shared_paper_shadow_evidence"
+            )
+        )
+        lines.append(
+            (
                 "Paper mode: "
                 f"enabled={'yes' if self.config.paper_execution_enabled else 'no'} | "
                 f"kill_switch={'on' if self.config.paper_execution_kill_switch else 'off'} | "
@@ -73,6 +82,12 @@ class StatusReporter:
                 f"high_score_override={'on' if self.config.paper_execution_high_score_override_enabled else 'off'}"
                 f"/{self.config.paper_execution_high_score_override_min_score:.1f}+"
                 f"/{self.config.paper_execution_high_score_override_fitness_margin:.2f}fit | "
+                f"equity_no_weekend_carry={'on' if self.config.paper_execution_equity_no_weekend_carry_enabled else 'off'}"
+                f"/entry_cutoff={self.config.paper_execution_equity_friday_entry_cutoff_minutes_before_close}m"
+                f"/flatten={self.config.paper_execution_equity_friday_flatten_minutes_before_close}m | "
+                f"trailing_observer={'on' if self.config.trailing_drawdown_observer_enabled else 'off'}"
+                f"/paper=${self.config.trailing_drawdown_observer_paper_giveback_usd:.2f}"
+                f"/live=${self.config.trailing_drawdown_observer_live_giveback_usd:.2f} | "
                 f"max_daily_drawdown=${self.config.paper_execution_max_daily_drawdown_usd:.2f} | "
                 f"stale_order_reaper={self.config.paper_execution_stale_order_minutes}m | "
                 f"base_max_open_positions={self.config.paper_execution_max_open_positions} | "
@@ -128,7 +143,7 @@ class StatusReporter:
             lines.append(self._render_alert_line(alert))
 
         lines.append("")
-        lines.append("Recent paper orders:")
+        lines.append("Recent broker orders (paper/live ledger, latest 5):")
         if recent_orders:
             for order in recent_orders:
                 lines.append(self._render_order_line(order))
@@ -136,7 +151,7 @@ class StatusReporter:
             lines.append("- none")
 
         lines.append("")
-        lines.append("Recent shadow proposals:")
+        lines.append("Recent shadow proposals (counterfactual, latest 5):")
         if recent_proposals:
             for proposal in recent_proposals[:5]:
                 lines.append(self._render_proposal_line(proposal))
@@ -157,12 +172,12 @@ class StatusReporter:
             lines.append(f"- {detail}")
 
         lines.append("")
-        lines.append("GA threshold advice:")
+        lines.append("GA threshold advice (lightweight status sample):")
         for detail in self._render_threshold_advice(threshold_advice):
             lines.append(f"- {detail}")
 
         lines.append("")
-        lines.append("Holding-window fitness:")
+        lines.append("Holding-window fitness (shadow evidence, recommendation-only):")
         for detail in self._render_holding_window_advice(holding_window_advice):
             lines.append(f"- {detail}")
 
@@ -189,7 +204,7 @@ class StatusReporter:
         return "\n".join(lines)
 
     def print(self) -> None:
-        print(self.render(), flush=True)
+        print(self.render(snapshot=self.snapshot(include_visuals=False)), flush=True)
 
     def snapshot(
         self,
@@ -234,6 +249,7 @@ class StatusReporter:
                 first_order=first_order,
                 account_overview=account_overview,
             ),
+            "paper_trade_outcome_metrics": self._build_paper_trade_outcome_metrics(),
             "open_positions": self._build_open_positions(
                 latest_tick=latest_tick,
                 recent_orders=recent_order_history,
@@ -299,11 +315,17 @@ class StatusReporter:
             )
             state = self.usage_ledger.get_strategy_threshold_adaptive_state() or {}
             state_threshold = state.get("effective_threshold")
+            # Status is an operator heartbeat, so it uses a bounded GA sample.
+            # The full recommendation remains available through --threshold-advice.
             advice = adviser.build_advice(
                 current_threshold=state_threshold
                 if state_threshold is not None
-                else self.config.strategy_allocation_suppress_threshold
+                else self.config.strategy_allocation_suppress_threshold,
+                tick_limit=120,
+                population_size=12,
+                generations=6,
             )
+            advice["scope"] = "lightweight_status"
             advice["adaptive_enabled"] = self.config.strategy_threshold_adaptive_enabled
             advice["adaptive_state"] = {
                 "effective_threshold": state.get("effective_threshold"),
@@ -349,6 +371,156 @@ class StatusReporter:
                 "reason": f"Holding-window advice unavailable: {exc}",
             }
 
+    def _build_paper_trade_outcome_metrics(self) -> dict[str, Any]:
+        """Summarize closed paper round trips for projection defaults only.
+
+        The slot-compounding page needs observed win/loss assumptions, but these
+        metrics are read-only and must not feed execution gates. They group
+        filled paper buy/sell orders by proposal id so the operator sees actual
+        closed-trade behavior instead of a synthetic 100% win-rate default.
+        """
+
+        query = """
+            WITH fills AS (
+                SELECT proposal_id, strategy_id, symbol, side, submitted_at,
+                       COALESCE(filled_qty, 0) AS filled_qty,
+                       COALESCE(filled_avg_price, 0) AS filled_avg_price
+                FROM paper_trade_orders
+                WHERE broker_id = 'alpaca_paper'
+                  AND status = 'filled'
+                  AND proposal_id <> ''
+                  AND side IN ('buy', 'sell')
+            ),
+            round_trips AS (
+                SELECT proposal_id,
+                       MIN(strategy_id) AS strategy_id,
+                       MIN(symbol) AS symbol,
+                       MIN(submitted_at) FILTER (WHERE side = 'buy') AS entry_at,
+                       MAX(submitted_at) FILTER (WHERE side = 'sell') AS exit_at,
+                       SUM(filled_qty * filled_avg_price) FILTER (WHERE side = 'buy') AS buy_value,
+                       SUM(filled_qty * filled_avg_price) FILTER (WHERE side = 'sell') AS sell_value,
+                       COUNT(*) FILTER (WHERE side = 'buy') AS buys,
+                       COUNT(*) FILTER (WHERE side = 'sell') AS sells
+                FROM fills
+                GROUP BY proposal_id
+                HAVING COUNT(*) FILTER (WHERE side = 'buy') > 0
+                   AND COUNT(*) FILTER (WHERE side = 'sell') > 0
+                   AND SUM(filled_qty * filled_avg_price) FILTER (WHERE side = 'buy') > 0
+            )
+            SELECT proposal_id, strategy_id, symbol, entry_at, exit_at,
+                   buy_value, sell_value,
+                   sell_value - buy_value AS pnl_usd,
+                   ((sell_value - buy_value) / buy_value) * 100.0 AS return_pct
+            FROM round_trips
+            ORDER BY exit_at DESC
+        """
+        try:
+            rows = self._query_rows(query=query)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "mode": "read_only_closed_paper_trades",
+                "reason": f"paper trade outcome metrics unavailable: {exc}",
+            }
+
+        returns = [self._to_float(row.get("return_pct")) for row in rows]
+        returns = [value for value in returns if value is not None]
+        wins = [value for value in returns if value > 0]
+        losses = [value for value in returns if value < 0]
+        flats = [value for value in returns if value == 0]
+        realized_pnl = round(
+            sum(self._to_float(row.get("pnl_usd")) or 0.0 for row in rows),
+            6,
+        )
+        total_buy_value = round(
+            sum(self._to_float(row.get("buy_value")) or 0.0 for row in rows),
+            6,
+        )
+        closed_trades = len(returns)
+        avg_return_pct = round(sum(returns) / closed_trades, 6) if closed_trades else 0.0
+        avg_win_pct = round(sum(wins) / len(wins), 6) if wins else 0.0
+        avg_loss_pct = round(abs(sum(losses) / len(losses)), 6) if losses else 0.0
+        first_entry_values = [
+            row.get("entry_at") for row in rows if row.get("entry_at") is not None
+        ]
+        last_exit_values = [
+            row.get("exit_at") for row in rows if row.get("exit_at") is not None
+        ]
+        first_entry_at = min(first_entry_values, default=None)
+        last_exit_at = max(last_exit_values, default=None)
+        observed_days = 0.0
+        if first_entry_at is not None and last_exit_at is not None:
+            first_dt = self._as_datetime(first_entry_at)
+            last_dt = self._as_datetime(last_exit_at)
+            if first_dt is not None and last_dt is not None:
+                observed_days = max((last_dt - first_dt).total_seconds() / 86400.0, 1.0)
+        observed_trades_per_day = round(closed_trades / observed_days, 6) if observed_days else 0.0
+        observed_slot_fill_pct = (
+            round(
+                min(
+                    (observed_trades_per_day / max(int(self.config.paper_execution_max_open_positions), 1))
+                    * 100.0,
+                    100.0,
+                ),
+                6,
+            )
+            if observed_trades_per_day > 0
+            else 0.0
+        )
+        win_rate = round(len(wins) / closed_trades, 6) if closed_trades else 0.0
+        loss_rate = round(len(losses) / closed_trades, 6) if closed_trades else 0.0
+        flat_rate = round(len(flats) / closed_trades, 6) if closed_trades else 0.0
+        return {
+            "status": "ok",
+            "mode": "read_only_closed_paper_trades",
+            "closed_trades": closed_trades,
+            "wins": len(wins),
+            "losses": len(losses),
+            "flats": len(flats),
+            "win_rate": win_rate,
+            "loss_rate": loss_rate,
+            "flat_rate": flat_rate,
+            "avg_return_pct": avg_return_pct,
+            "avg_win_pct": avg_win_pct,
+            "avg_loss_pct": avg_loss_pct,
+            "realized_pnl_usd": realized_pnl,
+            "total_buy_value_usd": total_buy_value,
+            "observed_days": round(observed_days, 6),
+            "observed_trades_per_day": observed_trades_per_day,
+            "observed_slot_fill_pct": observed_slot_fill_pct,
+            "first_entry_at": self._fmt_dt(first_entry_at),
+            "last_exit_at": self._fmt_dt(last_exit_at),
+            "recent_trades": [
+                {
+                    "proposal_id": row.get("proposal_id", ""),
+                    "strategy_id": row.get("strategy_id", ""),
+                    "symbol": row.get("symbol", ""),
+                    "exit_at": self._fmt_dt(row.get("exit_at")),
+                    "pnl_usd": self._to_float(row.get("pnl_usd")),
+                    "return_pct": self._to_float(row.get("return_pct")),
+                }
+                for row in rows[:10]
+            ],
+        }
+
+    def _query_rows(
+        self,
+        *,
+        query: str,
+        params: tuple[Any, ...] = tuple(),
+    ) -> list[dict[str, Any]]:
+        if self.usage_ledger.backend == "postgres":
+            with self.usage_ledger._connect_postgres() as connection:
+                with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                    cursor.execute(query.replace("?", "%s"), params)
+                    rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
+        with self.usage_ledger._connect_sqlite() as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
     def _render_latest_tick(self, *, now: datetime, latest_tick: dict[str, Any]) -> list[str]:
         started_at = latest_tick.get("started_at")
         ended_at = latest_tick.get("ended_at")
@@ -360,6 +532,7 @@ class StatusReporter:
         execution = self._as_dict(snapshot.get("execution"))
         strategy_fitness = self._as_dict(snapshot.get("strategy_fitness"))
         daily_protection = self._as_dict(snapshot.get("daily_protection"))
+        trailing_observer = self._as_dict(snapshot.get("trailing_drawdown_observer"))
         stale_order_reaper = self._as_dict(snapshot.get("stale_order_reaper"))
 
         tick_age = self._age_text(now, started_at)
@@ -385,9 +558,9 @@ class StatusReporter:
                 f"budget_status={latest_tick.get('budget_status', 'unknown')}"
             ),
             (
-                "Market: "
+                "Market gate: "
                 f"reason={market_gate.get('reason', 'unknown')} | "
-                f"market_open={market_gate.get('market_open', False)} | "
+                f"equity_market_open={market_gate.get('market_open', False)} | "
                 f"equity_scan_ready={market_gate.get('equity_scan_ready', False)} | "
                 f"crypto_scan_ready={market_gate.get('crypto_scan_ready', False)}"
             ),
@@ -425,6 +598,7 @@ class StatusReporter:
                 f"limit=${self._fmt_number(daily_protection.get('max_daily_drawdown_usd'), decimals=2)} | "
                 f"baseline=${self._fmt_number(daily_protection.get('baseline_equity'), decimals=2)}"
             ),
+            self._render_trailing_drawdown_observer_line(trailing_observer),
             (
                 "Order maintenance: "
                 f"stale_candidates={stale_order_reaper.get('stale_candidates', 0)} | "
@@ -449,6 +623,31 @@ class StatusReporter:
             lines.append(f"Last error: {last_error}")
         return lines
 
+    def _render_trailing_drawdown_observer_line(self, observer: dict[str, Any]) -> str:
+        lanes = self._as_dict(observer.get("lanes"))
+        preferred = (
+            str(self.config.paper_execution_equity_broker_id or "alpaca_paper")
+            .strip()
+            .lower()
+        )
+        lane = self._as_dict(lanes.get(preferred))
+        if not lane and lanes:
+            first_key = sorted(lanes.keys())[0]
+            lane = self._as_dict(lanes.get(first_key))
+        if not observer:
+            return "Trailing observer: no data yet"
+        return (
+            "Trailing observer (observe-only): "
+            f"mode={observer.get('mode', 'observe_only')} | "
+            f"affects_execution={observer.get('affects_execution', False)} | "
+            f"broker={lane.get('broker_id', preferred) or preferred} | "
+            f"giveback=${self._fmt_number(lane.get('giveback_usd'), decimals=2)}"
+            f"/{self._fmt_number(self._pct_from_ratio(lane.get('giveback_pct')), decimals=2)}% | "
+            f"threshold=${self._fmt_number(lane.get('threshold_usd'), decimals=2)}"
+            f"/{self._fmt_number(self._pct_from_ratio(lane.get('threshold_pct')), decimals=2)}% | "
+            f"would_block={lane.get('would_block_new_entries', False)}"
+        )
+
     def _build_trade_diagnostics(
         self,
         *,
@@ -465,14 +664,15 @@ class StatusReporter:
         execution = self._as_dict(snapshot.get("execution"))
         paper_exit_management = self._as_dict(snapshot.get("paper_exit_management"))
         daily_protection = self._as_dict(snapshot.get("daily_protection"))
+        trailing_observer = self._as_dict(snapshot.get("trailing_drawdown_observer"))
         stale_order_reaper = self._as_dict(snapshot.get("stale_order_reaper"))
 
         decision = str(risk_cfo.get("decision", "hold")).strip().lower()
         reason = str(risk_cfo.get("reason", "unknown")).strip() or "unknown"
         if decision == "submit_paper":
-            primary_line = f"CFO approved paper path | reason={reason}"
+            primary_line = f"Paper CFO approved path | reason={reason}"
         else:
-            primary_line = f"Primary blocker | reason={reason}"
+            primary_line = f"Primary paper/live-follow blocker | reason={reason}"
 
         lines = [
             primary_line,
@@ -483,10 +683,11 @@ class StatusReporter:
                 f" | limit=${self._fmt_number(daily_protection.get('max_daily_drawdown_usd'), decimals=2)}"
                 f" | entries_blocked={daily_protection.get('entries_blocked', False)}"
             ),
+            self._render_trailing_drawdown_observer_line(trailing_observer),
             (
                 "Market gate"
                 f" | reason={market_gate.get('reason', '-')}"
-                f" | market_open={market_gate.get('market_open', False)}"
+                f" | equity_market_open={market_gate.get('market_open', False)}"
                 f" | equity_ready={market_gate.get('equity_scan_ready', False)}"
                 f" | crypto_ready={market_gate.get('crypto_scan_ready', False)}"
             ),
@@ -624,7 +825,7 @@ class StatusReporter:
         blockers = self._as_dict(activity.get("blockers"))
         lines = [
             (
-                "Scan"
+                "Latest tick scan"
                 f" | mode={scan.get('mode', '-')}"
                 f" | candidates={scan.get('candidates_found', 0)}"
                 f" | selected={scan.get('selected_candidates', 0)}"
@@ -703,6 +904,7 @@ class StatusReporter:
             return [
                 (
                     f"status={status}"
+                    f" | scope={advice.get('scope', '-')}"
                     f" | current={self._fmt_number(advice.get('current_threshold'), decimals=2)}"
                     f" | reason={advice.get('reason', '-')}"
                 )
@@ -714,7 +916,8 @@ class StatusReporter:
         adaptive_state = self._as_dict(advice.get("adaptive_state"))
         return [
             (
-                f"action={advice.get('action', '-')}"
+                f"scope={advice.get('scope', '-')}"
+                f" | action={advice.get('action', '-')}"
                 f" | current={self._fmt_number(advice.get('current_threshold'), decimals=2)}"
                 f" | recommended={self._fmt_number(advice.get('recommended_threshold'), decimals=2)}"
                 f" | confidence={advice.get('confidence', '-')}"
@@ -773,7 +976,8 @@ class StatusReporter:
         policy_all = self._as_dict(advice.get("policy_stats_all"))
         lines = [
             (
-                f"strategy={advice.get('strategy_id', '-')}"
+                f"mode=recommendation_only"
+                f" | strategy={advice.get('strategy_id', '-')}"
                 f" | current={advice.get('current_window', '-')}"
                 f" | action={recommendation.get('action', '-')}"
                 f" | candidate={recommendation.get('candidate_policy', '-')}"
@@ -1312,7 +1516,7 @@ class StatusReporter:
         return accounts
 
     def _build_live_execution_overview(self) -> dict[str, Any]:
-        """Summarize live readiness without implying live-money approval."""
+        """Summarize live follower readiness without implying independent live strategy."""
         slot_size = float(self.config.live_execution_default_notional_usd)
         max_slots = int(self.config.live_execution_max_open_positions)
         envelope_max_usd = round(slot_size * max_slots, 6)
@@ -1333,6 +1537,18 @@ class StatusReporter:
             status = "blocked"
         if not blockers:
             status = "armed"
+
+        if blockers:
+            note = (
+                "Live entries remain blocked until all activation gates clear; "
+                "even then, live can only follow same-tick paper orders that were submitted."
+            )
+        else:
+            note = (
+                "Live follower is armed under the approved same-as-paper envelope. "
+                "It still cannot create independent live strategy decisions; entries must follow "
+                "same-tick submitted paper orders."
+            )
 
         return {
             "status": status,
@@ -1361,11 +1577,7 @@ class StatusReporter:
             "crypto_broker_id": self.config.live_execution_crypto_broker_id,
             "allowed_strategies": list(self.config.live_execution_allowed_strategies),
             "blockers": blockers,
-            "note": (
-                "Prepared for side-by-side paper/live operation. Live entries require "
-                "credentials, explicit enablement, kill switch off, activation ack, "
-                "and a live strategy allowlist before they can follow submitted paper trades."
-            ),
+            "note": note,
         }
 
     def _build_live_execution_intelligence(
@@ -1673,6 +1885,10 @@ class StatusReporter:
             f"{self._fmt_dt(order.get('submitted_at') or order.get('captured_at'))} | "
             f"{order.get('symbol', '')} | "
             f"{order.get('status', '') or '-'} | "
+            f"env={order.get('environment', '') or '-'} | "
+            f"mode={order.get('mode', '') or '-'} | "
+            f"broker={order.get('broker_id', '') or '-'} | "
+            f"instrument={order.get('canonical_instrument_id', '') or '-'} | "
             f"side={order.get('side', '') or '-'} | "
             f"notional=${float(order.get('notional_usd') or 0):.2f} | "
             f"strategy={order.get('strategy_id', '') or '-'}"
@@ -1683,6 +1899,7 @@ class StatusReporter:
             "- "
             f"{self._fmt_dt(proposal.get('proposed_at'))} | "
             f"{proposal.get('symbol', '')} | "
+            f"instrument={proposal.get('canonical_instrument_id', '') or '-'} | "
             f"status={proposal.get('status', '') or '-'} | "
             f"strategy={proposal.get('strategy_id', '') or '-'} | "
             f"score={float(proposal.get('signal_score') or proposal.get('opportunity_score') or 0):.3f}"
@@ -1896,7 +2113,7 @@ class StatusReporter:
                 f"independent_live_strategy_fitness={independent}"
             ),
             (
-                f"Recent entry sample | paper={overview.get('paper_entry_orders_sampled', 0)} | "
+                f"Recent order-ledger sample | paper={overview.get('paper_entry_orders_sampled', 0)} | "
                 f"live={overview.get('live_entry_orders_sampled', 0)} | "
                 f"matched_followups={overview.get('matched_live_followups', 0)} | "
                 f"unmatched_live={overview.get('unmatched_live_entries', 0)}"
@@ -2108,6 +2325,13 @@ class StatusReporter:
                     "latest_checkpoint_code": str(
                         fitness_row.get("checkpoint_code", "")
                     ).strip(),
+                    "fitness_environment": str(
+                        fitness_row.get("environment", "") or ""
+                    ),
+                    "fitness_mode": str(fitness_row.get("mode", "") or ""),
+                    "fitness_source_environment": str(
+                        fitness_row.get("source_environment", "") or ""
+                    ),
                     "win_rate": float(fitness_row.get("win_rate", 0) or 0),
                     "loss_rate": float(fitness_row.get("loss_rate", 0) or 0),
                     "sample_weight": float(fitness_row.get("sample_weight", 0) or 0),
@@ -2159,7 +2383,9 @@ class StatusReporter:
             self._strategy_ranking_reason(top_row),
             (
                 "Ranking order is based on each strategy's best current composite fitness row."
-                " Strategies with no fitness data are shown last."
+                " Strategies with no fitness data are shown last. Fitness evidence is"
+                " labeled by environment/source so paper or shadow evidence is not"
+                " mistaken for live outcome data."
             ),
             "",
         ]
@@ -2172,6 +2398,8 @@ class StatusReporter:
                     f"{int(row.get('rank_position', 0) or 0)}. {row.get('strategy_id', '-')}"
                     f" | fit={fit_text}"
                     f" | checkpoint={checkpoint}"
+                    f" | evidence={row.get('fitness_source_environment') or '-'}"
+                    f"/{row.get('fitness_environment') or '-'}"
                     f" | sample={row.get('sample_label', 'none')}"
                     f" | proposals={int(row.get('total_proposals_all', 0) or 0)}"
                     f" | outcomes={int(row.get('evaluated_outcomes_all', 0) or 0)}"
@@ -2311,6 +2539,16 @@ class StatusReporter:
         if minutes:
             return f"{minutes}m {seconds}s"
         return f"{seconds}s"
+
+    def _as_datetime(self, value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        if value in (None, ""):
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
 
     def _fmt_dt(self, value: datetime | None) -> str:
         if value is None:
@@ -2530,3 +2768,4 @@ class StatusReporter:
                 continue
             return order
         return None
+

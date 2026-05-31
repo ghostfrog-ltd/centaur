@@ -1,6 +1,7 @@
 # Project Centaur Constraints
 
 ## Hard Nos
+- No use of the `$50/day` target as a reason to bypass risk controls, widen notional, add slots, loosen strategy gates, change brokers, or alter live behavior without explicit human approval and matching reliability-stack updates.
 - No live-money trading outside the explicit 2026-05-29 Alpaca Live go-live override and its recorded same-as-paper micro envelope.
 - No Alpaca Live entry submission unless the explicit go-live override is recorded, the live enable flag is set, the entry kill switch is clear, credentials are configured, the activation acknowledgement is set, and the go-live record remains current.
 - No paper trade bigger than `$10` notional without explicit human override.
@@ -15,6 +16,8 @@
 - No raw chain-of-thought logging.
 - No logic changes that contradict this file or the decision log without asking first.
 - No safety-critical trading path without docstrings or nearby comments explaining its gating, capital-protection intent, and audit trail. This applies especially to live execution, broker adapters, risk gates, daily protection, stale-order handling, managed exits, and persistence writes.
+- No new learning/evidence data capture without a runnable report, dashboard/status surface, or documented query path that lets the operator assess the evidence later.
+- No new persistent high-volume table/query path without considering indexes, query shape, and control-loop impact.
 
 ## CFO Gate
 The CFO gate must hold unless all of the following are true:
@@ -53,6 +56,7 @@ Current paper approval rules from the live code:
 - No IG trade may pass if the implied exposure would exceed `1x` leverage.
 
 ## Current Paper Execution Envelope
+- Strategic target: grow toward a sustained, evidence-backed `$50/day` net profit pace by improving valid trade throughput, average net expectancy, exit/data reliability, and staged slot/capital scaling. This is a research and prioritization target only; current execution limits remain in force until explicitly changed.
 - Execution architecture: broker-adapter layer
 - Active broker: Alpaca Paper
 - IG status: scaffold-only / shadow-only preparation
@@ -64,8 +68,11 @@ Current paper approval rules from the live code:
 - By explicit human override on 2026-05-28, paper managed exits may capture profit at `1.25%` via `PAPER_EXECUTION_PROFIT_CAPTURE_PCT=0.0125` for both equity and crypto positions; this does not lower the paper entry projected-gain floors or change notional, broker routing, stops, strategy allowlist, slot caps, or live execution
 - Shadow outcomes must record the profit-target ladder configured by `SHADOW_PROFIT_TARGET_LADDER_PCT` so Centaur can learn whether waiting for `2%`, `3%`, `4%`, or `6%` would have worked while still taking the live paper `1.25%` capture
 - By explicit human override on 2026-05-28, `crypto_momentum.trend` paper managed exits now use `profit_capture_else_1d`: stop loss, profit capture, and target remain active, and positions that hit none of those may hold until a `1d` max-hold backstop instead of being forced out after `60` minutes
+- By explicit human override on 2026-05-31, managed max-hold exits must not sell red positions solely because time elapsed for `profit_after_1h_else_1d` or `profit_capture_else_1d`; if the max hold is reached while the reference price is below entry, the exit is deferred as `max_hold_red_deferred` while stop loss, profit capture, take profit, and Friday equity no-weekend-carry exits remain active
+- By explicit human override on 2026-05-31, equity paper execution has a no-weekend-carry guard: new equity entries are blocked in the final `60` minutes of the regular Friday session, and managed equity positions still open in the final `15` minutes are flattened with exit reason `friday_no_weekend_carry`; crypto is unchanged because it trades through the weekend
 - By explicit human override on 2026-05-28, paper allocation may override a near-miss fitness suppression only for already allowed paper strategies when the raw signal score is at least `90.0` and composite fitness is within `0.25` of the active suppress threshold; this remains paper-only and does not change notional, stops, projected-gain floors, broker routing, max orders, strategy allowlist, daily protector, or live execution
 - Daily equity drawdown protector: `$5.00`
+- Trailing drawdown observer: observe-only, records per-broker high-water giveback and whether a future guard would block new entries; it must not block paper/live entries, sell positions, cancel orders, or latch protection without a separate explicit human override
 - Stale unfilled equity entry orders are reaped after `5` minutes
 - Max orders per tick: `1`
 - Base max open positions: `10`
@@ -104,6 +111,8 @@ Current paper approval rules from the live code:
 - Prepared live strategy allowlist now mirrors paper for readiness only: `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`
 - Prepared live asset classes now mirror paper for readiness only: equities and crypto
 - Prepared live entry economics mirror paper: `$10` notional, `1` order per tick, `10` base slots, `$5.00` daily drawdown protector, `1.5%` equity projected-gain floor, `2.0%` crypto projected-gain floor, `5` bps equity limit buffer, and `25` bps crypto limit buffer
+- The equity no-weekend-carry guard mirrors paper for the same-as-paper live follower lane: late-Friday equity entries are blocked by paper before live can follow them, and activated live managed exits use the same Friday flatten reason for managed equity positions
+- The trailing drawdown observer may record Alpaca Live high-water giveback evidence, but observe-only output cannot create an independent live blocker or widen/alter the same-as-paper follower rule
 - Earned-slot compounding mirrors paper for live once live has its own baseline and P/L, but API keys alone still cannot activate live trading
 - Live entry submission is allowed only while all recorded live go-live gates pass
 - Live cancellation, stale-entry reaping, and managed sell exits are guarded by credentials plus activation acknowledgement, and are prepared so a future live lane can refresh stale/non-marketable orders instead of stranding positions
@@ -118,7 +127,16 @@ Current paper approval rules from the live code:
 - Safety-critical functions must have docstrings or compact comments that explain why they exist and which risk boundary they protect.
 - Comments must clarify non-obvious trading intent, not narrate obvious assignments.
 - If a future change touches live execution, risk gates, broker order submission/cancellation, daily protection, stale-order reaping, managed exits, strategy fitness admission, or persistent trade/account records, update the relevant doc block or nearby comment in the same change.
+- If a future change captures evidence for later learning, update `.venv-mac/bin/python main.py --evidence-report` or an equivalent report surface in the same task, and document how the evidence should be interpreted.
 - Documentation must stay honest about the current mode: paper active, Alpaca Live dormant/readiness unless a recorded go-live override says otherwise.
+
+## Database And Performance
+- PostgreSQL remains the live operations source; do not silently route live monitoring or operation through SQLite.
+- If PostgreSQL is configured, or paper/live execution is enabled, the operations ledger must fail closed when PostgreSQL is unavailable instead of falling back to SQLite.
+- New persistence paths must be shaped for operator queries before they are considered complete: add appropriate indexes, use bounded lookbacks where possible, and avoid table scans on the normal control tick.
+- New reports should prefer existing rollups/snapshots or indexed lookups over repeatedly rebuilding expensive views from raw history.
+- CLI/status heartbeat views should avoid dashboard-only heavy visual queries unless explicitly requested by a dashboard snapshot path.
+- Database optimization is part of feature quality, not cleanup for later, when the feature adds regular writes or repeated reads.
 
 ## Replay / Learning Constraints
 - Historical replay is allowed and preferred for fast training.

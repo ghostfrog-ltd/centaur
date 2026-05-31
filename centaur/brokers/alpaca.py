@@ -18,6 +18,8 @@ from .base import BrokerAdapter, BrokerAdapterError
 
 
 class AlpacaBrokerAdapter(BrokerAdapter):
+    """Alpaca Paper adapter that preserves the approved micro-order envelope."""
+
     broker_id = "alpaca_paper"
     label = "Alpaca Paper"
     native_currency = "USD"
@@ -113,6 +115,7 @@ class AlpacaBrokerAdapter(BrokerAdapter):
         limit_buffer_bps: float,
         usd_to_gbp: float | None = None,
     ) -> dict[str, Any]:
+        """Build a marketable-limit entry without changing size or direction."""
         asset_class = str(proposal.get("asset_class", "")).strip().lower()
         entry_price = _to_float(proposal.get("entry_price"))
         symbol = str(proposal.get("symbol", "")).strip().upper()
@@ -149,6 +152,7 @@ class AlpacaBrokerAdapter(BrokerAdapter):
         latest_bar: dict[str, Any] | None = None,
         usd_to_gbp: float | None = None,
     ) -> dict[str, Any]:
+        """Build a marketable-limit sell exit using broker-reported quantity."""
         formatted_qty = _format_order_qty(qty)
         if formatted_qty == "0":
             raise BrokerAdapterError("Alpaca exit request requires a positive quantity.")
@@ -269,6 +273,7 @@ def _to_float(value: Any) -> float | None:
 
 
 def _format_order_qty(value: float | str) -> str:
+    """Round down to Alpaca fractional precision to avoid overselling."""
     try:
         decimal_value = Decimal(str(value).strip())
     except (InvalidOperation, ValueError):
@@ -291,6 +296,7 @@ def _format_order_price(value: float) -> str:
 
 
 def _paper_limit_time_in_force(asset_class: str) -> str:
+    """Use Alpaca-supported TIF: crypto can IOC, fractional equities use DAY."""
     return "ioc" if str(asset_class).strip().lower() == "crypto" else "day"
 
 

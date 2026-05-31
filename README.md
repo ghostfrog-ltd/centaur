@@ -240,10 +240,13 @@ These live in `.env`. Use `.env.example` as the template.
 ### Database and Cost
 
 `OPERATIONS_DB_BACKEND`
-: Live operations backend. Current repo truth is PostgreSQL.
+: Live operations backend. Current repo truth is PostgreSQL; when PostgreSQL is configured, or paper/live execution is enabled, Centaur fails closed instead of falling back to SQLite.
 
 `DATABASE_URL`
 : PostgreSQL connection string.
+
+`POSTGRES_SCHEMA`
+: Optional PostgreSQL schema for operations tables. Leave unset for the current shared-schema runtime; set explicitly for future paper/live schema-separated deployments.
 
 `API_DAILY_COST_WARNING_USD` / `API_DAILY_COST_LIMIT_USD`
 : Cost guardrails for API usage.
@@ -503,6 +506,17 @@ These live in `.env`. Use `.env.example` as the template.
 `APP_SHARED_SECRET` / `WEBHOOK_SECRET`
 : Shared app/webhook secrets.
 
+### Storage Lanes
+
+`CORE_POSTGRES_SCHEMA`, `PAPER_POSTGRES_SCHEMA`, `LIVE_POSTGRES_SCHEMA`
+: The intended core/paper/live PostgreSQL lane names. `core` is for shared reviewed evidence and strategy fitness; `paper` and `live` are execution/evidence lanes.
+
+`POSTGRES_SCHEMA`
+: Optional active runtime schema. When set for a deployment, it selects the current paper or live lane schema while the storage report still shows the full core/paper/live layout.
+
+`scripts/bootstrap_storage_lanes.py`
+: Initializes the configured PostgreSQL `core`, `paper`, and `live` schemas/tables before an operational cutover. It does not change the active scheduler lane by itself.
+
 ### IG Scaffold
 
 `IG_API_KEY`, `IG_USERNAME`, `IG_PASSWORD`, `IG_ACCOUNT_NUMBER`
@@ -660,6 +674,12 @@ Run overnight crypto health:
 
 ```bash
 .venv-mac/bin/python main.py --crypto-health
+```
+
+Run the evidence registry before deciding actions:
+
+```bash
+.venv-mac/bin/python main.py --evidence-report
 ```
 
 Run historical replay:

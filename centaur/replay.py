@@ -325,6 +325,12 @@ def replay_strategy_fitness(context: TickContext) -> dict[str, object]:
         tick_id=context.tick_id,
         captured_at=context.started_at,
         summaries=summaries,
+        environment=context.config.centaur_environment,
+        mode="shadow",
+        source_environment="backtest",
+        broker_id="simulator",
+        data_provider="historical_store",
+        execution_provider="simulator",
     )
     result = {
         "strategy_summaries": len(summaries),

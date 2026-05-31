@@ -152,6 +152,8 @@ class CryptoHealthReport:
                         f"- {item.get('strategy_id', '-')}"
                         f" | {item.get('checkpoint_code', '-')}"
                         f" | rank={int(item.get('fitness_rank', 0) or 0)}"
+                        f" | evidence={item.get('source_environment', '-')}"
+                        f"/{item.get('environment', '-')}"
                         f" | proposals={int(item.get('evaluated_proposals', 0) or 0)}"
                         f" | avg={_fmt_pct(item.get('avg_realized_return_pct'))}"
                         f" | fit={_fmt_pct(item.get('composite_fitness_score'))}"

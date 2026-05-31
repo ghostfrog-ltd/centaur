@@ -39,7 +39,7 @@ class ScreenLogger:
                 "Runtime: "
                 f"env={config.env_name} | "
                 f"backend_pref={config.operations_db_backend_preference} | "
-                f"sqlite_fallback={config.usage_ledger_db_path} | "
+                f"sqlite_dev_store={config.usage_ledger_db_path} | "
                 f"profiling={'on' if config.control_enable_profiling else 'off'}"
             ),
             timestamp=started_at,

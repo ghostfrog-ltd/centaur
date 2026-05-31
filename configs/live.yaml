@@ -1,0 +1,27 @@
+mode: live
+environment: live
+broker: alpaca
+market_data_provider: alpaca
+execution_provider: alpaca_live
+
+database: centaur_live
+core_postgres_schema: core
+paper_postgres_schema: paper
+live_postgres_schema: live
+postgres_schema: live
+log_dir: storage/live/logs
+evidence_dir: storage/live/evidence
+
+allow_live_trading: false
+max_notional_per_trade: 10
+base_slots: 10
+
+enabled_strategies:
+  - mean_reversion.snapback
+  - crypto_momentum.trend
+  - momentum.volatility_breakout
+
+live_enabled_strategies:
+  - mean_reversion.snapback
+  - crypto_momentum.trend
+  - momentum.volatility_breakout

@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 
+from centaur.adapter_inventory import AdapterInventoryReport
 from centaur.backfill import HistoricalBackfillRunner
 from centaur.config import load_runtime_config
 from centaur.control import ControlPipelineRunner
 from centaur.crypto_health_report import CryptoHealthReport
 from centaur.dashboard_snapshot import write_dashboard_snapshot
+from centaur.evidence_report import EvidenceReport
 from centaur.holding_window_advisor import HoldingWindowAdvisor
 from centaur.paper_exit_review import PaperExitReview
 from centaur.replay import HistoricalReplayRunner
@@ -77,6 +79,21 @@ def parse_args() -> argparse.Namespace:
         "--crypto-health",
         action="store_true",
         help="Run a read-only crypto health report focused on overnight crypto scan activity and signal visibility.",
+    )
+    parser.add_argument(
+        "--evidence-report",
+        action="store_true",
+        help="Run a read-only registry report for shadow/counterfactual evidence streams before deciding actions.",
+    )
+    parser.add_argument(
+        "--storage-separation-report",
+        action="store_true",
+        help="Run a read-only paper/live provenance and storage-separation report.",
+    )
+    parser.add_argument(
+        "--adapter-inventory",
+        action="store_true",
+        help="Run a read-only inventory of market-data, execution, and broker/account adapters.",
     )
     parser.add_argument(
         "--strategy-id",
@@ -200,6 +217,25 @@ def main() -> None:
             ),
             flush=True,
         )
+        return
+
+    if args.evidence_report:
+        reporter = EvidenceReport()
+        print(
+            reporter.render(
+                report=reporter.build_report(tick_limit=max(1, args.days * 48) if args.days > 0 else 120)
+            ),
+            flush=True,
+        )
+        return
+
+    if args.storage_separation_report:
+        reporter = EvidenceReport()
+        print(reporter.render_storage_separation_report(), flush=True)
+        return
+
+    if args.adapter_inventory:
+        print(AdapterInventoryReport().render(), flush=True)
         return
 
     if args.dashboard:

@@ -404,6 +404,15 @@ def evaluate_shadow_checkpoint(
         "checkpoint_minutes": int(checkpoint.get("checkpoint_minutes", 0) or 0),
         "due_at": due_at.isoformat(),
         "evaluated_at": exit_at.isoformat(),
+        "environment": str(checkpoint.get("environment", "paper") or "paper"),
+        "mode": str(checkpoint.get("mode", "paper") or "paper"),
+        "source_environment": str(
+            checkpoint.get("source_environment", "shadow") or "shadow"
+        ),
+        "data_provider": str(checkpoint.get("data_provider", "alpaca") or "alpaca"),
+        "execution_provider": str(
+            checkpoint.get("execution_provider", "shadow") or "shadow"
+        ),
         "outcome_status": outcome_status,
         "exit_price": round(exit_price, 8),
         "exit_price_gbp": round(exit_price_gbp, 8) if exit_price_gbp is not None else None,

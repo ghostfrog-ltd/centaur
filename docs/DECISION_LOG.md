@@ -2,7 +2,375 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-05-29
+Last updated: 2026-05-31
+
+## 2026-05-31
+
+### Add runtime context, execution router, live guard, and instrument registry foundations
+Decision:
+- add a `ModeContext` runtime model that centralizes mode/environment normalization and live-broker permission checks
+- treat `live_dry` as a live-environment mode that may read live broker state for eligibility/risk review but must not mutate live broker state
+- update live pipeline boundaries to use `ModeContext` instead of ad hoc mode string checks
+- add an `ExecutionRouter` for approved entry orders, managed exit submissions, and stale-order cancellations so paper/live order actions have one broker-adapter choke point
+- add a `LiveRiskGuard` immediately before live entry, exit, and cancel actions to re-check runtime mode, live enablement, kill switch, activation acknowledgement, live broker id, strategy permission where relevant, live account/sync readiness, live entry capacity, latest-bar availability, live instrument/venue permission where derivable, same-paper-order validation where relevant, and entry notional
+- add an initial instrument registry that separates canonical Centaur instruments from venue symbols, including separate venue mappings for `ALPACA:BTC/USD`, `BINANCE:BTCUSDT`, and `COINBASE:BTC-USD`
+- add a first-class `InstrumentRef` resolved identity object to the registry and use it at persistence boundaries when deriving canonical instrument metadata
+- persist `canonical_instrument_id`, `venue`, and `venue_symbol` on broker order rows and shadow proposal/outcome evidence rows, including schema-bootstrap backfills for existing rows where the instrument can be derived
+- persist `asset_class`, `canonical_instrument_id`, `venue`, and `venue_symbol` on new market-data latest-bar rows, new historical-bar rows, and new strategy-candidate signal rows
+- preserve canonical instrument metadata through discovery ranked candidates and strategy signal dicts when that metadata is present on the source market-data row
+- preserve a serialized first-class `instrument_ref` through discovery ranked candidates and strategy signal dicts when canonical metadata is present on the source market-data row
+- add an initial market-data adapter boundary under `centaur.market_data_adapters`; current Alpaca equity/crypto latest-bar fetches and historical equity/crypto backfill fetches now go through `AlpacaMarketDataAdapter`
+- make `AlpacaMarketDataAdapter` enrich latest and historical bar payloads with canonical instrument metadata before pipeline persistence/discovery consumes them
+- add an initial execution-adapter boundary under `centaur.execution_adapters`; entry/exit order-request building and `ExecutionRouter` submit/cancel now use the narrower execution planning/mutation interface, currently bridged to existing broker adapters
+- explicitly allowlist the execution-adapter registry to `alpaca_paper` and `alpaca_live`, so scaffold-only/future providers fail at lookup before order planning or mutation
+- add `.venv-mac/bin/python main.py --storage-separation-report`, a bounded read-only report that samples recent broker-order, shadow-proposal, and strategy-fitness rows to show paper/live/evidence provenance and the current physical-split status
+- remove the separate live-only threshold report/config path after operator clarification; diagnostics should focus on whether live matched the same paper-approved order, not on a separate live policy
+- honor optional `POSTGRES_SCHEMA` in `UsageLedger`; when set, the PostgreSQL backend creates/uses that schema and reports it in backend detail, while unset keeps the current shared-schema behavior
+- add an explicit core/paper/live storage layout model so reviewed evidence and strategy fitness can remain shared in `core` while paper/live execution evidence has separate lane schemas and directories
+- make storage lane directories lazy with `StorageLayout.ensure_directories()` and remove the empty root `storage/` placeholder tree because it contained only `.gitkeep` files
+- add `scripts/bootstrap_storage_lanes.py` to initialize the configured PostgreSQL `core`, `paper`, and `live` schemas/tables before any active scheduler cutover
+- add `.venv-mac/bin/python main.py --adapter-inventory`, a read-only inventory of active, bridged, scaffold-only, and not-implemented market-data/execution/broker-account adapters
+- surface the canonical instrument id in recent broker-order and shadow-proposal status lines
+- add PostgreSQL-only paper/live config and deployment examples under `configs/` and `deployments/`
+- make `CENTAUR_CONFIG` load those paper/live YAML files as runtime defaults, while keeping `.env` as the final operator override layer
+- create the target physical `app/` architecture tree as facade modules over the current `centaur/` implementation, covering `core`, `engine`, `adapters`, `runtime`, `storage`, `reporting`, and `strategies`
+- move the first implementation slice into `app/`: runtime mode context, live guard, execution router, execution adapters, market-data adapters, canonical instruments, and storage layout
+- keep the old `centaur/` files for those moved boundaries as compatibility wrappers and switch active pipeline imports to the `app/` modules
+- add an import test proving the new `app/` architecture facades resolve to the current implementation
+
+Why:
+- the adapter-first architecture requires mode/environment to be a hard safety boundary, not scattered string logic
+- `live_dry` is only useful if it can exercise live-readiness paths without creating an order-mutation path
+- strategies and future adapters need a canonical instrument layer so vendor symbols do not become the core truth
+- config examples should reflect the intended paper/live separation without implying SQLite-backed live operation
+
+Implementation notes:
+- this is architecture scaffolding and boundary hardening only
+- the router and live guard now cover entry submission, managed exit submission, and stale-order cancellation
+- live entry/exit order requests with explicit venue metadata that conflicts with the live broker venue are blocked before adapter calls; known registry mappings that are not executable on the broker venue are also blocked
+- live entry/exit submission now re-checks that the live account/positions/orders sync exists, the live account is active and unblocked, the relevant latest bar exists, and live entry capacity has not already been consumed before any adapter call
+- by operator clarification on 2026-05-31, do not configure separate live-only trade-count or bar-age policy unless explicitly requested; Alpaca Live should be exactly the paper lane, but live
+- no separate live-guard threshold report or live-only threshold config remains after the same-as-paper clarification; diagnostics should review whether live matched the approved paper action
+- live-dry exit/cancel intent evidence is still minimal and should get a fuller report model before relying on it operationally
+- PostgreSQL status smoke verified the instrument metadata backfill: recent older broker-order and shadow-proposal rows now show canonical instrument ids where derivable
+- PostgreSQL status smoke also verified new latest-bar rows carrying canonical instrument ids such as `AAVE-USD-SPOT`, `BTC-USD-SPOT`, and `LINK-USD-SPOT`
+- a first attempt at bootstrapping latest-bar historical metadata used a full-table update and was canceled because it blocked dashboard/status/control startup; normal schema bootstrap now adds columns/indexes and writes metadata for new rows without sweeping large market-data/signal history
+- historical backfill rows now also write canonical instrument metadata for new bars, with a supporting `(canonical_instrument_id, timeframe, bar_timestamp)` index and no historical sweep in normal schema bootstrap
+- `InstrumentRef` is a migration foundation only; strategy scoring and market-data selection still use current symbol fields while carrying canonical metadata forward for evidence and routing
+- the market-data adapter boundary is a no-behavior-change wrapper around the current Alpaca client; direct Alpaca data transport calls now live inside the Alpaca market-data adapter, while future non-Alpaca providers still need concrete adapters and symbol-normalization tests before activation
+- adapter-side instrument metadata enriches payloads only; it does not alter bar prices, ranking inputs, symbol lists, risk gates, or order routing
+- the execution-adapter boundary is also a no-behavior-change wrapper for now; it separates order planning and mutation dependencies from broader broker account/state adapters, while concrete non-Alpaca execution adapters still require separate implementation and tests
+- IG remains account-scaffold-only and is not resolvable as an execution adapter
+- the adapter inventory is an operator/reporting surface only; it does not instantiate non-Alpaca providers or make them eligible for trading
+- the new `app/` package is now both a physical folder/import boundary and the implementation owner for the first migrated boundary slice; broader pipeline orchestration, persistence repositories, reports, strategies, and dashboards still need staged migration
+- compatibility wrappers in `centaur/` are deliberate so older imports and scheduler paths keep working during the migration
+- strategy scoring still uses the same symbol/asset-class fields and numeric inputs; canonical metadata is carried for downstream evidence/routing and does not alter ranking or signal logic
+- the storage-separation report verified PostgreSQL row-level provenance on recent samples: broker orders, shadow proposals, and strategy fitness rows had required `environment`, `mode`, and `source_environment` values; physical paper/live database or schema separation remains pending
+- schema-level separation is now scaffolded, but the active local runtime remains on its configured current schema unless `POSTGRES_SCHEMA` is explicitly set; moving production paper/live lanes requires a separate migration/checklist
+- storage layout reporting now distinguishes the shared core brain lane from paper/live execution lanes; the split must not be implemented by duplicating strategy fitness or letting live outcome rows masquerade as paper evidence
+- root storage cleanup removes unused placeholder folders only; configured lane paths still exist as logical paths and can be recreated lazily for file output
+- lane schema bootstrapping is non-destructive readiness work only; switching unattended jobs to lane schemas remains a separate operational cutover step
+- no notional, strategy allowlist, projected-gain floor, slot policy, daily protection, broker routing, live activation rule, or managed-exit policy changed
+- regression tests now cover runtime context permissions, `live_dry` environment defaulting, venue-specific symbol mapping, live-dry router behavior, live guard pre-submit blocking, live exit guard blocking, live cancel guard blocking, and paper cancel routing
+
+### Record live-dry order-action intents
+Decision:
+- make `ExecutionRouter` append live-dry entry, exit, and cancel intents into tick state under `execution_router_intents`
+- let live-dry stale-order reaping produce intended cancellation records without calling the live broker adapter or marking the order canceled
+- let live-dry managed exits produce intended exit and refresh-cancel records without calling the live broker adapter or persisting live broker responses
+- persist router intents in an `execution_router_intents` audit table with runtime mode, lane, action, broker, status, strategy, symbol/order id, canonical instrument metadata, and the intended order payload
+- summarize recent router intents in `.venv-mac/bin/python main.py --evidence-report`
+- keep explicit paper mode blocked from live broker sync and live order-action paths
+
+Why:
+- `live_dry` should be useful for reviewing what Centaur would have done in the live lane
+- intended live actions must be auditable without creating real broker mutations
+- the architecture doc calls for `live_dry` to produce intended live orders, not merely skip the live lane
+- tick-state evidence alone is too ephemeral for operator review after a later tick has replaced the latest state
+
+Implementation notes:
+- this is observability and dry-run evidence only
+- no paper/live notional, strategy allowlist, projected-gain floor, broker routing, activation gate, kill switch, daily protection, managed-exit rule, or real order behavior changed
+- a PostgreSQL status smoke check initially caught a normal-runtime bug from the refactor (`intended_refresh_cancellations` referenced in paper exit management); it was fixed immediately, tests passed, and the next scheduler tick completed `ok`
+
+### Persist shadow evidence provenance
+Decision:
+- add explicit provenance columns to `shadow_trade_proposals` and `shadow_trade_outcomes`: `environment`, `mode`, `source_environment`, `data_provider`, and `execution_provider`
+- make new shadow proposals inherit runtime environment/mode and record `source_environment=shadow`, `execution_provider=shadow`
+- make pending outcome checkpoints inherit metadata from their parent proposal
+- carry that metadata through evaluated outcome rows
+
+Why:
+- shadow proposals/outcomes are evidence rows that may later inform live decisions
+- live must be able to consume that evidence without it becoming indistinguishable from live outcome history
+- fitness snapshots are downstream of shadow outcomes, so the raw evidence layer also needs provenance
+
+Implementation notes:
+- this is persistence/auditability work only
+- no strategy selection, paper/live order submission, broker routing, notional, slot policy, projected-gain floors, daily protection, live follower gates, or managed exits changed
+- regression tests now cover proposal/outcome provenance in addition to order and fitness provenance
+
+### Add runtime live-boundary guards
+Decision:
+- make explicit `CENTAUR_MODE=paper` skip Alpaca Live broker sync and live order mutation paths
+- allow `live_dry` to carry intended live approvals but keep `execution_live` from submitting broker orders
+- keep live broker order mutation restricted to runtime `live`
+- add regression tests proving paper mode does not touch the live broker sync adapter and live_dry does not submit live orders
+
+Why:
+- the architecture refactor requires runtime mode to be an actual safety boundary, not just a label
+- paper changes should be testable without accidentally touching live broker APIs
+- live_dry should be useful for eligibility/risk review without real order placement
+
+Implementation notes:
+- the already-approved same-as-paper live follower remains active because legacy activation flags resolve runtime mode to `live`
+- explicit `CENTAUR_MODE` still takes precedence, so an operator can force paper-only mode
+- this does not change notional, strategy allowlists, projected-gain floors, daily protection, broker routing, or live activation requirements
+
+### Make legacy live runtime labels honest
+Decision:
+- keep `CENTAUR_MODE` and `CENTAUR_ENVIRONMENT` as the explicit runtime source when they are configured
+- for older `.env` files that predate these fields, report runtime `live/live` when the already-approved live activation flags are armed: `LIVE_EXECUTION_ENABLED=true`, `LIVE_EXECUTION_KILL_SWITCH=false`, and `LIVE_EXECUTION_ACTIVATION_ACK=LIVE_TRADING_APPROVED`
+- leave unarmed or non-live configurations reporting `paper/paper` by default
+
+Why:
+- the current same-as-paper live follower lane was activated before the new runtime-mode settings existed
+- showing `mode=paper` while Alpaca Live is armed is misleading for operators and for new evidence/provenance rows
+- this keeps status truthful during the migration toward fully explicit runtime modes
+
+Implementation notes:
+- this is a transitional compatibility shim for existing configuration files
+- explicit `CENTAUR_MODE`/`CENTAUR_ENVIRONMENT` still override the fallback
+- this does not change paper/live order submission, broker routing, notional, slot policy, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits
+
+### Persist broker order ledger provenance
+Decision:
+- add explicit provenance columns to `paper_trade_orders`: `environment`, `mode`, `source_environment`, `data_provider`, and `execution_provider`
+- infer new order provenance from `broker_id` and proposal linkage: paper broker rows are `paper/paper`, live broker rows are `live/live`, live follower entries with proposal ids use `source_environment=paper`, and paper proposal-derived entries use `source_environment=shadow`
+- backfill existing `*_live` broker rows as live rows
+- show order `env` and `mode` in the status recent-order ledger
+
+Why:
+- the current order audit table contains both paper and Alpaca Live follower orders while the broader PostgreSQL paper/live separation is still being built
+- live should be able to follow paper without order-history ambiguity
+- future separation by database/schema will be safer if every order row already carries its runtime provenance
+
+Implementation notes:
+- this is persistence/auditability work only
+- no paper/live order submission, broker routing, notional, slot policy, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits changed
+- the table name remains legacy for now; the new metadata makes its mixed paper/live ledger role explicit until a later storage split/rename is safe
+
+### Persist strategy fitness evidence-origin metadata
+Decision:
+- add explicit evidence-origin columns to `strategy_fitness_snapshots`: `environment`, `mode`, `source_environment`, `broker_id`, `data_provider`, and `execution_provider`
+- add matching SQLite dev and PostgreSQL schema migration/index support
+- label status, strategy-health, and crypto-health fitness output with the evidence source/environment
+- keep current production fitness as shared shadow-derived strategy evidence unless a future explicit live-fitness lane is implemented
+
+Why:
+- separating paper/live databases or schemas must not make live blind, but live also must not mistake paper or shadow evidence for real-money outcomes
+- the same Centaur strategy brain can consume reviewed paper/shadow/backtest evidence if every row remains auditable by origin
+- future live promotion needs three distinct concepts: paper/shadow fitness evidence, explicit live strategy permission, and true live fitness from live fills/outcomes
+
+Implementation notes:
+- current runtime snapshots default to `source_environment=shadow` and `execution_provider=shadow`
+- replay fitness snapshots record `source_environment=backtest`, `broker_id=simulator`, and `execution_provider=simulator`
+- this does not change paper/live order submission, broker routing, notional, slot policy, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits
+
+### Add adapter-first architecture instructions to the read-first stack
+Decision:
+- make `centaur-codex-architecture-instructions.md` part of the repo read-first stack
+- record the target direction: Centaur core should own instruments, market snapshots, signals, proposals, strategy evaluation, fitness, risk, slot logic, order intents, exits, and reporting models
+- put vendor market data, execution, broker/account, and symbol-mapping behavior behind adapters
+- require explicit runtime modes (`shadow`, `paper`, `live_dry`, `live`) and separated paper/live configuration, persistence, evidence, permissions, logs, and runtime state
+- align the architecture examples with the existing PostgreSQL-only rule for scheduler-backed paper/live operation and monitoring
+
+Why:
+- the operator wants to improve paper/research safely without accidental live impact
+- future vendors such as Alpaca, Binance, Coinbase, Betfair, or Polygon should not require duplicating the strategy/risk/fitness brain
+- the initial architecture draft used `.db` examples, but repo constraints already require PostgreSQL for live operation and fail-closed behavior when paper/live execution is enabled
+
+Implementation notes:
+- this is architecture/documentation guidance only
+- no paper/live order submission, broker routing, notional, slot policy, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits changed
+- SQLite remains only explicit local/dev scaffolding when execution is disabled; it must not become a scheduler-backed paper/live operations source
+
+### Record the $50/day strategic growth target
+Decision:
+- document a strategic target of reaching a sustained, evidence-backed `$50/day` net profit pace
+- expose the scaling report as `docs/FIFTY_DOLLAR_DAY_PLAN.md` and as a downloadable file from the root slot-compounding page
+- make the target part of the project directives as a prioritization goal only
+
+Why:
+- the operator wants the project oriented around a concrete growth target instead of a vague "improve returns" mandate
+- the current math shows `$50/day` requires more valid throughput, better net expectancy, cleaner exit/data reliability, and staged capital/slot scaling
+- the target needs to be visible in future work without weakening the existing risk framework
+
+Implementation notes:
+- this does not change paper/live order submission, broker routing, notional, slot policy, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits
+- any execution-envelope change still requires explicit approval and reliability-stack updates
+
+### Make slot-compounding defaults use actual closed-trade metrics
+Decision:
+- add read-only `paper_trade_outcome_metrics` to the dashboard snapshot from closed Alpaca Paper round trips
+- default the slot-compounding page from observed win rate, average winning-trade percent, average losing-trade percent, observed trade-throughput/slot-fill pace, and account-level tracked P/L
+- show the implied loss rate as the remainder of win rate so lowering wins visibly raises losses
+
+Why:
+- the previous page mixed real account P/L with synthetic `100%` win-rate and `0%` loss defaults
+- those placeholders made the projection look cleaner than the actual paper history
+- the operator needs a realistic starting point before experimenting with alternate assumptions
+
+Implementation notes:
+- metrics are grouped from filled `alpaca_paper` buy/sell orders by proposal id
+- this is an observability/projection change only
+- it does not change paper/live order submission, broker routing, notional, slot policy, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits
+
+### Refresh dashboard snapshots outside the control tick
+Decision:
+- keep `CONTROL_REFRESH_DASHBOARD_SNAPSHOT=false` so the normal 30-second control tick does not wait on dashboard/report snapshot work
+- add a separate macOS `launchd` agent, `com.ghostfrog.centaur.dashboard-snapshot`, that runs `scripts/write_dashboard_snapshot.sh` every `300` seconds
+- install the snapshot wrapper under `~/.centaur/write_dashboard_snapshot.sh` and log to `~/.centaur/runtime/dashboard_snapshot.log`
+- use a lock directory so overlapping snapshot refreshes skip instead of stacking
+
+Why:
+- the browser dashboard and slot-compounding page read the saved `var/dashboard_snapshot.json`; refreshing the browser does not query Alpaca or PostgreSQL directly
+- manual-only snapshot refresh made the dashboard look current while showing stale numbers
+- separating dashboard freshness from the trading tick keeps operator data reasonably fresh without adding avoidable drag to the safety-critical control loop
+
+Implementation notes:
+- this is an observability/data-freshness change only
+- it does not change paper/live order submission, broker routing, notional, slot policy, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits
+- the snapshot file remains an operator surface; PostgreSQL remains the live operations source
+
+### Tighten status and dashboard honesty labels
+Decision:
+- update status and web-dashboard wording so paper account values, live readiness, live execution intelligence, broker-order ledger rows, latest-tick activity, recent samples, all-time evidence, shadow-only recommendations, and observe-only risk evidence are clearly separated
+- label crypto-only windows as such instead of showing a generic closed market card
+- keep this as presentation and auditability cleanup only; do not alter paper/live execution gates, notional, exits, broker routing, strategy allowlists, or risk policy
+
+Why:
+- the same operator surfaces now carry paper execution state, live same-as-paper follower monitoring, shadow evidence, and observe-only risk observations
+- ambiguous labels can make read-only intelligence look like active policy, or make broker-aware order history look paper-only
+- the operator needs to read the dashboard quickly without confusing latest tick facts with broader evidence windows
+
+Implementation notes:
+- status now calls recent order rows `Recent broker orders (paper/live ledger, latest 5)` and includes `broker_id` in each rendered order line
+- dashboard cards now distinguish `Paper day P/L`, `Paper positions`, `Paper CFO`, `Equity market gate`, and `Paper peak giveback`
+- holding-window advice is labeled recommendation-only/shadow evidence, and live execution intelligence remains explicitly read-only
+- the web build label is `2026-05-31-honest-status-labels`
+
+### Add report/control-loop query indexes
+Decision:
+- add narrow operations-store indexes for regular status, dashboard, evidence, strategy-health, paper-exit, and holding-window query paths
+- cover tick usage rollups, FX reference lookup by source, latest-bar windows, candidate-signal counts, paper-order activity, per-strategy paper-order review, proposal/order joins, and evaluated shadow outcomes
+- keep this as a performance and auditability cleanup only; do not alter paper/live execution gates, notional, exits, broker routing, strategy allowlists, or risk policy
+
+Why:
+- Project rules now require database changes to be shaped so status/report paths do not drag on the control loop
+- the operator is increasingly using evidence reports before changing behavior, so those reports need predictable query paths as data grows
+- recent paper/live monitoring depends on distinguishing real activity from missing or slow evidence surfaces
+
+Implementation notes:
+- the new indexes are created in both SQLite dev schema and PostgreSQL operations schema so local/dev reports stay comparable to live operations behavior
+- PostgreSQL schema bootstrap takes a transaction-scoped advisory lock so concurrent status/report starts cannot race each other while creating new indexes
+- `paper_trade_orders` now has activity, broker-activity, strategy/side/status, and proposal/side/submitted indexes for recent-order, first-order, strategy-health, and paper-exit review paths
+- `shadow_trade_outcomes` now has an evaluated-outcome partial index for strategy fitness and holding-window review joins
+- `market_data_latest_bars`, `strategy_candidate_signals`, `api_request_events`, and `fx_reference_rates` gained indexes matching their bounded status/report lookups
+
+### Fail closed on PostgreSQL operations-store loss
+Decision:
+- require `UsageLedger` to fail closed when PostgreSQL is configured but unavailable
+- also require PostgreSQL when paper or live execution is enabled, even if a local SQLite path exists
+- keep SQLite available only as an explicit local/dev path when execution is not enabled
+- add an index shaped for the trailing high-water query: broker id plus equity descending plus capture time
+- keep `main.py --status` on a lightweight heartbeat path: no dashboard-only visual datasets, and a bounded threshold-advice sample instead of the full GA
+
+Why:
+- live operation and monitoring must not silently read or write the wrong store
+- a status surface backed by an empty fallback SQLite file can make the system look quiet when the real operations history is unavailable
+- the trailing drawdown observer reads account snapshots on every tick, so its high-water lookup needs a matching index rather than a cleanup task later
+- the full threshold GA is useful on demand but too expensive for routine status checks
+
+Implementation notes:
+- `UsageLedger` now raises when PostgreSQL is required but unavailable instead of falling back to SQLite
+- `idx_broker_account_snapshots_high_water` supports the per-broker high-water lookup used by `trailing_drawdown_observer`
+- additional indexes support recent tick, broker snapshot, and shadow proposal status/report queries
+- `.venv-mac/bin/python main.py --threshold-advice` remains the full recommendation workflow
+
+### Add evidence-reporting and database-quality directives
+Decision:
+- make evidence review a core project rule: any new feature that captures learning data must also add or update a runnable report, dashboard/status surface, or documented query path
+- require the report surface to explain how the data should be interpreted before it is used to change trading behavior
+- make high-quality code/documentation explicit: safety-critical logic and persistence paths need docstrings or compact comments that explain the risk boundary, audit trail, and operational intent
+- make database performance part of feature completeness: new persistent/high-volume paths must consider indexes, bounded lookbacks, query shape, and control-loop impact
+
+Why:
+- the operator wants accumulating shadow/counterfactual data to become actionable evidence rather than forgotten telemetry
+- reportable evidence makes it easier to decide when to promote an observe-only idea into active policy
+- database drag can silently damage the trading loop, so persistence quality must be handled while the feature is built
+
+Implementation notes:
+- `AGENTS.md` now carries the directive at the project-instruction level
+- `CONSTRAINTS.md` now blocks new evidence capture without a review surface and adds database-performance constraints
+- `SKILL.md` now has an `Evidence Capture And Reporting` workflow
+- broad report requests should start with `.venv-mac/bin/python main.py --evidence-report`
+
+### Add observe-only trailing drawdown evidence
+Decision:
+- add a `risk.trailing_drawdown_observer` pipeline step that records high-water equity giveback by broker for the current market session
+- keep it strictly observe-only: no CFO gate changes, no order cancellation, no forced exits, no live follower behavior changes, and no protection latch
+- default the counterfactual thresholds to `$2.00` giveback for paper and `$2.00` giveback for live, with percent thresholds disabled at `0.00`
+- expose the result in persisted tick snapshots, status output, trade diagnostics, and the web dashboard peak-giveback card
+- add `.venv-mac/bin/python main.py --evidence-report` as the broad report entrypoint for listing all shadow/counterfactual streams before deciding actions
+
+Why:
+- the operator noticed a visible peak followed by a drop and asked whether Centaur could minimize loss with a high-water rule
+- paper and live share the same codebase, and the system is showing early green shoots, so an active blocker would be premature
+- observe-only data lets the project answer “would this have helped or made things worse?” before promoting anything into execution policy
+
+Implementation notes:
+- config flags: `TRAILING_DRAWDOWN_OBSERVER_ENABLED`, `TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_USD`, `TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_PCT`, `TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_USD`, and `TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_PCT`
+- high-water evidence comes from `broker_account_snapshots`, so no new live operations source or SQLite fallback is introduced
+- the evidence report currently indexes shadow checkpoints, profit-target ladder, holding-window advice, threshold advice, signal visibility, crypto health, live execution intelligence, trailing drawdown observer, and special exit reasons
+- a future active guard would require a separate explicit human override and reliability-stack update
+
+### Defer red max-hold managed exits
+Decision:
+- stop allowing `max_holding_window_elapsed` to be the sole reason to sell a red managed position for `profit_after_1h_else_1d` and `profit_capture_else_1d`
+- when the max-hold point is reached and the current reference price is below entry, defer the exit with skip reason `max_hold_red_deferred`
+- keep stop loss, profit capture, take profit, and Friday equity no-weekend-carry exits active
+- keep notional, broker routing, strategy allowlist, projected-gain floors, one-order-per-tick discipline, slot caps, and daily drawdown protection unchanged
+
+Why:
+- a `LINK/USD` paper position and the same-as-paper live follower sold at a small loss solely because the `1d` max-hold timer elapsed
+- the operator objected that this was bad behavior when the trade had not hit its stop
+- the max-hold rule should not convert a modest unrealized loss into a realized loss by itself; deterministic protective exits should remain responsible for actual loss exits
+
+Implementation notes:
+- `profit_after_1h_else_1d` still sells after one hour when profitable and still sells at max hold when not red
+- `profit_capture_else_1d` still sells at profit capture, target, stop, or a non-red max-hold exit
+- red deferrals should be monitored because they can tie up slots; future work can add a read-only report for open `max_hold_red_deferred` positions and compare later outcomes
+
+### Add equity no-weekend-carry guard
+Decision:
+- keep Friday equity trading available for most of the regular session
+- block new equity paper entries in the final `60` minutes of the regular Friday session
+- flatten managed equity paper positions in the final `15` minutes of the regular Friday session with exit reason `friday_no_weekend_carry`
+- leave crypto unchanged because crypto can trade through the weekend
+- keep `$10` notional, broker routing, strategy allowlist, stop loss, profit capture, projected-gain floors, one-order-per-tick discipline, slot caps, and daily drawdown protection unchanged
+
+Why:
+- a calendar `1d` backstop can expire on Saturday for Friday equity entries, creating Monday forced exits that are driven by timing rather than a fresh thesis check
+- banning all Friday equity trading would discard about one trading day per week
+- a Friday intraday/no-weekend-carry rule reduces weekend gap exposure while preserving most Friday opportunity
+
+Implementation notes:
+- config flags: `PAPER_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED=true`, `PAPER_EXECUTION_EQUITY_FRIDAY_ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE=60`, and `PAPER_EXECUTION_EQUITY_FRIDAY_FLATTEN_MINUTES_BEFORE_CLOSE=15`
+- the CFO gate rejects late-Friday equity entries with `friday_entry_cutoff_no_weekend_carry`
+- managed exits check stop loss, profit capture, and take profit before the Friday flatten reason, so protective/profit exits keep their more specific audit reason when they trigger
+- live follower entry selection inherits the same late-Friday equity entry cutoff because live can only follow paper-approved/submitted orders; live managed exits use the same managed-exit helper and therefore share the flatten reason after activation gates
+- this is a capital-preservation rule, not evidence that weekend carry is always bad; future review should compare `friday_no_weekend_carry` outcomes with Monday-open and Monday-close counterfactuals before loosening it
 
 ## 2026-05-29
 

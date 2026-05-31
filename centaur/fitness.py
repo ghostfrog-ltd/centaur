@@ -48,6 +48,16 @@ def enrich_strategy_fitness_rows(
         enriched.append(
             {
                 "strategy_id": str(row.get("strategy_id", "")),
+                "environment": str(row.get("environment", "paper") or "paper"),
+                "mode": str(row.get("mode", "paper") or "paper"),
+                "source_environment": str(
+                    row.get("source_environment", "shadow") or "shadow"
+                ),
+                "broker_id": str(row.get("broker_id", "") or ""),
+                "data_provider": str(row.get("data_provider", "alpaca") or "alpaca"),
+                "execution_provider": str(
+                    row.get("execution_provider", "shadow") or "shadow"
+                ),
                 "strategy_family": str(row.get("strategy_family", "")),
                 "profile_id": str(row.get("profile_id", "")),
                 "asset_class": str(row.get("asset_class", "")),

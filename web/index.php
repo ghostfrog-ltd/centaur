@@ -3,475 +3,1471 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Project Centaur Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>Centaur Slot Compounding</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f7f5;
+      --surface: #ffffff;
+      --surface-2: #eef5f1;
+      --ink: #172022;
+      --muted: #657174;
+      --line: #d7e1dc;
+      --teal: #0f8b8d;
+      --teal-dark: #096669;
+      --gold: #c98f13;
+      --blue: #3867d6;
+      --rose: #c94b5f;
+      --green: #258b57;
+      --shadow: 0 16px 40px rgba(18, 31, 32, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, rgba(15, 139, 141, 0.08), rgba(244, 247, 245, 0) 34rem),
+        var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .shell {
+      width: min(1460px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 32px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .eyebrow {
+      margin: 0 0 7px;
+      color: var(--teal-dark);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 3vw, 44px);
+      line-height: 1.02;
+      letter-spacing: 0;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 750;
+      padding: 0 14px;
+      box-shadow: 0 6px 18px rgba(18, 31, 32, 0.05);
+      text-decoration: none;
+    }
+
+    .button:hover {
+      border-color: rgba(15, 139, 141, 0.45);
+    }
+
+    .button.primary {
+      background: var(--teal);
+      border-color: var(--teal);
+      color: white;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(320px, 0.82fr) minmax(0, 1.58fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel {
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      min-height: 56px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.76);
+    }
+
+    .panel-title {
+      font-size: 15px;
+      font-weight: 850;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: var(--surface-2);
+      color: var(--teal-dark);
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .controls {
+      display: grid;
+      gap: 16px;
+      padding: 16px;
+    }
+
+    .control {
+      display: grid;
+      gap: 8px;
+    }
+
+    .control-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: baseline;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .readout {
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 850;
+      white-space: nowrap;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--teal);
+    }
+
+    .number-row {
+      display: grid;
+      grid-template-columns: 1fr 86px;
+      gap: 10px;
+      align-items: center;
+    }
+
+    input[type="number"],
+    select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: white;
+      color: var(--ink);
+      padding: 7px 10px;
+      text-align: right;
+      font-weight: 750;
+    }
+
+    select {
+      text-align: left;
+    }
+
+    .segmented {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+    }
+
+    .segment {
+      min-height: 34px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 850;
+    }
+
+    .segment.active {
+      background: var(--surface);
+      color: var(--teal-dark);
+      box-shadow: 0 4px 14px rgba(18, 31, 32, 0.08);
+    }
+
+    .main {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .stat {
+      min-height: 112px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      box-shadow: 0 8px 22px rgba(18, 31, 32, 0.05);
+      min-width: 0;
+    }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .stat-value {
+      margin-top: 12px;
+      font-size: clamp(22px, 2.25vw, 34px);
+      font-weight: 900;
+      line-height: 1;
+      overflow-wrap: anywhere;
+    }
+
+    .stat-detail {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .chart-wrap {
+      padding: 12px 14px 16px;
+      min-width: 0;
+    }
+
+    canvas {
+      width: 100%;
+      aspect-ratio: 16 / 8.5;
+      display: block;
+      border-radius: 8px;
+      background: linear-gradient(180deg, #ffffff, #f7faf8);
+      border: 1px solid var(--line);
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .key {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .swatch {
+      width: 18px;
+      height: 4px;
+      border-radius: 999px;
+      background: var(--teal);
+    }
+
+    .swatch.gold {
+      background: var(--gold);
+    }
+
+    .swatch.blue {
+      background: var(--blue);
+    }
+
+    .details {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .wide {
+      grid-column: 1 / -1;
+    }
+
+    .tabs {
+      display: grid;
+      gap: 14px;
+    }
+
+    .tab-list {
+      display: inline-grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 4px;
+      width: min(480px, 100%);
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(238, 245, 241, 0.92);
+    }
+
+    .tab-button {
+      min-height: 40px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 900;
+      padding: 0 14px;
+    }
+
+    .tab-button.active {
+      background: var(--surface);
+      color: var(--teal-dark);
+      box-shadow: 0 4px 14px rgba(18, 31, 32, 0.08);
+    }
+
+    .tab-page {
+      display: grid;
+      gap: 18px;
+    }
+
+    .table-wrap {
+      max-height: 392px;
+      overflow: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: right;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      background: #f8fbf9;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 850;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      z-index: 1;
+    }
+
+    th:first-child,
+    td:first-child {
+      text-align: left;
+    }
+
+    .meter-list {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+    }
+
+    .meter-row {
+      display: grid;
+      gap: 8px;
+    }
+
+    .meter-top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .meter-value {
+      color: var(--ink);
+      font-weight: 900;
+    }
+
+    .meter {
+      height: 12px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      overflow: hidden;
+      border: 1px solid var(--line);
+    }
+
+    .meter-fill {
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, var(--teal), var(--green));
+      border-radius: inherit;
+    }
+
+    .meter-fill.gold {
+      background: linear-gradient(90deg, var(--gold), #e0b540);
+    }
+
+    .meter-fill.blue {
+      background: linear-gradient(90deg, var(--blue), #6c8ff0);
+    }
+
+    .note {
+      margin: 0;
+      padding: 12px 16px 16px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      border-top: 1px solid var(--line);
+      background: rgba(238, 245, 241, 0.52);
+    }
+
+    @media (max-width: 1120px) {
+      .grid,
+      .details {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 1280px) {
+      .stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 680px) {
+      .shell {
+        width: min(100% - 24px, 1460px);
+        padding-top: 16px;
+      }
+
+      .topbar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .toolbar {
+        justify-content: stretch;
+      }
+
+      .button {
+        flex: 1 1 auto;
+      }
+
+      .stats {
+        grid-template-columns: 1fr;
+      }
+
+      canvas {
+        aspect-ratio: 1 / 0.92;
+      }
+    }
+  </style>
 </head>
-<body class="bg-stone-100 text-stone-900">
-  <main class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-    <header class="mb-6 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+<body>
+  <main class="shell">
+    <header class="topbar">
       <div>
-        <p class="text-sm font-medium uppercase tracking-wide text-amber-700">Project Centaur</p>
-        <h1 class="text-3xl font-semibold tracking-tight">Operator Dashboard</h1>
-        <p id="checked-at" class="mt-2 text-sm text-stone-500">Loading latest snapshot...</p>
+        <p class="eyebrow">Project Centaur</p>
+        <h1>Slot Compounding</h1>
       </div>
-      <div class="flex flex-wrap gap-2">
-        <button id="refresh-button" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Refresh</button>
-        <a href="/api/snapshot.php" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Snapshot JSON</a>
+      <div class="toolbar">
+        <button id="preset-current" class="button primary" type="button">Current Envelope</button>
+        <button id="preset-fast" class="button" type="button">Faster Test</button>
+        <button id="reset" class="button" type="button">Reset</button>
+        <a class="button" href="/reports/50-dollar-day-plan.md" download>Download Plan</a>
+        <a class="button" href="/dashboard.php">Dashboard</a>
       </div>
     </header>
 
-    <section id="metric-cards" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-6"></section>
-
-    <section class="mt-6 grid gap-6 xl:grid-cols-[1.3fr_0.9fr]">
-      <div class="space-y-6">
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Account</h2>
+    <section class="grid">
+      <aside class="panel" aria-label="Model controls">
+        <div class="panel-head">
+          <div class="panel-title">Inputs</div>
+          <div class="badge-row">
+            <span id="source-badge" class="badge">Current envelope</span>
+            <span id="input-badge" class="badge">$10 slots</span>
           </div>
-          <div id="account-panel" class="grid gap-4 p-4 md:grid-cols-2"></div>
+        </div>
+        <div class="controls">
+          <div class="control">
+            <div class="control-top">
+              <label for="base-slots">Base Slots</label>
+              <span id="base-slots-readout" class="readout">10</span>
+            </div>
+            <div class="number-row">
+              <input id="base-slots" type="range" min="1" max="500" step="1" value="10">
+              <input id="base-slots-number" type="number" min="1" max="500" step="1" value="10">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="slot-size">Per Slot Contains</label>
+              <span id="slot-size-readout" class="readout">$10.00</span>
+            </div>
+            <div class="number-row">
+              <input id="slot-size" type="range" min="1" max="100" step="1" value="10">
+              <input id="slot-size-number" type="number" min="1" max="10000" step="1" value="10">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label>Per Slot Back Mode</label>
+              <span id="back-mode-readout" class="readout">Percent</span>
+            </div>
+            <div class="segmented" role="group" aria-label="Per slot back mode">
+              <button id="mode-percent" class="segment active" type="button">Percent</button>
+              <button id="mode-dollars" class="segment" type="button">Dollars</button>
+            </div>
+          </div>
+
+          <div class="control" id="return-percent-control">
+            <div class="control-top">
+              <label for="return-percent">Avg Win Per Winning Slot</label>
+              <span id="return-percent-readout" class="readout">0%</span>
+            </div>
+            <div class="number-row">
+              <input id="return-percent" type="range" min="-5" max="12" step="0.01" value="0">
+              <input id="return-percent-number" type="number" min="-100" max="100" step="0.01" value="0">
+            </div>
+          </div>
+
+          <div class="control" id="return-dollars-control" hidden>
+            <div class="control-top">
+              <label for="return-dollars">Avg Win Per Winning Slot</label>
+              <span id="return-dollars-readout" class="readout">$0.00</span>
+            </div>
+            <div class="number-row">
+              <input id="return-dollars" type="range" min="-5" max="5" step="0.01" value="0">
+              <input id="return-dollars-number" type="number" min="-10000" max="10000" step="0.01" value="0">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="win-rate">Win Rate Assumption</label>
+              <span id="win-rate-readout" class="readout">100%</span>
+            </div>
+            <div class="number-row">
+              <input id="win-rate" type="range" min="0" max="100" step="1" value="100">
+              <input id="win-rate-number" type="number" min="0" max="100" step="1" value="100">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="loss-percent">Avg Loss Per Losing Slot</label>
+              <span id="loss-percent-readout" class="readout">0%</span>
+            </div>
+            <div class="number-row">
+              <input id="loss-percent" type="range" min="0" max="12" step="0.05" value="0">
+              <input id="loss-percent-number" type="number" min="0" max="100" step="0.05" value="0">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="slot-fill">Slots Used Per Cycle</label>
+              <span id="slot-fill-readout" class="readout">100%</span>
+            </div>
+            <div class="number-row">
+              <input id="slot-fill" type="range" min="1" max="100" step="1" value="100">
+              <input id="slot-fill-number" type="number" min="1" max="100" step="1" value="100">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="starting-profit">Starting Snapshot P/L</label>
+              <span id="starting-profit-readout" class="readout">$0.00</span>
+            </div>
+            <div class="number-row">
+              <input id="starting-profit" type="range" min="-100" max="250" step="1" value="0">
+              <input id="starting-profit-number" type="number" min="-100000" max="100000" step="1" value="0">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="cycles">Modeled Active Days</label>
+              <span id="cycles-readout" class="readout">365</span>
+            </div>
+            <div class="number-row">
+              <input id="cycles" type="range" min="1" max="1000" step="1" value="365">
+              <input id="cycles-number" type="number" min="1" max="10000" step="1" value="365">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="cycles-per-day">Cycles Per Active Day</label>
+              <span id="cycles-per-day-readout" class="readout">1</span>
+            </div>
+            <div class="number-row">
+              <input id="cycles-per-day" type="range" min="1" max="48" step="1" value="1">
+              <input id="cycles-per-day-number" type="number" min="1" max="1440" step="1" value="1">
+            </div>
+          </div>
+        </div>
+        <p class="note">Read-only projection. Snapshot defaults use closed paper-trade outcomes for win rate, average win, and average loss; account-level P/L still includes open red positions. The saved dashboard snapshot is refreshed in the background every 5 minutes; browser refreshes read that latest saved file. Calendar holidays and closed equity sessions are not automatically modeled; the active-day count is editable.</p>
+      </aside>
+
+      <section class="main">
+        <div class="stats" aria-label="Simulation summary">
+          <article class="stat">
+            <div class="stat-label">Projected Profit</div>
+            <div id="stat-profit" class="stat-value">$0.00</div>
+            <div id="stat-profit-detail" class="stat-detail">0 cycles</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">Projected Slots</div>
+            <div id="stat-slots" class="stat-value">0</div>
+            <div id="stat-slots-detail" class="stat-detail">0 earned</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">Slot Capacity</div>
+            <div id="stat-capacity" class="stat-value">$0.00</div>
+            <div id="stat-capacity-detail" class="stat-detail">0 x $0</div>
+          </article>
+          <article class="stat">
+            <div class="stat-label">Next Slot Needs</div>
+            <div id="stat-next" class="stat-value">$0.00</div>
+            <div id="stat-next-detail" class="stat-detail">remaining</div>
+          </article>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Open positions</h2>
+        <section class="tabs">
+          <div class="tab-list" role="tablist" aria-label="Compounding views">
+            <button id="tab-graph-button" class="tab-button active" type="button" role="tab" aria-controls="tab-graph" aria-selected="true">Graph</button>
+            <button id="tab-slices-button" class="tab-button" type="button" role="tab" aria-controls="tab-slices" aria-selected="false">30 Active-Day Slices</button>
           </div>
-          <div id="positions-table" class="overflow-x-auto"></div>
-        </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Recent paper orders</h2>
-          </div>
-          <div id="orders-table" class="overflow-x-auto"></div>
-        </div>
+          <section id="tab-graph" class="tab-page" role="tabpanel" aria-labelledby="tab-graph-button">
+            <section class="panel" aria-label="Compounding chart">
+              <div class="panel-head">
+                <div class="panel-title">Curve</div>
+                <span id="chart-badge" class="badge">120 cycles</span>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="chart" aria-label="Profit, slot count, and slot capacity over time"></canvas>
+                <div class="legend">
+                  <span class="key"><span class="swatch"></span>Tracked P/L</span>
+                  <span class="key"><span class="swatch gold"></span>Effective Slots</span>
+                  <span class="key"><span class="swatch blue"></span>Slot Capacity</span>
+                </div>
+              </div>
+            </section>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Recent shadow proposals</h2>
-          </div>
-          <div id="proposals-table" class="overflow-x-auto"></div>
-        </div>
+            <section class="details">
+              <section class="panel">
+                <div class="panel-head">
+                  <div class="panel-title">Milestones</div>
+                  <span id="milestone-badge" class="badge">0 earned</span>
+                </div>
+                <div class="meter-list" id="meters"></div>
+              </section>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Signal pipeline</h2>
-          </div>
-          <div id="signal-panels" class="space-y-4 p-4"></div>
-        </div>
-      </div>
+              <section class="panel">
+                <div class="panel-head">
+                  <div class="panel-title">Sampled Timeline</div>
+                  <span id="table-badge" class="badge">12 rows</span>
+                </div>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Cycle</th>
+                        <th>Profit</th>
+                        <th>Earned</th>
+                        <th>Slots</th>
+                        <th>Capacity</th>
+                        <th>Net Cycle</th>
+                      </tr>
+                    </thead>
+                    <tbody id="timeline-body"></tbody>
+                  </table>
+                </div>
+              </section>
+            </section>
+          </section>
 
-      <div class="space-y-6">
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Trade diagnostics</h2>
-          </div>
-          <div id="trade-diagnostics" class="space-y-2 p-4"></div>
-        </div>
-
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Centaur activity</h2>
-          </div>
-          <div id="activity-panel" class="space-y-2 p-4"></div>
-        </div>
-
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">GA threshold advice</h2>
-          </div>
-          <div id="threshold-panel" class="space-y-2 p-4"></div>
-        </div>
-
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Holding-window fitness</h2>
-          </div>
-          <div id="holding-window-panel" class="space-y-2 p-4"></div>
-        </div>
-
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Broker accounts</h2>
-          </div>
-          <div id="broker-panel" class="space-y-2 p-4"></div>
-        </div>
-
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Live readiness</h2>
-          </div>
-          <div id="live-panel" class="space-y-2 p-4"></div>
-        </div>
-
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">API cost</h2>
-          </div>
-          <div id="cost-panel" class="space-y-2 p-4"></div>
-        </div>
-
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Alerts</h2>
-          </div>
-          <div id="alerts-panel" class="space-y-3 p-4"></div>
-        </div>
-      </div>
+          <section id="tab-slices" class="tab-page" role="tabpanel" aria-labelledby="tab-slices-button" hidden>
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">30 Active-Day Slices</div>
+                <span id="slice-badge" class="badge">1 model year</span>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Active Days</th>
+                      <th>#</th>
+                      <th>Slice Earned</th>
+                      <th>Avg / Day</th>
+                      <th>Ending Profit</th>
+                      <th>Earned Slots</th>
+                      <th>Total Slots</th>
+                      <th>Capacity</th>
+                    </tr>
+                  </thead>
+                  <tbody id="slice-body"></tbody>
+                </table>
+              </div>
+            </section>
+          </section>
+        </section>
+      </section>
     </section>
   </main>
 
   <script>
-    const snapshotUrl = "/api/snapshot.php";
-    const refreshIntervalMs = 15000;
+    const currentEnvelope = {
+      baseSlots: 10,
+      slotSize: 10,
+      profitCapturePct: 1.25,
+      activeDaysPerYear: 252,
+      maxOrdersPerTick: 1,
+      dailyDrawdownUsd: 5
+    };
 
-    const cardContainer = document.getElementById("metric-cards");
-    const checkedAtNode = document.getElementById("checked-at");
+    const defaults = {
+      baseSlots: currentEnvelope.baseSlots,
+      slotSize: currentEnvelope.slotSize,
+      backMode: "percent",
+      returnPercent: 0,
+      returnDollars: 0,
+      winRate: 100,
+      lossPercent: 0,
+      slotFill: 100,
+      startingProfit: 0,
+      cycles: currentEnvelope.activeDaysPerYear,
+      cyclesPerDay: 1
+    };
 
-    const accountPanel = document.getElementById("account-panel");
-    const positionsTable = document.getElementById("positions-table");
-    const ordersTable = document.getElementById("orders-table");
-    const proposalsTable = document.getElementById("proposals-table");
-    const signalPanels = document.getElementById("signal-panels");
-    const tradeDiagnostics = document.getElementById("trade-diagnostics");
-    const activityPanel = document.getElementById("activity-panel");
-    const thresholdPanel = document.getElementById("threshold-panel");
-    const holdingWindowPanel = document.getElementById("holding-window-panel");
-    const brokerPanel = document.getElementById("broker-panel");
-    const livePanel = document.getElementById("live-panel");
-    const costPanel = document.getElementById("cost-panel");
-    const alertsPanel = document.getElementById("alerts-panel");
+    const fastPreset = {
+      baseSlots: 10,
+      slotSize: 10,
+      backMode: "percent",
+      returnPercent: 2.5,
+      returnDollars: 0.25,
+      winRate: 100,
+      lossPercent: 0,
+      slotFill: 100,
+      startingProfit: 0,
+      cycles: 240,
+      cyclesPerDay: 12
+    };
 
-    function fmtNumber(value, decimals = 2) {
-      if (value === null || value === undefined || value === "") return "-";
+    const fields = {
+      baseSlots: bindNumber("base-slots"),
+      slotSize: bindNumber("slot-size"),
+      returnPercent: bindNumber("return-percent"),
+      returnDollars: bindNumber("return-dollars"),
+      winRate: bindNumber("win-rate"),
+      lossPercent: bindNumber("loss-percent"),
+      slotFill: bindNumber("slot-fill"),
+      startingProfit: bindNumber("starting-profit"),
+      cycles: bindNumber("cycles"),
+      cyclesPerDay: bindNumber("cycles-per-day")
+    };
+
+    const nodes = {
+      sourceBadge: document.getElementById("source-badge"),
+      inputBadge: document.getElementById("input-badge"),
+      baseSlotsReadout: document.getElementById("base-slots-readout"),
+      slotSizeReadout: document.getElementById("slot-size-readout"),
+      backModeReadout: document.getElementById("back-mode-readout"),
+      returnPercentReadout: document.getElementById("return-percent-readout"),
+      returnDollarsReadout: document.getElementById("return-dollars-readout"),
+      winRateReadout: document.getElementById("win-rate-readout"),
+      lossPercentReadout: document.getElementById("loss-percent-readout"),
+      slotFillReadout: document.getElementById("slot-fill-readout"),
+      startingProfitReadout: document.getElementById("starting-profit-readout"),
+      cyclesReadout: document.getElementById("cycles-readout"),
+      cyclesPerDayReadout: document.getElementById("cycles-per-day-readout"),
+      returnPercentControl: document.getElementById("return-percent-control"),
+      returnDollarsControl: document.getElementById("return-dollars-control"),
+      modePercent: document.getElementById("mode-percent"),
+      modeDollars: document.getElementById("mode-dollars"),
+      tabGraphButton: document.getElementById("tab-graph-button"),
+      tabSlicesButton: document.getElementById("tab-slices-button"),
+      tabGraph: document.getElementById("tab-graph"),
+      tabSlices: document.getElementById("tab-slices"),
+      statProfit: document.getElementById("stat-profit"),
+      statProfitDetail: document.getElementById("stat-profit-detail"),
+      statSlots: document.getElementById("stat-slots"),
+      statSlotsDetail: document.getElementById("stat-slots-detail"),
+      statCapacity: document.getElementById("stat-capacity"),
+      statCapacityDetail: document.getElementById("stat-capacity-detail"),
+      statNext: document.getElementById("stat-next"),
+      statNextDetail: document.getElementById("stat-next-detail"),
+      chartBadge: document.getElementById("chart-badge"),
+      milestoneBadge: document.getElementById("milestone-badge"),
+      sliceBadge: document.getElementById("slice-badge"),
+      tableBadge: document.getElementById("table-badge"),
+      meters: document.getElementById("meters"),
+      sliceBody: document.getElementById("slice-body"),
+      timelineBody: document.getElementById("timeline-body"),
+      chart: document.getElementById("chart")
+    };
+
+    let backMode = defaults.backMode;
+    let currentDefaultSource = "Current envelope";
+    let latestRows = [];
+
+    function bindNumber(id) {
+      return {
+        range: document.getElementById(id),
+        number: document.getElementById(`${id}-number`)
+      };
+    }
+
+    function clamp(value, min, max) {
       const number = Number(value);
-      if (Number.isNaN(number)) return "-";
-      return number.toFixed(decimals);
+      if (!Number.isFinite(number)) return min;
+      return Math.min(max, Math.max(min, number));
+    }
+
+    function valueOf(fieldName) {
+      return Number(fields[fieldName].number.value);
+    }
+
+    function setField(fieldName, value) {
+      const field = fields[fieldName];
+      const min = Number(field.number.min);
+      const max = Number(field.number.max);
+      const next = clamp(value, min, max);
+      field.number.value = String(next);
+      const rangeMin = Number(field.range.min);
+      const rangeMax = Number(field.range.max);
+      field.range.value = String(clamp(next, rangeMin, rangeMax));
+    }
+
+    function numberOrNull(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function withCurrentSlotEconomics(preset) {
+      const slotSize = numberOrNull(preset.slotSize) ?? currentEnvelope.slotSize;
+      const returnPercent = numberOrNull(preset.returnPercent) ?? 0;
+      return {
+        ...preset,
+        returnDollars: Number(((slotSize * returnPercent) / 100).toFixed(4))
+      };
+    }
+
+    function syncField(fieldName, source) {
+      const field = fields[fieldName];
+      const sourceNode = field[source];
+      const targetNode = source === "range" ? field.number : field.range;
+      const targetMin = Number(targetNode.min);
+      const targetMax = Number(targetNode.max);
+      targetNode.value = String(clamp(sourceNode.value, targetMin, targetMax));
     }
 
     function fmtCurrency(value, decimals = 2) {
-      if (value === null || value === undefined || value === "") return "-";
-      const number = Number(value);
-      if (Number.isNaN(number)) return "-";
-      return `$${number.toFixed(decimals)}`;
+      if (!Number.isFinite(value)) return "-";
+      return `$${value.toLocaleString(undefined, {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals
+      })}`;
     }
 
-    function fmtSignedCurrency(value) {
-      if (value === null || value === undefined || value === "") return "-";
-      const number = Number(value);
-      if (Number.isNaN(number)) return "-";
-      return `$${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
+    function fmtNumber(value, decimals = 0) {
+      if (!Number.isFinite(value)) return "-";
+      return value.toLocaleString(undefined, {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals
+      });
     }
 
-    function fmtSignedPct(value) {
-      if (value === null || value === undefined || value === "") return "-";
-      const number = Number(value);
-      if (Number.isNaN(number)) return "-";
-      return `${number >= 0 ? "+" : ""}${number.toFixed(2)}%`;
+    function pct(value) {
+      return `${fmtNumber(value, value % 1 === 0 ? 0 : 2)}%`;
     }
 
-    function escapeHtml(value) {
-      return String(value ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
+    function fmtSnapshotLabel(value) {
+      if (!value) return "Latest snapshot";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "Latest snapshot";
+      return `Snapshot ${date.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric"
+      })} ${date.toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit"
+      })}`;
     }
 
-    function renderList(target, items, emptyLabel = "Nothing recorded yet.") {
-      const rows = Array.isArray(items) ? items.filter(Boolean) : [];
-      if (!rows.length) {
-        target.innerHTML = `<p class="text-sm text-stone-500">${escapeHtml(emptyLabel)}</p>`;
-        return;
-      }
-      target.innerHTML = rows.map((item) => `
-        <div class="rounded-md border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-700">
-          <span class="font-mono text-[12px]">${escapeHtml(item)}</span>
-        </div>
-      `).join("");
+    function getInputs() {
+      const slotSize = Math.max(0.01, valueOf("slotSize"));
+      const returnPerSlot = backMode === "percent"
+        ? slotSize * (valueOf("returnPercent") / 100)
+        : valueOf("returnDollars");
+      return {
+        baseSlots: Math.max(0, Math.floor(valueOf("baseSlots"))),
+        slotSize,
+        backMode,
+        returnPercent: valueOf("returnPercent"),
+        returnDollars: valueOf("returnDollars"),
+        returnPerSlot,
+        winRate: clamp(valueOf("winRate"), 0, 100) / 100,
+        lossPercent: valueOf("lossPercent"),
+        slotFill: clamp(valueOf("slotFill"), 0, 100) / 100,
+        startingProfit: valueOf("startingProfit"),
+        cycles: Math.max(1, Math.floor(valueOf("cycles"))),
+        cyclesPerDay: Math.max(1, Math.floor(valueOf("cyclesPerDay")))
+      };
     }
 
-    function renderTable(target, columns, rows, emptyLabel) {
-      if (!Array.isArray(rows) || !rows.length) {
-        target.innerHTML = `<p class="p-4 text-sm text-stone-500">${escapeHtml(emptyLabel)}</p>`;
-        return;
-      }
-      const head = columns.map((column) => `<th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">${escapeHtml(column.label)}</th>`).join("");
-      const body = rows.map((row) => `
-        <tr class="border-t border-stone-200">
-          ${columns.map((column) => `<td class="px-4 py-3 text-sm text-stone-700 ${column.mono ? "font-mono text-[12px]" : ""}">${column.render(row)}</td>`).join("")}
-        </tr>
-      `).join("");
-      target.innerHTML = `<table class="min-w-full">${`<thead class="bg-stone-50"><tr>${head}</tr></thead><tbody>${body}</tbody>`}</table>`;
-    }
+    function simulate(inputs) {
+      const rows = [];
+      let profit = inputs.startingProfit;
 
-    function buildMetricCards(snapshot) {
-      const latestTick = snapshot.latest_tick || {};
-      const tickState = latestTick.state_snapshot_json || {};
-      const marketGate = tickState.market_gate || {};
-      const riskCfo = tickState.risk_cfo || {};
-      const blockers = (snapshot.centaur_activity || {}).blockers || {};
-      const account = snapshot.account_overview || {};
-
-      const cards = [
-        { label: "Latest tick", value: String(latestTick.status || "none").toUpperCase(), detail: latestTick.started_at || "-" },
-        { label: "Market", value: marketGate.market_open ? "OPEN" : "CLOSED", detail: marketGate.reason || "-" },
-        { label: "CFO", value: riskCfo.decision || "-", detail: riskCfo.reason || "-" },
-        { label: "Day P/L", value: fmtSignedCurrency(account.day_change_usd), detail: fmtSignedPct(account.day_change_pct), tone: Number(account.day_change_usd) > 0 ? "text-emerald-600" : Number(account.day_change_usd) < 0 ? "text-rose-600" : "" },
-        { label: "Open positions", value: String(account.open_positions_count || 0), detail: `slots ${account.open_positions_count || 0}/10` },
-        { label: "Primary blocker", value: blockers.primary_stage || "-", detail: blockers.cfo_reason || "-" }
-      ];
-
-      cardContainer.innerHTML = cards.map((card) => `
-        <article class="rounded-lg border border-stone-200 bg-white p-4 shadow-sm">
-          <div class="text-sm text-stone-500">${escapeHtml(card.label)}</div>
-          <div class="mt-3 text-2xl font-semibold ${card.tone || ""}">${escapeHtml(card.value)}</div>
-          <div class="mt-2 text-sm text-stone-500">${escapeHtml(card.detail || "-")}</div>
-        </article>
-      `).join("");
-    }
-
-    function buildAccountPanel(account) {
-      const blocks = [
-        {
-          title: "Balances",
-          rows: [
-            `Equity ${fmtCurrency(account.equity)}`,
-            `Cash ${fmtCurrency(account.cash)}`,
-            `Buying power ${fmtCurrency(account.buying_power)}`,
-            `Position value ${fmtCurrency(account.position_market_value_usd)}`
-          ]
-        },
-        {
-          title: "Capital and P/L",
-          rows: [
-            `Day change ${fmtSignedCurrency(account.day_change_usd)} (${fmtSignedPct(account.day_change_pct)})`,
-            `Open unrealized ${fmtSignedCurrency(account.open_position_unrealized_pl_usd)}`,
-            `Committed ${fmtCurrency(account.capital_committed_usd)}`,
-            `Free ${fmtCurrency(account.capital_free_usd)}`
-          ]
+      for (let cycle = 0; cycle <= inputs.cycles; cycle += 1) {
+        const earnedSlots = Math.floor(Math.max(0, profit) / inputs.slotSize);
+        const effectiveSlots = inputs.baseSlots + earnedSlots;
+        const slotsUsed = effectiveSlots * inputs.slotFill;
+        const winningSlots = slotsUsed * inputs.winRate;
+        const losingSlots = slotsUsed - winningSlots;
+        const grossBack = cycle === 0 ? 0 : winningSlots * inputs.returnPerSlot;
+        const lossDrag = cycle === 0 ? 0 : losingSlots * inputs.slotSize * (inputs.lossPercent / 100);
+        const cycleBack = grossBack - lossDrag;
+        const capacity = effectiveSlots * inputs.slotSize;
+        rows.push({
+          cycle,
+          day: cycle / inputs.cyclesPerDay,
+          profit,
+          earnedSlots,
+          effectiveSlots,
+          capacity,
+          grossBack,
+          lossDrag,
+          cycleBack
+        });
+        if (cycle < inputs.cycles) {
+          profit += cycleBack;
         }
-      ];
+      }
 
-      accountPanel.innerHTML = blocks.map((block) => `
-        <div class="rounded-md border border-stone-200 bg-stone-50 p-4">
-          <h3 class="text-sm font-semibold text-stone-800">${escapeHtml(block.title)}</h3>
-          <ul class="mt-3 space-y-2 text-sm text-stone-600">
-            ${block.rows.map((row) => `<li>${escapeHtml(row)}</li>`).join("")}
-          </ul>
-        </div>
-      `).join("");
+      return rows;
     }
 
-    function buildSignalPanels(activity) {
-      const sections = [
-        { title: "Raw signals", rows: activity.raw_signal_preview || [], empty: "No raw signals captured on this tick." },
-        { title: "Suppressed signals", rows: activity.suppressed_signal_preview || [], empty: "No suppressed signals captured on this tick." },
-        { title: "Surviving signals", rows: activity.surviving_signal_preview || [], empty: "No surviving signals on this tick." }
+    function sampleRows(rows, count = 12) {
+      if (rows.length <= count) return rows;
+      const chosen = new Map();
+      const maxIndex = rows.length - 1;
+      for (let i = 0; i < count; i += 1) {
+        const index = Math.round((i / (count - 1)) * maxIndex);
+        chosen.set(index, rows[index]);
+      }
+      return Array.from(chosen.values());
+    }
+
+    function updateReadouts(inputs) {
+      nodes.sourceBadge.textContent = currentDefaultSource;
+      nodes.inputBadge.textContent = `${fmtCurrency(inputs.slotSize, 0)} slots`;
+      nodes.baseSlotsReadout.textContent = fmtNumber(inputs.baseSlots);
+      nodes.slotSizeReadout.textContent = fmtCurrency(inputs.slotSize);
+      nodes.backModeReadout.textContent = backMode === "percent" ? "Percent" : "Dollars";
+      nodes.returnPercentReadout.textContent = pct(inputs.returnPercent);
+      nodes.returnDollarsReadout.textContent = fmtCurrency(inputs.returnDollars);
+      nodes.winRateReadout.textContent = `${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`;
+      nodes.lossPercentReadout.textContent = pct(inputs.lossPercent);
+      nodes.slotFillReadout.textContent = pct(inputs.slotFill * 100);
+      nodes.startingProfitReadout.textContent = fmtCurrency(inputs.startingProfit);
+      nodes.cyclesReadout.textContent = fmtNumber(inputs.cycles);
+      nodes.cyclesPerDayReadout.textContent = fmtNumber(inputs.cyclesPerDay);
+      nodes.modePercent.classList.toggle("active", backMode === "percent");
+      nodes.modeDollars.classList.toggle("active", backMode === "dollars");
+      nodes.returnPercentControl.hidden = backMode !== "percent";
+      nodes.returnDollarsControl.hidden = backMode !== "dollars";
+    }
+
+    function updateSummary(inputs, rows) {
+      const end = rows[rows.length - 1];
+      const gained = end.profit - inputs.startingProfit;
+      const nextSlotAt = (end.earnedSlots + 1) * inputs.slotSize;
+      const nextSlotNeeds = Math.max(0, nextSlotAt - Math.max(0, end.profit));
+      const days = end.day;
+      const returnText = backMode === "percent"
+        ? `${pct(inputs.returnPercent)} avg win | ${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`
+        : `${fmtCurrency(inputs.returnPerSlot)} avg win | ${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`;
+
+      nodes.statProfit.textContent = fmtCurrency(end.profit);
+      nodes.statProfitDetail.textContent = `${fmtCurrency(gained)} gained over ${fmtNumber(days, 1)} active days`;
+      nodes.statSlots.textContent = fmtNumber(end.effectiveSlots);
+      nodes.statSlotsDetail.textContent = `${fmtNumber(end.earnedSlots)} earned from ${fmtCurrency(Math.max(0, end.profit))} tracked P/L`;
+      nodes.statCapacity.textContent = fmtCurrency(end.capacity);
+      nodes.statCapacityDetail.textContent = `${fmtNumber(end.effectiveSlots)} x ${fmtCurrency(inputs.slotSize)} | ${returnText} | ${pct(inputs.lossPercent)} loss`;
+      nodes.statNext.textContent = fmtCurrency(nextSlotNeeds);
+      nodes.statNextDetail.textContent = nextSlotNeeds === 0 ? "next slot unlocked" : `next slot at ${fmtCurrency(nextSlotAt)}`;
+      nodes.chartBadge.textContent = `${fmtNumber(inputs.cycles)} cycles | ${fmtNumber(days, 1)} active days`;
+      nodes.milestoneBadge.textContent = `${fmtNumber(end.earnedSlots)} earned`;
+    }
+
+    function updateMeters(inputs, rows) {
+      const end = rows[rows.length - 1];
+      const milestones = [
+        { label: "Next earned slot", target: (end.earnedSlots + 1) * inputs.slotSize, tone: "" },
+        { label: "Double base capacity", target: inputs.baseSlots * inputs.slotSize, tone: "gold" },
+        { label: "Triple base capacity", target: inputs.baseSlots * inputs.slotSize * 2, tone: "blue" }
       ];
 
-      signalPanels.innerHTML = sections.map((section) => {
-        if (!section.rows.length) {
-          return `<section class="rounded-md border border-stone-200 bg-stone-50 p-4"><h3 class="text-sm font-semibold">${escapeHtml(section.title)}</h3><p class="mt-3 text-sm text-stone-500">${escapeHtml(section.empty)}</p></section>`;
-        }
+      nodes.meters.innerHTML = milestones.map((item) => {
+        const progress = item.target > 0 ? clamp((Math.max(0, end.profit) / item.target) * 100, 0, 100) : 100;
         return `
-          <section class="rounded-md border border-stone-200 bg-stone-50 p-4">
-            <h3 class="text-sm font-semibold">${escapeHtml(section.title)}</h3>
-            <div class="mt-3 overflow-x-auto">
-              <table class="min-w-full">
-                <thead>
-                  <tr>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Strategy</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Symbol</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Status</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Score</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Fitness</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Target</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${section.rows.slice(0, 8).map((row) => `
-                    <tr class="border-t border-stone-200">
-                      <td class="px-3 py-2 text-sm text-stone-700">${escapeHtml(row.strategy_id || "-")}</td>
-                      <td class="px-3 py-2 font-mono text-[12px] text-stone-700">${escapeHtml((row.symbol || "-").toUpperCase())}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${escapeHtml(row.allocation_status || "-")}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${fmtNumber(row.signal_score, 2)}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${fmtNumber(row.fitness_composite_score, 2)}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${fmtNumber(row.target_return_pct, 2)}%</td>
-                    </tr>
-                  `).join("")}
-                </tbody>
-              </table>
+          <div class="meter-row">
+            <div class="meter-top">
+              <span>${item.label}</span>
+              <span class="meter-value">${fmtCurrency(Math.max(0, end.profit))} / ${fmtCurrency(item.target)}</span>
             </div>
-          </section>
+            <div class="meter"><div class="meter-fill ${item.tone}" style="width: ${progress}%"></div></div>
+          </div>
         `;
       }).join("");
     }
 
-    async function loadSnapshot() {
-      checkedAtNode.textContent = "Refreshing...";
-      const response = await fetch(snapshotUrl, { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`Snapshot request failed: ${response.status}`);
-      }
-      return response.json();
+    function updateTimeline(rows) {
+      const sampled = sampleRows(rows, 12);
+      nodes.tableBadge.textContent = `${sampled.length} rows`;
+      nodes.timelineBody.innerHTML = sampled.map((row) => `
+        <tr>
+          <td>${fmtNumber(row.cycle)}</td>
+          <td>${fmtCurrency(row.profit)}</td>
+          <td>${fmtNumber(row.earnedSlots)}</td>
+          <td>${fmtNumber(row.effectiveSlots)}</td>
+          <td>${fmtCurrency(row.capacity)}</td>
+          <td>${fmtCurrency(row.cycleBack)}</td>
+        </tr>
+      `).join("");
     }
 
-    function renderSnapshot(snapshot) {
-      checkedAtNode.textContent = `Checked ${snapshot.checked_at || "-"} | auto refresh every 15s`;
-      buildMetricCards(snapshot);
-      buildAccountPanel(snapshot.account_overview || {});
+    function updateSlices(inputs) {
+      const periodDays = 30;
+      const totalDays = currentEnvelope.activeDaysPerYear * 5;
+      const rows = simulate({
+        ...inputs,
+        cycles: Math.ceil(totalDays * inputs.cyclesPerDay)
+      });
+      const slices = [];
 
-      renderTable(
-        positionsTable,
-        [
-          { label: "Symbol", mono: true, render: (row) => escapeHtml(row.symbol || "-") },
-          { label: "Qty", render: (row) => fmtNumber(row.qty, 4) },
-          { label: "Value", render: (row) => fmtCurrency(row.market_value_usd) },
-          { label: "Entry", render: (row) => fmtCurrency(row.avg_entry_price, 4) },
-          { label: "Current", render: (row) => fmtCurrency(row.current_price, 4) },
-          { label: "Unrealized", render: (row) => `${fmtSignedCurrency(row.unrealized_pl_usd)} (${fmtSignedPct(row.unrealized_pl_pct)})` },
-          { label: "Stop", render: (row) => fmtCurrency(row.stop_loss_price, 4) },
-          { label: "Target", render: (row) => fmtCurrency(row.target_price, 4) },
-          { label: "Policy", render: (row) => escapeHtml(row.managed_exit_policy || "-") },
-          { label: "Exit", render: (row) => escapeHtml(row.exit_state || "-") }
-        ],
-        snapshot.open_positions || [],
-        "No open positions."
-      );
+      if (totalDays <= 0) {
+        nodes.sliceBadge.textContent = "0 slices";
+        nodes.sliceBody.innerHTML = "";
+        return;
+      }
 
-      renderTable(
-        ordersTable,
-        [
-          { label: "When", render: (row) => escapeHtml(row.submitted_at || row.captured_at || "-") },
-          { label: "Symbol", mono: true, render: (row) => escapeHtml(row.symbol || "-") },
-          { label: "Status", render: (row) => escapeHtml(row.status || "-") },
-          { label: "Side", render: (row) => escapeHtml(row.side || "-") },
-          { label: "Notional", render: (row) => fmtCurrency(row.notional_usd) },
-          { label: "Strategy", render: (row) => escapeHtml(row.strategy_id || "-") }
-        ],
-        snapshot.recent_orders || [],
-        "No recent paper orders."
-      );
+      for (let startDay = 0; startDay < totalDays; startDay += periodDays) {
+        const endDay = Math.min(startDay + periodDays, totalDays);
+        const start = rowAtDay(rows, startDay);
+        const finish = rowAtDay(rows, endDay);
+        const days = Math.max(0.0001, finish.day - start.day);
+        const earned = finish.profit - start.profit;
+        slices.push({
+          startDay,
+          endDay,
+          earned,
+          averagePerDay: earned / days,
+          endingProfit: finish.profit,
+          earnedSlots: finish.earnedSlots,
+          effectiveSlots: finish.effectiveSlots,
+          capacity: finish.capacity
+        });
+      }
 
-      renderTable(
-        proposalsTable,
-        [
-          { label: "When", render: (row) => escapeHtml(row.proposed_at || "-") },
-          { label: "Symbol", mono: true, render: (row) => escapeHtml(row.symbol || "-") },
-          { label: "Status", render: (row) => escapeHtml(row.status || "-") },
-          { label: "Strategy", render: (row) => escapeHtml(row.strategy_id || "-") },
-          { label: "Score", render: (row) => fmtNumber(row.signal_score ?? row.opportunity_score, 3) }
-        ],
-        snapshot.recent_proposals || [],
-        "No recent shadow proposals."
-      );
+      nodes.sliceBadge.textContent = `${slices.length} slices | 5 years`;
+      nodes.sliceBody.innerHTML = slices.map((slice, index) => `
+        <tr>
+          <td>${fmtNumber(slice.startDay, 0)}-${fmtNumber(slice.endDay, 0)}</td>
+          <td>${fmtNumber(index + 1)}</td>
+          <td>${fmtCurrency(slice.earned)}</td>
+          <td>${fmtCurrency(slice.averagePerDay)}</td>
+          <td>${fmtCurrency(slice.endingProfit)}</td>
+          <td>${fmtNumber(slice.earnedSlots)}</td>
+          <td>${fmtNumber(slice.effectiveSlots)}</td>
+          <td>${fmtCurrency(slice.capacity)}</td>
+        </tr>
+      `).join("");
+    }
 
-      buildSignalPanels(snapshot.centaur_activity || {});
-      renderList(tradeDiagnostics, snapshot.trade_diagnostics || [], "No diagnostics recorded yet.");
+    function rowAtDay(rows, targetDay) {
+      let closest = rows[0];
+      for (const row of rows) {
+        if (Math.abs(row.day - targetDay) < Math.abs(closest.day - targetDay)) {
+          closest = row;
+        }
+        if (row.day >= targetDay) return row;
+      }
+      return rows[rows.length - 1];
+    }
 
-      const activity = snapshot.centaur_activity || {};
-      const scan = activity.scan || {};
-      const flow = activity.flow || {};
-      const blockers = activity.blockers || {};
-      renderList(
-        activityPanel,
-        [
-          `Scan | mode=${scan.mode || "-"} | candidates=${scan.candidates_found || 0} | selected=${scan.selected_candidates || 0} | bars=${scan.bars_available || 0} | top=${scan.top_symbol || "-"}`,
-          `Flow | raw=${flow.raw_signals || 0} | survived=${flow.surviving_signals || 0} | suppressed=${flow.suppressed_signals || 0} | proposals=${flow.proposals_created || 0} | cfo=${flow.cfo_reason || "-"}`,
-          `Blockers | stage=${blockers.primary_stage || "-"} | market=${blockers.market_reason || "-"} | cfo=${blockers.cfo_reason || "-"}`
-        ],
-        "No activity snapshot yet."
-      );
+    function drawChart(rows) {
+      const canvas = nodes.chart;
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(320, Math.floor(rect.width * dpr));
+      const height = Math.max(240, Math.floor(rect.height * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, width, height);
+      ctx.scale(dpr, dpr);
 
-      const thresholdAdvice = snapshot.threshold_advice || {};
-      const thresholdGene = thresholdAdvice.gene || {};
-      const thresholdTest = thresholdAdvice.test || {};
-      const thresholdAll = thresholdAdvice.all || {};
-      const adaptiveThreshold = thresholdAdvice.adaptive_state || {};
-      renderList(
-        thresholdPanel,
-        [
-          `Action ${thresholdAdvice.action || "-"} | current ${fmtNumber(thresholdAdvice.current_threshold, 2)} | recommended ${fmtNumber(thresholdAdvice.recommended_threshold, 2)} | confidence ${thresholdAdvice.confidence || "-"}`,
-          `Adaptive ${thresholdAdvice.adaptive_enabled ? "on" : "off"} | effective ${fmtNumber(adaptiveThreshold.effective_threshold, 2)} | rails ${fmtNumber(adaptiveThreshold.ceiling, 2)}..${fmtNumber(adaptiveThreshold.floor, 2)} | band +/-${fmtNumber(adaptiveThreshold.band_width, 2)} | updated ${adaptiveThreshold.updated_at || "-"}`,
-          `Evidence | ticks ${thresholdAdvice.tick_count || 0} | train ${thresholdAdvice.train_tick_count || 0} | test ${thresholdAdvice.test_tick_count || 0} | test score ${fmtNumber(thresholdTest.score, 2)}`,
-          `Policy | base ${fmtNumber(thresholdGene.base_threshold, 2)} | target ${thresholdGene.target_low || "-"}-${thresholdGene.target_high || "-"} per tick | ending ${fmtNumber(thresholdAll.ending_threshold, 2)}`,
-          `Trade-aware | avg tradeable ${fmtNumber(thresholdAll.avg_tradeable_survivors, 2)}/tick | avg tradeable fit ${fmtNumber(thresholdAll.avg_tradeable_fitness, 2)} | non-tradeable survivors ${thresholdAll.non_tradeable_survivors || 0}`,
-          thresholdAdvice.reason || "-",
-          adaptiveThreshold.reason || ""
-        ],
-        "No GA threshold advice available yet."
-      );
-
-      const holdingAdvice = snapshot.holding_window_advice || {};
-      const holdingRecommendation = holdingAdvice.recommendation || {};
-      const holdingSamples = holdingAdvice.sample_counts || {};
-      const holdingAll = holdingAdvice.fixed_windows_all || {};
-      const holding7d = holdingAdvice.fixed_windows_7d || {};
-      const holdingPolicy = holdingAdvice.policy_stats_all || {};
-      const metricText = (metric) => {
-        metric = metric || {};
-        if (!metric.n) return "n=0";
-        return `n=${metric.n} avg=${fmtNumber(metric.avg_return_pct, 2)}% win=${fmtNumber(Number(metric.win_rate || 0) * 100, 1)}% score=${fmtNumber(metric.score, 2)}`;
+      const w = width / dpr;
+      const h = height / dpr;
+      const pad = {
+        left: Math.max(48, Math.min(72, w * 0.09)),
+        right: Math.max(34, Math.min(54, w * 0.06)),
+        top: 28,
+        bottom: 42
       };
-      renderList(
-        holdingWindowPanel,
-        [
-          `Strategy ${holdingAdvice.strategy_id || "-"} | current ${holdingAdvice.current_window || "-"} | action ${holdingRecommendation.action || "-"} | confidence ${holdingRecommendation.confidence || "-"}`,
-          `Candidate ${holdingRecommendation.candidate_policy || "-"}`,
-          `Samples | all ${holdingSamples.complete_15m_1h_1d || 0} | 30d ${holdingSamples.complete_15m_1h_1d_30d || 0} | 7d ${holdingSamples.complete_15m_1h_7d || 0}`,
-          `All-time | 15m ${metricText(holdingAll["15m"])} | 1h ${metricText(holdingAll["1h"])} | 1d ${metricText(holdingAll["1d"])}`,
-          `Recent 7d | 15m ${metricText(holding7d["15m"])} | 1h ${metricText(holding7d["1h"])}`,
-          `Dynamic | 1h profit else 1d ${metricText(holdingPolicy.take_1h_profit_else_1d)}`,
-          holdingRecommendation.reason || "-"
-        ],
-        "No holding-window fitness advice available yet."
+      const plotW = w - pad.left - pad.right;
+      const plotH = h - pad.top - pad.bottom;
+      const maxCycle = Math.max(1, rows[rows.length - 1].cycle);
+      const maxMoney = Math.max(
+        1,
+        ...rows.map((row) => Math.max(row.profit, row.capacity, 0))
       );
+      const maxSlots = Math.max(1, ...rows.map((row) => row.effectiveSlots));
+      const moneyTop = niceCeil(maxMoney);
+      const slotsTop = niceCeil(maxSlots);
 
-      renderList(brokerPanel, snapshot.broker_accounts || [], "No broker snapshots recorded yet.");
-      renderList(livePanel, snapshot.live_execution_overview || [], "No live-readiness state available.");
+      const x = (cycle) => pad.left + (cycle / maxCycle) * plotW;
+      const yMoney = (value) => pad.top + plotH - (Math.max(0, value) / moneyTop) * plotH;
+      const ySlots = (value) => pad.top + plotH - (value / slotsTop) * plotH;
 
-      const cost = snapshot.cost_overview || {};
-      const today = cost.today || {};
-      const yesterday = cost.yesterday || {};
-      renderList(
-        costPanel,
-        [
-          `Pricing | configured=${cost.pricing_configured ? "yes" : "no"} | gemini_pricing=${cost.gemini_pricing_configured ? "yes" : "no"} | usd_to_gbp=${fmtNumber(cost.usd_to_gbp, 4)}`,
-          `Today | est=${fmtCurrency(today.estimated_cost_usd, 4)} | requests=${today.request_count || 0}`,
-          `Yesterday | est=${fmtCurrency(yesterday.estimated_cost_usd, 4)} | requests=${yesterday.request_count || 0}`,
-          ...((cost.notes || []).slice(0, 3))
-        ],
-        "No cost data recorded yet."
-      );
+      ctx.fillStyle = "#ffffff";
+      roundRect(ctx, 0.5, 0.5, w - 1, h - 1, 8);
+      ctx.fill();
 
-      const alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts : [];
-      if (!alerts.length) {
-        alertsPanel.innerHTML = `<p class="text-sm text-stone-500">No current alerts.</p>`;
-      } else {
-        alertsPanel.innerHTML = alerts.slice(0, 8).map((alert) => `
-          <article class="rounded-md border border-stone-200 bg-stone-50 p-4">
-            <div class="text-xs font-semibold uppercase tracking-wide text-stone-500">${escapeHtml(alert.level || "info")}</div>
-            <div class="mt-2 text-sm font-medium text-stone-800">${escapeHtml(alert.summary || "-")}</div>
-            <div class="mt-2 text-xs text-stone-500">${escapeHtml(alert.at || "-")}</div>
-            <div class="mt-2 text-sm text-stone-600">${escapeHtml(alert.detail || "-")}</div>
-          </article>
-        `).join("");
+      drawGrid(ctx, { pad, plotW, plotH, w, h, moneyTop, slotsTop });
+
+      drawArea(ctx, rows, x, yMoney, pad.top + plotH);
+      drawLine(ctx, rows, x, yMoney, "profit", "#0f8b8d", 3);
+      drawLine(ctx, rows, x, yMoney, "capacity", "#3867d6", 2);
+      drawStepLine(ctx, rows, x, ySlots, "effectiveSlots", "#c98f13", 2.5);
+
+      const end = rows[rows.length - 1];
+      drawPoint(ctx, x(end.cycle), yMoney(end.profit), "#0f8b8d");
+      drawPoint(ctx, x(end.cycle), ySlots(end.effectiveSlots), "#c98f13");
+
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
+
+    function niceCeil(value) {
+      const exponent = Math.floor(Math.log10(value));
+      const base = Math.pow(10, exponent);
+      const fraction = value / base;
+      const nice = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+      return nice * base;
+    }
+
+    function drawGrid(ctx, chart) {
+      const { pad, plotW, plotH, w, moneyTop, slotsTop } = chart;
+      ctx.strokeStyle = "#e3ebe7";
+      ctx.lineWidth = 1;
+      ctx.fillStyle = "#657174";
+      ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+      ctx.textBaseline = "middle";
+
+      for (let i = 0; i <= 4; i += 1) {
+        const t = i / 4;
+        const y = pad.top + plotH - t * plotH;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + plotW, y);
+        ctx.stroke();
+        ctx.textAlign = "right";
+        ctx.fillText(fmtAxisMoney(moneyTop * t), pad.left - 10, y);
+        ctx.textAlign = "left";
+        ctx.fillText(fmtNumber(slotsTop * t, 0), pad.left + plotW + 10, y);
+      }
+
+      ctx.strokeStyle = "#cfdad5";
+      ctx.beginPath();
+      ctx.moveTo(pad.left, pad.top);
+      ctx.lineTo(pad.left, pad.top + plotH);
+      ctx.lineTo(pad.left + plotW, pad.top + plotH);
+      ctx.lineTo(pad.left + plotW, pad.top);
+      ctx.stroke();
+
+      ctx.fillStyle = "#657174";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.fillText("P/L and capacity", pad.left, 18);
+      ctx.textAlign = "right";
+      ctx.fillText("slots", w - pad.right, 18);
+      ctx.textAlign = "center";
+      ctx.fillText("cycles", pad.left + plotW / 2, pad.top + plotH + 30);
+    }
+
+    function fmtAxisMoney(value) {
+      if (value >= 1000) return `$${fmtNumber(value / 1000, 1)}k`;
+      return `$${fmtNumber(value, 0)}`;
+    }
+
+    function drawArea(ctx, rows, x, y, baseline) {
+      ctx.beginPath();
+      rows.forEach((row, index) => {
+        const px = x(row.cycle);
+        const py = y(row.profit);
+        if (index === 0) ctx.moveTo(px, baseline);
+        ctx.lineTo(px, py);
+      });
+      ctx.lineTo(x(rows[rows.length - 1].cycle), baseline);
+      ctx.closePath();
+      const gradient = ctx.createLinearGradient(0, 0, 0, baseline);
+      gradient.addColorStop(0, "rgba(15, 139, 141, 0.24)");
+      gradient.addColorStop(1, "rgba(15, 139, 141, 0.02)");
+      ctx.fillStyle = gradient;
+      ctx.fill();
+    }
+
+    function drawLine(ctx, rows, x, y, key, color, width) {
+      ctx.beginPath();
+      rows.forEach((row, index) => {
+        const px = x(row.cycle);
+        const py = y(row[key]);
+        if (index === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.stroke();
+    }
+
+    function drawStepLine(ctx, rows, x, y, key, color, width) {
+      ctx.beginPath();
+      rows.forEach((row, index) => {
+        const px = x(row.cycle);
+        const py = y(row[key]);
+        if (index === 0) {
+          ctx.moveTo(px, py);
+          return;
+        }
+        const prev = rows[index - 1];
+        const prevX = x(prev.cycle);
+        const prevY = y(prev[key]);
+        ctx.lineTo(px, prevY);
+        ctx.lineTo(px, py);
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.stroke();
+    }
+
+    function drawPoint(ctx, x, y, color) {
+      ctx.beginPath();
+      ctx.arc(x, y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function roundRect(ctx, x, y, width, height, radius) {
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.arcTo(x + width, y, x + width, y + height, radius);
+      ctx.arcTo(x + width, y + height, x, y + height, radius);
+      ctx.arcTo(x, y + height, x, y, radius);
+      ctx.arcTo(x, y, x + width, y, radius);
+      ctx.closePath();
+    }
+
+    function render() {
+      const inputs = getInputs();
+      const rows = simulate(inputs);
+      updateReadouts(inputs);
+      updateSummary(inputs, rows);
+      updateMeters(inputs, rows);
+      latestRows = rows;
+      updateSlices(inputs);
+      updateTimeline(rows);
+      if (!nodes.tabGraph.hidden) {
+        drawChart(rows);
       }
     }
 
-    async function refreshSnapshot() {
+    function applyPreset(preset, sourceLabel = "Current envelope") {
+      const normalizedPreset = withCurrentSlotEconomics(preset);
+      currentDefaultSource = sourceLabel;
+      backMode = normalizedPreset.backMode;
+      Object.entries(normalizedPreset).forEach(([key, value]) => {
+        if (key in fields) setField(key, value);
+      });
+      render();
+    }
+
+    function presetFromSnapshot(snapshot) {
+      const account = snapshot && typeof snapshot === "object" ? snapshot.account_overview || {} : {};
+      const performance = snapshot && typeof snapshot === "object" ? snapshot.performance_comparison || {} : {};
+      const outcomes = snapshot && typeof snapshot === "object" ? snapshot.paper_trade_outcome_metrics || {} : {};
+      const slotSize = numberOrNull(account.slot_size_usd) ?? currentEnvelope.slotSize;
+      const baseSlots = numberOrNull(account.base_max_open_positions) ?? currentEnvelope.baseSlots;
+      const trackedPnl = numberOrNull(account.earned_slot_pnl_usd);
+      const trackedDays = Math.max(1, numberOrNull(performance.tracked_days) ?? 1);
+      const returnOnEnvelopePct = numberOrNull(performance.return_on_envelope_pct);
+      const observedNetPctPerDay = returnOnEnvelopePct === null
+        ? defaults.returnPercent
+        : Number((returnOnEnvelopePct / trackedDays).toFixed(4));
+      const closedTrades = numberOrNull(outcomes.closed_trades) ?? 0;
+      const avgWinPct = numberOrNull(outcomes.avg_win_pct);
+      const avgLossPct = numberOrNull(outcomes.avg_loss_pct);
+      const winRate = numberOrNull(outcomes.win_rate);
+      const observedSlotFillPct = numberOrNull(outcomes.observed_slot_fill_pct);
+      return {
+        ...defaults,
+        baseSlots,
+        slotSize,
+        returnPercent: closedTrades > 0 && avgWinPct !== null ? avgWinPct : observedNetPctPerDay,
+        winRate: closedTrades > 0 && winRate !== null ? Number((winRate * 100).toFixed(2)) : 100,
+        lossPercent: closedTrades > 0 && avgLossPct !== null ? avgLossPct : 0,
+        slotFill: closedTrades > 0 && observedSlotFillPct !== null ? observedSlotFillPct : defaults.slotFill,
+        startingProfit: trackedPnl === null ? defaults.startingProfit : trackedPnl
+      };
+    }
+
+    async function loadSnapshotDefaults() {
+      if (!["http:", "https:"].includes(window.location.protocol)) {
+        return false;
+      }
+      const response = await fetch("/api/snapshot.php", { cache: "no-store" });
+      if (!response.ok) {
+        return false;
+      }
+      const snapshot = await response.json();
+      applyPreset(presetFromSnapshot(snapshot), fmtSnapshotLabel(snapshot.checked_at));
+      return true;
+    }
+
+    async function initialize() {
+      applyPreset(defaults, "Current envelope");
       try {
-        const snapshot = await loadSnapshot();
-        renderSnapshot(snapshot);
+        await loadSnapshotDefaults();
       } catch (error) {
-        checkedAtNode.textContent = `Dashboard refresh failed: ${error.message}`;
+        currentDefaultSource = "Current envelope";
+        render();
       }
     }
 
-    document.getElementById("refresh-button").addEventListener("click", refreshSnapshot);
-    refreshSnapshot();
-    window.setInterval(refreshSnapshot, refreshIntervalMs);
+    function setActiveTab(tabName) {
+      const graphActive = tabName === "graph";
+      nodes.tabGraph.hidden = !graphActive;
+      nodes.tabSlices.hidden = graphActive;
+      nodes.tabGraphButton.classList.toggle("active", graphActive);
+      nodes.tabSlicesButton.classList.toggle("active", !graphActive);
+      nodes.tabGraphButton.setAttribute("aria-selected", graphActive ? "true" : "false");
+      nodes.tabSlicesButton.setAttribute("aria-selected", graphActive ? "false" : "true");
+      if (graphActive && latestRows.length) {
+        drawChart(latestRows);
+      }
+    }
+
+    Object.entries(fields).forEach(([fieldName, field]) => {
+      field.range.addEventListener("input", () => {
+        syncField(fieldName, "range");
+        render();
+      });
+      field.number.addEventListener("input", () => {
+        syncField(fieldName, "number");
+        render();
+      });
+    });
+
+    nodes.modePercent.addEventListener("click", () => {
+      backMode = "percent";
+      render();
+    });
+
+    nodes.modeDollars.addEventListener("click", () => {
+      backMode = "dollars";
+      render();
+    });
+
+    nodes.tabGraphButton.addEventListener("click", () => setActiveTab("graph"));
+    nodes.tabSlicesButton.addEventListener("click", () => setActiveTab("slices"));
+
+    document.getElementById("preset-current").addEventListener("click", async () => {
+      try {
+        const loaded = await loadSnapshotDefaults();
+        if (!loaded) applyPreset(defaults, "Current envelope");
+      } catch (error) {
+        applyPreset(defaults, "Current envelope");
+      }
+    });
+    document.getElementById("preset-fast").addEventListener("click", () => applyPreset(fastPreset, "Faster test"));
+    document.getElementById("reset").addEventListener("click", () => applyPreset(defaults, "Current envelope"));
+    window.addEventListener("resize", render);
+
+    initialize();
   </script>
 </body>
 </html>

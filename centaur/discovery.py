@@ -5,6 +5,8 @@ from datetime import date, datetime
 from math import log10
 from typing import Any
 
+from app.core.instruments import InstrumentRef, instrument_ref_from_metadata
+
 
 @dataclass(frozen=True, slots=True)
 class RankedCandidate:
@@ -22,12 +24,19 @@ class RankedCandidate:
     trade_count: int | None
     bar_timestamp: str | None
     note: str
+    canonical_instrument_id: str = ""
+    venue: str = ""
+    venue_symbol: str = ""
+    instrument_ref: InstrumentRef | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "symbol": self.symbol,
             "source": self.source,
             "asset_class": self.asset_class,
+            "canonical_instrument_id": self.canonical_instrument_id,
+            "venue": self.venue,
+            "venue_symbol": self.venue_symbol,
             "rank": self.rank,
             "selected": self.selected,
             "discovery_score": self.discovery_score,
@@ -40,6 +49,9 @@ class RankedCandidate:
             "bar_timestamp": _normalize_timestamp(self.bar_timestamp),
             "note": self.note,
         }
+        if self.instrument_ref is not None:
+            payload["instrument_ref"] = self.instrument_ref.as_dict()
+        return payload
 
 
 def rank_candidates(
@@ -84,6 +96,10 @@ def rank_candidates(
                 trade_count=trade_count,
                 bar_timestamp=row.get("bar_timestamp"),
                 note=note,
+                canonical_instrument_id=str(row.get("canonical_instrument_id", "")),
+                venue=str(row.get("venue", "")),
+                venue_symbol=str(row.get("venue_symbol", "")),
+                instrument_ref=instrument_ref_from_metadata(row),
             )
         )
 
@@ -116,6 +132,10 @@ def rank_candidates(
                 trade_count=item.trade_count,
                 bar_timestamp=item.bar_timestamp,
                 note=item.note,
+                canonical_instrument_id=item.canonical_instrument_id,
+                venue=item.venue,
+                venue_symbol=item.venue_symbol,
+                instrument_ref=item.instrument_ref,
             )
         )
     return ranked_rows

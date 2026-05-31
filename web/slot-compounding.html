@@ -83,6 +83,9 @@
     }
 
     .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       min-height: 40px;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -92,6 +95,7 @@
       font-weight: 750;
       padding: 0 14px;
       box-shadow: 0 6px 18px rgba(18, 31, 32, 0.05);
+      text-decoration: none;
     }
 
     .button:hover {
@@ -146,6 +150,13 @@
       font-size: 12px;
       font-weight: 800;
       white-space: nowrap;
+    }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
     }
 
     .controls {
@@ -520,6 +531,8 @@
         <button id="preset-current" class="button primary" type="button">Current Envelope</button>
         <button id="preset-fast" class="button" type="button">Faster Test</button>
         <button id="reset" class="button" type="button">Reset</button>
+        <a class="button" href="/reports/50-dollar-day-plan.md" download>Download Plan</a>
+        <a class="button" href="/dashboard.php">Dashboard</a>
       </div>
     </header>
 
@@ -527,7 +540,10 @@
       <aside class="panel" aria-label="Model controls">
         <div class="panel-head">
           <div class="panel-title">Inputs</div>
-          <span id="input-badge" class="badge">$10 slots</span>
+          <div class="badge-row">
+            <span id="source-badge" class="badge">Current envelope</span>
+            <span id="input-badge" class="badge">$10 slots</span>
+          </div>
         </div>
         <div class="controls">
           <div class="control">
@@ -536,8 +552,8 @@
               <span id="base-slots-readout" class="readout">10</span>
             </div>
             <div class="number-row">
-              <input id="base-slots" type="range" min="1" max="100" step="1" value="10">
-              <input id="base-slots-number" type="number" min="1" max="100" step="1" value="10">
+              <input id="base-slots" type="range" min="1" max="500" step="1" value="10">
+              <input id="base-slots-number" type="number" min="1" max="500" step="1" value="10">
             </div>
           </div>
 
@@ -565,23 +581,45 @@
 
           <div class="control" id="return-percent-control">
             <div class="control-top">
-              <label for="return-percent">Per Slot Back</label>
-              <span id="return-percent-readout" class="readout">0.90%</span>
+              <label for="return-percent">Avg Win Per Winning Slot</label>
+              <span id="return-percent-readout" class="readout">0%</span>
             </div>
             <div class="number-row">
-              <input id="return-percent" type="range" min="0" max="12" step="0.05" value="0.9">
-              <input id="return-percent-number" type="number" min="0" max="100" step="0.05" value="0.9">
+              <input id="return-percent" type="range" min="-5" max="12" step="0.01" value="0">
+              <input id="return-percent-number" type="number" min="-100" max="100" step="0.01" value="0">
             </div>
           </div>
 
           <div class="control" id="return-dollars-control" hidden>
             <div class="control-top">
-              <label for="return-dollars">Per Slot Back</label>
-              <span id="return-dollars-readout" class="readout">$0.09</span>
+              <label for="return-dollars">Avg Win Per Winning Slot</label>
+              <span id="return-dollars-readout" class="readout">$0.00</span>
             </div>
             <div class="number-row">
-              <input id="return-dollars" type="range" min="0" max="5" step="0.01" value="0.09">
-              <input id="return-dollars-number" type="number" min="0" max="10000" step="0.01" value="0.09">
+              <input id="return-dollars" type="range" min="-5" max="5" step="0.01" value="0">
+              <input id="return-dollars-number" type="number" min="-10000" max="10000" step="0.01" value="0">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="win-rate">Win Rate Assumption</label>
+              <span id="win-rate-readout" class="readout">100%</span>
+            </div>
+            <div class="number-row">
+              <input id="win-rate" type="range" min="0" max="100" step="1" value="100">
+              <input id="win-rate-number" type="number" min="0" max="100" step="1" value="100">
+            </div>
+          </div>
+
+          <div class="control">
+            <div class="control-top">
+              <label for="loss-percent">Avg Loss Per Losing Slot</label>
+              <span id="loss-percent-readout" class="readout">0%</span>
+            </div>
+            <div class="number-row">
+              <input id="loss-percent" type="range" min="0" max="12" step="0.05" value="0">
+              <input id="loss-percent-number" type="number" min="0" max="100" step="0.05" value="0">
             </div>
           </div>
 
@@ -598,7 +636,7 @@
 
           <div class="control">
             <div class="control-top">
-              <label for="starting-profit">Starting Tracked P/L</label>
+              <label for="starting-profit">Starting Snapshot P/L</label>
               <span id="starting-profit-readout" class="readout">$0.00</span>
             </div>
             <div class="number-row">
@@ -609,7 +647,7 @@
 
           <div class="control">
             <div class="control-top">
-              <label for="cycles">Cycles</label>
+              <label for="cycles">Modeled Active Days</label>
               <span id="cycles-readout" class="readout">365</span>
             </div>
             <div class="number-row">
@@ -620,7 +658,7 @@
 
           <div class="control">
             <div class="control-top">
-              <label for="cycles-per-day">Cycles Per Day</label>
+              <label for="cycles-per-day">Cycles Per Active Day</label>
               <span id="cycles-per-day-readout" class="readout">1</span>
             </div>
             <div class="number-row">
@@ -629,18 +667,18 @@
             </div>
           </div>
         </div>
-        <p class="note">Read-only model. It does not change notional, broker routing, live behavior, slot limits, strategy gates, or daily protection.</p>
+        <p class="note">Read-only projection. Snapshot defaults use closed paper-trade outcomes for win rate, average win, and average loss; account-level P/L still includes open red positions. The saved dashboard snapshot is refreshed in the background every 5 minutes; browser refreshes read that latest saved file. Calendar holidays and closed equity sessions are not automatically modeled; the active-day count is editable.</p>
       </aside>
 
       <section class="main">
         <div class="stats" aria-label="Simulation summary">
           <article class="stat">
-            <div class="stat-label">Ending Profit</div>
+            <div class="stat-label">Projected Profit</div>
             <div id="stat-profit" class="stat-value">$0.00</div>
             <div id="stat-profit-detail" class="stat-detail">0 cycles</div>
           </article>
           <article class="stat">
-            <div class="stat-label">Ending Slots</div>
+            <div class="stat-label">Projected Slots</div>
             <div id="stat-slots" class="stat-value">0</div>
             <div id="stat-slots-detail" class="stat-detail">0 earned</div>
           </article>
@@ -659,7 +697,7 @@
         <section class="tabs">
           <div class="tab-list" role="tablist" aria-label="Compounding views">
             <button id="tab-graph-button" class="tab-button active" type="button" role="tab" aria-controls="tab-graph" aria-selected="true">Graph</button>
-            <button id="tab-slices-button" class="tab-button" type="button" role="tab" aria-controls="tab-slices" aria-selected="false">30-Day Slices</button>
+            <button id="tab-slices-button" class="tab-button" type="button" role="tab" aria-controls="tab-slices" aria-selected="false">30 Active-Day Slices</button>
           </div>
 
           <section id="tab-graph" class="tab-page" role="tabpanel" aria-labelledby="tab-graph-button">
@@ -701,7 +739,7 @@
                         <th>Earned</th>
                         <th>Slots</th>
                         <th>Capacity</th>
-                        <th>Cycle Back</th>
+                        <th>Net Cycle</th>
                       </tr>
                     </thead>
                     <tbody id="timeline-body"></tbody>
@@ -714,14 +752,14 @@
           <section id="tab-slices" class="tab-page" role="tabpanel" aria-labelledby="tab-slices-button" hidden>
             <section class="panel">
               <div class="panel-head">
-                <div class="panel-title">30-Day Slices</div>
-                <span id="slice-badge" class="badge">1 year</span>
+                <div class="panel-title">30 Active-Day Slices</div>
+                <span id="slice-badge" class="badge">1 model year</span>
               </div>
               <div class="table-wrap">
                 <table>
                   <thead>
                     <tr>
-                      <th>Days</th>
+                      <th>Active Days</th>
                       <th>#</th>
                       <th>Slice Earned</th>
                       <th>Avg / Day</th>
@@ -742,15 +780,26 @@
   </main>
 
   <script>
-    const defaults = {
+    const currentEnvelope = {
       baseSlots: 10,
       slotSize: 10,
+      profitCapturePct: 1.25,
+      activeDaysPerYear: 252,
+      maxOrdersPerTick: 1,
+      dailyDrawdownUsd: 5
+    };
+
+    const defaults = {
+      baseSlots: currentEnvelope.baseSlots,
+      slotSize: currentEnvelope.slotSize,
       backMode: "percent",
-      returnPercent: 0.9,
-      returnDollars: 0.09,
+      returnPercent: 0,
+      returnDollars: 0,
+      winRate: 100,
+      lossPercent: 0,
       slotFill: 100,
       startingProfit: 0,
-      cycles: 365,
+      cycles: currentEnvelope.activeDaysPerYear,
       cyclesPerDay: 1
     };
 
@@ -760,6 +809,8 @@
       backMode: "percent",
       returnPercent: 2.5,
       returnDollars: 0.25,
+      winRate: 100,
+      lossPercent: 0,
       slotFill: 100,
       startingProfit: 0,
       cycles: 240,
@@ -771,6 +822,8 @@
       slotSize: bindNumber("slot-size"),
       returnPercent: bindNumber("return-percent"),
       returnDollars: bindNumber("return-dollars"),
+      winRate: bindNumber("win-rate"),
+      lossPercent: bindNumber("loss-percent"),
       slotFill: bindNumber("slot-fill"),
       startingProfit: bindNumber("starting-profit"),
       cycles: bindNumber("cycles"),
@@ -778,12 +831,15 @@
     };
 
     const nodes = {
+      sourceBadge: document.getElementById("source-badge"),
       inputBadge: document.getElementById("input-badge"),
       baseSlotsReadout: document.getElementById("base-slots-readout"),
       slotSizeReadout: document.getElementById("slot-size-readout"),
       backModeReadout: document.getElementById("back-mode-readout"),
       returnPercentReadout: document.getElementById("return-percent-readout"),
       returnDollarsReadout: document.getElementById("return-dollars-readout"),
+      winRateReadout: document.getElementById("win-rate-readout"),
+      lossPercentReadout: document.getElementById("loss-percent-readout"),
       slotFillReadout: document.getElementById("slot-fill-readout"),
       startingProfitReadout: document.getElementById("starting-profit-readout"),
       cyclesReadout: document.getElementById("cycles-readout"),
@@ -815,6 +871,7 @@
     };
 
     let backMode = defaults.backMode;
+    let currentDefaultSource = "Current envelope";
     let latestRows = [];
 
     function bindNumber(id) {
@@ -843,6 +900,20 @@
       const rangeMin = Number(field.range.min);
       const rangeMax = Number(field.range.max);
       field.range.value = String(clamp(next, rangeMin, rangeMax));
+    }
+
+    function numberOrNull(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function withCurrentSlotEconomics(preset) {
+      const slotSize = numberOrNull(preset.slotSize) ?? currentEnvelope.slotSize;
+      const returnPercent = numberOrNull(preset.returnPercent) ?? 0;
+      return {
+        ...preset,
+        returnDollars: Number(((slotSize * returnPercent) / 100).toFixed(4))
+      };
     }
 
     function syncField(fieldName, source) {
@@ -874,6 +945,19 @@
       return `${fmtNumber(value, value % 1 === 0 ? 0 : 2)}%`;
     }
 
+    function fmtSnapshotLabel(value) {
+      if (!value) return "Latest snapshot";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "Latest snapshot";
+      return `Snapshot ${date.toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric"
+      })} ${date.toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit"
+      })}`;
+    }
+
     function getInputs() {
       const slotSize = Math.max(0.01, valueOf("slotSize"));
       const returnPerSlot = backMode === "percent"
@@ -885,7 +969,9 @@
         backMode,
         returnPercent: valueOf("returnPercent"),
         returnDollars: valueOf("returnDollars"),
-        returnPerSlot: Math.max(0, returnPerSlot),
+        returnPerSlot,
+        winRate: clamp(valueOf("winRate"), 0, 100) / 100,
+        lossPercent: valueOf("lossPercent"),
         slotFill: clamp(valueOf("slotFill"), 0, 100) / 100,
         startingProfit: valueOf("startingProfit"),
         cycles: Math.max(1, Math.floor(valueOf("cycles"))),
@@ -901,7 +987,11 @@
         const earnedSlots = Math.floor(Math.max(0, profit) / inputs.slotSize);
         const effectiveSlots = inputs.baseSlots + earnedSlots;
         const slotsUsed = effectiveSlots * inputs.slotFill;
-        const cycleBack = cycle === 0 ? 0 : slotsUsed * inputs.returnPerSlot;
+        const winningSlots = slotsUsed * inputs.winRate;
+        const losingSlots = slotsUsed - winningSlots;
+        const grossBack = cycle === 0 ? 0 : winningSlots * inputs.returnPerSlot;
+        const lossDrag = cycle === 0 ? 0 : losingSlots * inputs.slotSize * (inputs.lossPercent / 100);
+        const cycleBack = grossBack - lossDrag;
         const capacity = effectiveSlots * inputs.slotSize;
         rows.push({
           cycle,
@@ -910,10 +1000,12 @@
           earnedSlots,
           effectiveSlots,
           capacity,
+          grossBack,
+          lossDrag,
           cycleBack
         });
         if (cycle < inputs.cycles) {
-          profit += Math.max(0, effectiveSlots * inputs.slotFill * inputs.returnPerSlot);
+          profit += cycleBack;
         }
       }
 
@@ -932,12 +1024,15 @@
     }
 
     function updateReadouts(inputs) {
+      nodes.sourceBadge.textContent = currentDefaultSource;
       nodes.inputBadge.textContent = `${fmtCurrency(inputs.slotSize, 0)} slots`;
       nodes.baseSlotsReadout.textContent = fmtNumber(inputs.baseSlots);
       nodes.slotSizeReadout.textContent = fmtCurrency(inputs.slotSize);
       nodes.backModeReadout.textContent = backMode === "percent" ? "Percent" : "Dollars";
       nodes.returnPercentReadout.textContent = pct(inputs.returnPercent);
       nodes.returnDollarsReadout.textContent = fmtCurrency(inputs.returnDollars);
+      nodes.winRateReadout.textContent = `${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`;
+      nodes.lossPercentReadout.textContent = pct(inputs.lossPercent);
       nodes.slotFillReadout.textContent = pct(inputs.slotFill * 100);
       nodes.startingProfitReadout.textContent = fmtCurrency(inputs.startingProfit);
       nodes.cyclesReadout.textContent = fmtNumber(inputs.cycles);
@@ -955,18 +1050,18 @@
       const nextSlotNeeds = Math.max(0, nextSlotAt - Math.max(0, end.profit));
       const days = end.day;
       const returnText = backMode === "percent"
-        ? `${pct(inputs.returnPercent)} per used slot`
-        : `${fmtCurrency(inputs.returnPerSlot)} per used slot`;
+        ? `${pct(inputs.returnPercent)} avg win | ${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`
+        : `${fmtCurrency(inputs.returnPerSlot)} avg win | ${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`;
 
       nodes.statProfit.textContent = fmtCurrency(end.profit);
-      nodes.statProfitDetail.textContent = `${fmtCurrency(gained)} gained over ${fmtNumber(days, 1)} days`;
+      nodes.statProfitDetail.textContent = `${fmtCurrency(gained)} gained over ${fmtNumber(days, 1)} active days`;
       nodes.statSlots.textContent = fmtNumber(end.effectiveSlots);
       nodes.statSlotsDetail.textContent = `${fmtNumber(end.earnedSlots)} earned from ${fmtCurrency(Math.max(0, end.profit))} tracked P/L`;
       nodes.statCapacity.textContent = fmtCurrency(end.capacity);
-      nodes.statCapacityDetail.textContent = `${fmtNumber(end.effectiveSlots)} x ${fmtCurrency(inputs.slotSize)} | ${returnText}`;
+      nodes.statCapacityDetail.textContent = `${fmtNumber(end.effectiveSlots)} x ${fmtCurrency(inputs.slotSize)} | ${returnText} | ${pct(inputs.lossPercent)} loss`;
       nodes.statNext.textContent = fmtCurrency(nextSlotNeeds);
       nodes.statNextDetail.textContent = nextSlotNeeds === 0 ? "next slot unlocked" : `next slot at ${fmtCurrency(nextSlotAt)}`;
-      nodes.chartBadge.textContent = `${fmtNumber(inputs.cycles)} cycles | ${fmtNumber(days, 1)} days`;
+      nodes.chartBadge.textContent = `${fmtNumber(inputs.cycles)} cycles | ${fmtNumber(days, 1)} active days`;
       nodes.milestoneBadge.textContent = `${fmtNumber(end.earnedSlots)} earned`;
     }
 
@@ -1009,7 +1104,7 @@
 
     function updateSlices(inputs) {
       const periodDays = 30;
-      const totalDays = 365 * 5;
+      const totalDays = currentEnvelope.activeDaysPerYear * 5;
       const rows = simulate({
         ...inputs,
         cycles: Math.ceil(totalDays * inputs.cyclesPerDay)
@@ -1261,12 +1356,66 @@
       }
     }
 
-    function applyPreset(preset) {
-      backMode = preset.backMode;
-      Object.entries(preset).forEach(([key, value]) => {
+    function applyPreset(preset, sourceLabel = "Current envelope") {
+      const normalizedPreset = withCurrentSlotEconomics(preset);
+      currentDefaultSource = sourceLabel;
+      backMode = normalizedPreset.backMode;
+      Object.entries(normalizedPreset).forEach(([key, value]) => {
         if (key in fields) setField(key, value);
       });
       render();
+    }
+
+    function presetFromSnapshot(snapshot) {
+      const account = snapshot && typeof snapshot === "object" ? snapshot.account_overview || {} : {};
+      const performance = snapshot && typeof snapshot === "object" ? snapshot.performance_comparison || {} : {};
+      const outcomes = snapshot && typeof snapshot === "object" ? snapshot.paper_trade_outcome_metrics || {} : {};
+      const slotSize = numberOrNull(account.slot_size_usd) ?? currentEnvelope.slotSize;
+      const baseSlots = numberOrNull(account.base_max_open_positions) ?? currentEnvelope.baseSlots;
+      const trackedPnl = numberOrNull(account.earned_slot_pnl_usd);
+      const trackedDays = Math.max(1, numberOrNull(performance.tracked_days) ?? 1);
+      const returnOnEnvelopePct = numberOrNull(performance.return_on_envelope_pct);
+      const observedNetPctPerDay = returnOnEnvelopePct === null
+        ? defaults.returnPercent
+        : Number((returnOnEnvelopePct / trackedDays).toFixed(4));
+      const closedTrades = numberOrNull(outcomes.closed_trades) ?? 0;
+      const avgWinPct = numberOrNull(outcomes.avg_win_pct);
+      const avgLossPct = numberOrNull(outcomes.avg_loss_pct);
+      const winRate = numberOrNull(outcomes.win_rate);
+      const observedSlotFillPct = numberOrNull(outcomes.observed_slot_fill_pct);
+      return {
+        ...defaults,
+        baseSlots,
+        slotSize,
+        returnPercent: closedTrades > 0 && avgWinPct !== null ? avgWinPct : observedNetPctPerDay,
+        winRate: closedTrades > 0 && winRate !== null ? Number((winRate * 100).toFixed(2)) : 100,
+        lossPercent: closedTrades > 0 && avgLossPct !== null ? avgLossPct : 0,
+        slotFill: closedTrades > 0 && observedSlotFillPct !== null ? observedSlotFillPct : defaults.slotFill,
+        startingProfit: trackedPnl === null ? defaults.startingProfit : trackedPnl
+      };
+    }
+
+    async function loadSnapshotDefaults() {
+      if (!["http:", "https:"].includes(window.location.protocol)) {
+        return false;
+      }
+      const response = await fetch("/api/snapshot.php", { cache: "no-store" });
+      if (!response.ok) {
+        return false;
+      }
+      const snapshot = await response.json();
+      applyPreset(presetFromSnapshot(snapshot), fmtSnapshotLabel(snapshot.checked_at));
+      return true;
+    }
+
+    async function initialize() {
+      applyPreset(defaults, "Current envelope");
+      try {
+        await loadSnapshotDefaults();
+      } catch (error) {
+        currentDefaultSource = "Current envelope";
+        render();
+      }
     }
 
     function setActiveTab(tabName) {
@@ -1306,12 +1455,19 @@
     nodes.tabGraphButton.addEventListener("click", () => setActiveTab("graph"));
     nodes.tabSlicesButton.addEventListener("click", () => setActiveTab("slices"));
 
-    document.getElementById("preset-current").addEventListener("click", () => applyPreset(defaults));
-    document.getElementById("preset-fast").addEventListener("click", () => applyPreset(fastPreset));
-    document.getElementById("reset").addEventListener("click", () => applyPreset(defaults));
+    document.getElementById("preset-current").addEventListener("click", async () => {
+      try {
+        const loaded = await loadSnapshotDefaults();
+        if (!loaded) applyPreset(defaults, "Current envelope");
+      } catch (error) {
+        applyPreset(defaults, "Current envelope");
+      }
+    });
+    document.getElementById("preset-fast").addEventListener("click", () => applyPreset(fastPreset, "Faster test"));
+    document.getElementById("reset").addEventListener("click", () => applyPreset(defaults, "Current envelope"));
     window.addEventListener("resize", render);
 
-    render();
+    initialize();
   </script>
 </body>
 </html>

@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import perf_counter
 
-from .alpaca import get_alpaca_client
 from .console import ScreenLogger
 from .config import RuntimeConfig, load_runtime_config
+from app.adapters.market_data import get_market_data_adapter
 from .models import StepProfile, TickContext, TickReport
 from .pipelines import StepDefinition, fx_gbp_reference
 from .usage import UsageLedger
@@ -34,8 +34,8 @@ def backfill_equities(context: TickContext) -> dict[str, object]:
 
     fx_reference = context.state["fx_gbp_reference"]
     start_at = context.started_at - timedelta(days=request.days)
-    client = get_alpaca_client(context)
-    bars_by_symbol = client.get_historical_stock_bars(
+    market_data = get_market_data_adapter(context, "alpaca")
+    bars_by_symbol = market_data.get_historical_equity_bars(
         context,
         symbols=list(request.equity_symbols),
         timeframe=request.timeframe,
@@ -86,8 +86,8 @@ def backfill_crypto(context: TickContext) -> dict[str, object]:
 
     fx_reference = context.state["fx_gbp_reference"]
     start_at = context.started_at - timedelta(days=request.days)
-    client = get_alpaca_client(context)
-    bars_by_symbol = client.get_historical_crypto_bars(
+    market_data = get_market_data_adapter(context, "alpaca")
+    bars_by_symbol = market_data.get_historical_crypto_bars(
         context,
         location=context.config.alpaca_crypto_location,
         symbols=list(request.crypto_symbols),

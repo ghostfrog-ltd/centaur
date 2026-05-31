@@ -6,15 +6,17 @@ import re
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from .alpaca import (
-    get_alpaca_client,
-    summarize_latest_bars,
-)
+from app.adapters.execution import ExecutionAdapterError, get_execution_adapter
+from app.adapters.market_data import get_market_data_adapter
+from app.runtime.execution_router import ExecutionRouter
+from app.runtime.mode_context import mode_context_from_config
+
 from .brokers import BrokerAdapterError, get_broker_adapter
 from .discovery import rank_candidates
 from .fitness import allocate_strategy_signals, enrich_strategy_fitness_rows
 from .fx import EcbReferenceRateClient, rate_is_stale
 from .gemini import GeminiApiError, get_gemini_client
+from .alpaca import summarize_latest_bars
 from .models import TickContext
 from .shadow import build_shadow_proposals, evaluate_shadow_checkpoint
 from .strategies import evaluate_strategies
@@ -73,6 +75,131 @@ def _live_limit_buffer_bps(config: Any, asset_class: str) -> float:
             )
         )
     return float(config.live_execution_limit_buffer_bps)
+
+
+def _live_runtime_allows_broker_reads(context: TickContext) -> bool:
+    return mode_context_from_config(context.config).can_read_live_broker
+
+
+def _live_runtime_allows_order_mutation(context: TickContext) -> bool:
+    return mode_context_from_config(context.config).can_mutate_live_broker
+
+
+def _empty_live_broker_state(context: TickContext, *, reason: str) -> dict[str, Any]:
+    result = {
+        "broker_id": "alpaca_live",
+        "mode": "skipped",
+        "reason": reason,
+    }
+    context.state["alpaca_live_account"] = {
+        "broker_id": "alpaca_live",
+        "summary": {},
+        "raw": {},
+    }
+    context.state["alpaca_live_positions"] = {
+        "broker_id": "alpaca_live",
+        "summary": {"open_positions": 0, "symbols": []},
+        "raw": [],
+    }
+    context.state["alpaca_live_orders"] = {
+        "broker_id": "alpaca_live",
+        "summary": {"open_orders": 0, "open_order_symbols": []},
+        "raw": [],
+    }
+    return result
+
+
+def _equity_weekend_carry_enabled(config: Any) -> bool:
+    return bool(
+        getattr(config, "paper_execution_equity_no_weekend_carry_enabled", False)
+    )
+
+
+def _market_session_minutes(
+    as_of: datetime,
+    market_timezone: str,
+    *,
+    next_close: Any = None,
+) -> tuple[int, int] | None:
+    market_now = as_of.astimezone(ZoneInfo(market_timezone))
+    if market_now.weekday() != 4:
+        return None
+    close_at = _coerce_datetime(next_close)
+    if close_at is not None:
+        market_close = close_at.astimezone(ZoneInfo(market_timezone))
+        if market_close.date() == market_now.date():
+            regular_close_minutes = (market_close.hour * 60) + market_close.minute
+        else:
+            regular_close_minutes = 16 * 60
+    else:
+        regular_close_minutes = 16 * 60
+    minutes_since_midnight = (market_now.hour * 60) + market_now.minute
+    return minutes_since_midnight, regular_close_minutes
+
+
+def _equity_friday_entry_cutoff_active(
+    config: Any,
+    as_of: datetime,
+    *,
+    next_close: Any = None,
+) -> bool:
+    """Protect equity entries from creating calendar-weekend hold drift."""
+    if not _equity_weekend_carry_enabled(config):
+        return False
+    session = _market_session_minutes(
+        as_of,
+        config.market_timezone,
+        next_close=next_close,
+    )
+    if session is None:
+        return False
+    minutes_since_midnight, regular_close_minutes = session
+    cutoff_minutes = max(
+        0,
+        int(
+            getattr(
+                config,
+                "paper_execution_equity_friday_entry_cutoff_minutes_before_close",
+                60,
+            )
+        ),
+    )
+    cutoff_at = regular_close_minutes - cutoff_minutes
+    return cutoff_at <= minutes_since_midnight < regular_close_minutes
+
+
+def _equity_friday_flatten_due(
+    config: Any,
+    *,
+    asset_class: str,
+    as_of: datetime,
+    next_close: Any = None,
+) -> bool:
+    """Return true when an equity managed exit should avoid weekend carry."""
+    if str(asset_class).strip().lower() != "equity":
+        return False
+    if not _equity_weekend_carry_enabled(config):
+        return False
+    session = _market_session_minutes(
+        as_of,
+        config.market_timezone,
+        next_close=next_close,
+    )
+    if session is None:
+        return False
+    minutes_since_midnight, regular_close_minutes = session
+    flatten_minutes = max(
+        0,
+        int(
+            getattr(
+                config,
+                "paper_execution_equity_friday_flatten_minutes_before_close",
+                15,
+            )
+        ),
+    )
+    flatten_at = regular_close_minutes - flatten_minutes
+    return flatten_at <= minutes_since_midnight < regular_close_minutes
 
 
 def _paper_allocation_suppress_thresholds(
@@ -223,28 +350,13 @@ def alpaca_orders(context: TickContext) -> PipelineResult:
 
 
 def alpaca_live_sync(context: TickContext) -> PipelineResult:
+    if not _live_runtime_allows_broker_reads(context):
+        return _empty_live_broker_state(context, reason="runtime_mode_not_live")
     if not context.config.alpaca_live_api_configured:
-        result = {
-            "broker_id": "alpaca_live",
-            "mode": "skipped",
-            "reason": "alpaca_live_credentials_missing",
-        }
-        context.state["alpaca_live_account"] = {
-            "broker_id": "alpaca_live",
-            "summary": {},
-            "raw": {},
-        }
-        context.state["alpaca_live_positions"] = {
-            "broker_id": "alpaca_live",
-            "summary": {"open_positions": 0, "symbols": []},
-            "raw": [],
-        }
-        context.state["alpaca_live_orders"] = {
-            "broker_id": "alpaca_live",
-            "summary": {"open_orders": 0, "open_order_symbols": []},
-            "raw": [],
-        }
-        return result
+        return _empty_live_broker_state(
+            context,
+            reason="alpaca_live_credentials_missing",
+        )
 
     adapter = get_broker_adapter(context, "alpaca_live")
     raw_account = {
@@ -319,6 +431,13 @@ def alpaca_live_sync(context: TickContext) -> PipelineResult:
 
 
 def daily_protection(context: TickContext) -> PipelineResult:
+    """Persist the paper daily drawdown latch before any new entry decision.
+
+    This protects the fixed micro-capital envelope by preserving the first
+    session baseline and keeping the protected state durable once the configured
+    loss limit is reached. CFO reads this state; the protector itself does not
+    size trades or choose strategies.
+    """
     account = context.state["alpaca_account"]["summary"]
     current_equity = _as_float(account.get("equity"))
     if current_equity is None or current_equity <= 0:
@@ -382,6 +501,18 @@ def live_daily_protection(context: TickContext) -> PipelineResult:
     audit trail so a future real-money lane cannot reset its baseline mid-session
     or forget that protection has already triggered.
     """
+    if not _live_runtime_allows_broker_reads(context):
+        result = {
+            "system_status": "skipped",
+            "entries_blocked": True,
+            "reason": "runtime_mode_not_live",
+            "max_daily_drawdown_usd": float(
+                context.config.live_execution_max_daily_drawdown_usd
+            ),
+        }
+        context.state["live_daily_protection"] = result
+        return result
+
     account_state = context.state.get("alpaca_live_account", {})
     summary = account_state.get("summary", {}) if isinstance(account_state, dict) else {}
     current_equity = _as_float(summary.get("equity"))
@@ -445,7 +576,78 @@ def live_daily_protection(context: TickContext) -> PipelineResult:
     return result
 
 
+def trailing_drawdown_observer(context: TickContext) -> PipelineResult:
+    """Record high-water drawdown evidence without changing trading gates.
+
+    This is a shadow risk rule: it measures whether a future trailing giveback
+    guard would have blocked new entries, but it deliberately does not latch
+    protection, cancel orders, submit exits, or alter paper/live CFO decisions.
+    """
+    config = context.config
+    session_date, session_open_at = _current_market_session(
+        started_at=context.started_at,
+        market_timezone=config.market_timezone,
+    )
+    result: dict[str, Any] = {
+        "mode": "observe_only",
+        "enabled": bool(config.trailing_drawdown_observer_enabled),
+        "affects_execution": False,
+        "entries_blocked": False,
+        "session_date": session_date.isoformat(),
+        "session_open_at": session_open_at,
+        "lanes": {},
+        "any_would_block_new_entries": False,
+    }
+    if not config.trailing_drawdown_observer_enabled:
+        result["mode"] = "disabled"
+        context.state["trailing_drawdown_observer"] = result
+        return result
+
+    paper_brokers = {
+        str(config.paper_execution_equity_broker_id or "").strip().lower(),
+        str(config.paper_execution_crypto_broker_id or "").strip().lower(),
+    }
+    live_brokers = {
+        str(config.live_execution_equity_broker_id or "").strip().lower(),
+        str(config.live_execution_crypto_broker_id or "").strip().lower(),
+    }
+    lanes: dict[str, Any] = {}
+    for broker_id in sorted(broker for broker in paper_brokers if broker):
+        lanes[broker_id] = _build_trailing_drawdown_observation(
+            context=context,
+            broker_id=broker_id,
+            account_state_key=_account_state_key_for_broker(broker_id),
+            session_open_at=session_open_at,
+            threshold_usd=float(config.trailing_drawdown_observer_paper_giveback_usd),
+            threshold_pct=float(config.trailing_drawdown_observer_paper_giveback_pct),
+        )
+    for broker_id in sorted(broker for broker in live_brokers if broker):
+        lanes[broker_id] = _build_trailing_drawdown_observation(
+            context=context,
+            broker_id=broker_id,
+            account_state_key=_account_state_key_for_broker(broker_id),
+            session_open_at=session_open_at,
+            threshold_usd=float(config.trailing_drawdown_observer_live_giveback_usd),
+            threshold_pct=float(config.trailing_drawdown_observer_live_giveback_pct),
+        )
+    result["lanes"] = lanes
+    result["any_would_block_new_entries"] = any(
+        bool(lane.get("would_block_new_entries"))
+        for lane in lanes.values()
+        if isinstance(lane, dict)
+    )
+    context.state["trailing_drawdown_observer"] = result
+    return result
+
+
 def stale_order_reaper(context: TickContext) -> PipelineResult:
+    """Cancel stale untouched paper equity entry limits and audit the action.
+
+    The reaper keeps old marketable-limit buys from filling after their signal
+    context has aged. It only acts on entry orders that match the stale-entry
+    predicate, then persists the cancellation and increments the daily audit
+    counter used by status/reporting.
+    """
     raw_orders = list(context.state.get("alpaca_orders", {}).get("raw", []))
     stale_after_minutes = max(1, int(context.config.paper_execution_stale_order_minutes))
     if not raw_orders:
@@ -462,6 +664,7 @@ def stale_order_reaper(context: TickContext) -> PipelineResult:
     cancel_errors: list[dict[str, Any]] = []
     stale_candidates: list[dict[str, Any]] = []
     updated_orders: list[dict[str, Any]] = []
+    router = ExecutionRouter()
 
     for order in raw_orders:
         symbol = str(order.get("symbol", "")).upper()
@@ -485,9 +688,13 @@ def stale_order_reaper(context: TickContext) -> PipelineResult:
             cancel_errors.append({"symbol": symbol, "error": "missing_order_id"})
             updated_orders.append(order)
             continue
-        try:
-            adapter = get_broker_adapter(context, broker_id)
-            adapter.cancel_order(context, order_id=order_id)
+        routed_cancel = router.route_cancel_order(
+            context=context,
+            broker_id=broker_id,
+            order_id=order_id,
+            lane="paper",
+        )
+        if routed_cancel.canceled:
             canceled_order = {
                 **order,
                 "status": "canceled",
@@ -495,8 +702,10 @@ def stale_order_reaper(context: TickContext) -> PipelineResult:
             }
             canceled_orders.append(canceled_order)
             updated_orders.append(canceled_order)
-        except BrokerAdapterError as exc:
-            cancel_errors.append({"symbol": symbol, "error": str(exc)})
+        else:
+            cancel_errors.append(
+                {"symbol": symbol, "error": routed_cancel.error or routed_cancel.status}
+            )
             updated_orders.append(order)
 
     orders_saved = 0
@@ -562,6 +771,22 @@ def live_stale_order_reaper(context: TickContext) -> PipelineResult:
     audit trail, and relies on the live adapter to enforce credentials and
     activation acknowledgement before any live account mutation.
     """
+    if not _live_runtime_allows_broker_reads(context):
+        result = {
+            "broker": "alpaca_live",
+            "mode": "skipped",
+            "reason": "runtime_mode_not_live",
+            "orders_checked": 0,
+            "stale_candidates": 0,
+            "orders_canceled": 0,
+        }
+        context.state["live_stale_order_reaper"] = {
+            **result,
+            "canceled_orders": [],
+            "errors": [],
+        }
+        return result
+
     raw_orders = list(context.state.get("alpaca_live_orders", {}).get("raw", []))
     stale_after_minutes = max(1, int(context.config.paper_execution_stale_order_minutes))
     if not raw_orders:
@@ -580,9 +805,11 @@ def live_stale_order_reaper(context: TickContext) -> PipelineResult:
         return result
 
     canceled_orders: list[dict[str, Any]] = []
+    intended_cancellations: list[dict[str, Any]] = []
     cancel_errors: list[dict[str, Any]] = []
     stale_candidates: list[dict[str, Any]] = []
     updated_orders: list[dict[str, Any]] = []
+    router = ExecutionRouter()
 
     for order in raw_orders:
         symbol = str(order.get("symbol", "")).upper()
@@ -605,9 +832,13 @@ def live_stale_order_reaper(context: TickContext) -> PipelineResult:
             cancel_errors.append({"symbol": symbol, "error": "missing_order_id"})
             updated_orders.append(order)
             continue
-        try:
-            adapter = get_broker_adapter(context, "alpaca_live")
-            adapter.cancel_order(context, order_id=order_id)
+        routed_cancel = router.route_cancel_order(
+            context=context,
+            broker_id="alpaca_live",
+            order_id=order_id,
+            lane="live",
+        )
+        if routed_cancel.canceled:
             canceled_order = {
                 **order,
                 "broker_id": "alpaca_live",
@@ -616,8 +847,20 @@ def live_stale_order_reaper(context: TickContext) -> PipelineResult:
             }
             canceled_orders.append(canceled_order)
             updated_orders.append(canceled_order)
-        except BrokerAdapterError as exc:
-            cancel_errors.append({"symbol": symbol, "error": str(exc)})
+        elif routed_cancel.status == "live_dry_intent":
+            intended_cancellations.append(
+                {
+                    "symbol": symbol,
+                    "order_id": order_id,
+                    "broker_id": "alpaca_live",
+                    "intent": routed_cancel.intended_order or {},
+                }
+            )
+            updated_orders.append(order)
+        else:
+            cancel_errors.append(
+                {"symbol": symbol, "error": routed_cancel.error or routed_cancel.status}
+            )
             updated_orders.append(order)
 
     orders_saved = 0
@@ -644,7 +887,10 @@ def live_stale_order_reaper(context: TickContext) -> PipelineResult:
                     protection["raw"]["stale_orders_reaped_count"] = stale_count
 
     prior_summary = context.state.get("alpaca_live_orders", {}).get("summary", {})
-    revised_summary = get_broker_adapter(context, "alpaca_live").summarize_orders(updated_orders)
+    if _live_runtime_allows_order_mutation(context):
+        revised_summary = get_broker_adapter(context, "alpaca_live").summarize_orders(updated_orders)
+    else:
+        revised_summary = prior_summary
     context.state["alpaca_live_orders"] = {
         "summary": {
             **revised_summary,
@@ -660,9 +906,12 @@ def live_stale_order_reaper(context: TickContext) -> PipelineResult:
         "orders_checked": len(raw_orders),
         "stale_candidates": len(stale_candidates),
         "orders_canceled": len(canceled_orders),
+        "orders_intended": len(intended_cancellations),
         "orders_saved": orders_saved,
         "stale_after_minutes": stale_after_minutes,
     }
+    if intended_cancellations:
+        result["mode"] = "live_dry"
     if stale_candidates:
         result["first_stale_symbol"] = stale_candidates[0]["symbol"]
     if cancel_errors:
@@ -671,6 +920,7 @@ def live_stale_order_reaper(context: TickContext) -> PipelineResult:
     context.state["live_stale_order_reaper"] = {
         **result,
         "canceled_orders": canceled_orders,
+        "intended_cancellations": intended_cancellations,
         "errors": cancel_errors,
         "stale_candidates_detail": stale_candidates,
     }
@@ -695,6 +945,7 @@ def _account_trade_ready(summary: dict[str, Any]) -> tuple[bool, str]:
 
 
 def market_gate(context: TickContext) -> PipelineResult:
+    """Build the account/market readiness snapshot used by scan and CFO gates."""
     account = context.state["alpaca_account"]["summary"]
     clock = context.state["alpaca_clock"]["summary"]
     is_open = bool(clock["is_open"])
@@ -727,6 +978,8 @@ def market_gate(context: TickContext) -> PipelineResult:
         "account_active": account_active,
         "account_status": account.get("status"),
         "account_trade_ready": account_trade_ready,
+        "next_open": clock.get("next_open"),
+        "next_close": clock.get("next_close"),
         "equity_scan_ready": equity_scan_ready,
         "equity_reason": equity_reason,
         "crypto_scan_ready": crypto_scan_ready,
@@ -920,10 +1173,10 @@ def market_latest_bars(context: TickContext) -> PipelineResult:
         context.state["market_data_latest_bars"] = result
         return result
 
-    client = get_alpaca_client(context)
+    market_data = get_market_data_adapter(context, "alpaca")
     captured_at = context.started_at
     fx_reference = context.state["fx_gbp_reference"]
-    bars = client.get_latest_bars(context, symbols=watchlist)
+    bars = market_data.get_latest_equity_bars(context, symbols=watchlist)
     bars_saved = context.usage_ledger.record_latest_bars(
         tick_id=context.tick_id,
         captured_at=captured_at,
@@ -970,10 +1223,10 @@ def crypto_latest_bars(context: TickContext) -> PipelineResult:
         context.state["crypto_data_latest_bars"] = result
         return result
 
-    client = get_alpaca_client(context)
+    market_data = get_market_data_adapter(context, "alpaca")
     captured_at = context.started_at
     fx_reference = context.state["fx_gbp_reference"]
-    bars = client.get_latest_crypto_bars(
+    bars = market_data.get_latest_crypto_bars(
         context,
         location=context.config.alpaca_crypto_location,
         symbols=symbols,
@@ -1000,6 +1253,13 @@ def crypto_latest_bars(context: TickContext) -> PipelineResult:
 
 
 def paper_exit_management(context: TickContext) -> PipelineResult:
+    """Submit or refresh deterministic managed exits for paper positions.
+
+    This is the protective sell side of paper execution: it reconstructs the
+    persisted entry plan, checks stop/profit/time/no-weekend rules, refreshes
+    stale/non-marketable open exits, and writes every submitted exit back to the
+    broker-separated order audit trail.
+    """
     positions = list(context.state.get("alpaca_positions", {}).get("raw", []))
     if not positions:
         result = {
@@ -1031,6 +1291,7 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
     skipped: list[dict[str, Any]] = []
     refreshed_exit_orders: list[dict[str, Any]] = []
     refresh_errors: list[dict[str, Any]] = []
+    router = ExecutionRouter()
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
         broker_id = str(position.get("broker_id", "alpaca_paper")).strip().lower() or "alpaca_paper"
@@ -1070,9 +1331,13 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
             if not order_id:
                 skipped.append({"symbol": symbol, "reason": "open_exit_order_missing_id"})
                 continue
-            try:
-                adapter = get_broker_adapter(context, broker_id)
-                adapter.cancel_order(context, order_id=order_id)
+            routed_cancel = router.route_cancel_order(
+                context=context,
+                broker_id=broker_id,
+                order_id=order_id,
+                lane="paper",
+            )
+            if routed_cancel.canceled:
                 refreshed_exit_orders.append(
                     {
                         **open_exit_order,
@@ -1081,13 +1346,13 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
                         "exit_refresh_reason": refresh_reason,
                     }
                 )
-            except BrokerAdapterError as exc:
+            else:
                 refresh_errors.append(
                     {
                         "symbol": symbol,
                         "order_id": order_id,
                         "reason": refresh_reason,
-                        "error": str(exc),
+                        "error": routed_cancel.error or routed_cancel.status,
                     }
                 )
                 skipped.append({"symbol": symbol, "reason": "exit_order_refresh_failed"})
@@ -1162,16 +1427,20 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
 
     submitted_orders: list[dict[str, Any]] = []
     submission_errors: list[dict[str, Any]] = []
+    router = ExecutionRouter()
     for exit_request in exit_requests:
-        try:
-            adapter = get_broker_adapter(context, exit_request["broker_id"])
-            broker_order = adapter.submit_order(
-                context,
-                order_request=exit_request["order_request"],
-            )
+        routed = router.route_order_request(
+            context=context,
+            broker_id=exit_request["broker_id"],
+            order_request=exit_request["order_request"],
+            lane="paper",
+            action="exit",
+            strategy_id=exit_request.get("strategy_id"),
+        )
+        if routed.submitted and routed.order is not None:
             submitted_orders.append(
                 {
-                    **broker_order,
+                    **routed.order,
                     "broker_id": exit_request["broker_id"],
                     "proposal_id": exit_request["proposal_id"],
                     "strategy_id": exit_request["strategy_id"],
@@ -1219,13 +1488,13 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
                     ),
                 }
             )
-        except BrokerAdapterError as exc:
+        elif routed.error:
             submission_errors.append(
                 {
                     "symbol": exit_request["symbol"],
                     "broker_id": exit_request["broker_id"],
                     "strategy_id": exit_request["strategy_id"],
-                    "error": str(exc),
+                    "error": routed.error,
                     "exit_reason": exit_request["exit_reason"],
                 }
             )
@@ -1289,6 +1558,22 @@ def live_exit_management(context: TickContext) -> PipelineResult:
     the original stop/target/holding policy, and every broker response is saved
     under `alpaca_live` for later live-vs-paper drift review.
     """
+    if not _live_runtime_allows_broker_reads(context):
+        result = {
+            "broker": "alpaca_live",
+            "positions_checked": 0,
+            "exit_orders_submitted": 0,
+            "mode": "skipped",
+            "reason": "runtime_mode_not_live",
+        }
+        context.state["live_exit_management"] = {
+            **result,
+            "orders": [],
+            "errors": [],
+            "skipped": [],
+        }
+        return result
+
     positions = list(context.state.get("alpaca_live_positions", {}).get("raw", []))
     if not positions:
         result = {
@@ -1319,7 +1604,9 @@ def live_exit_management(context: TickContext) -> PipelineResult:
     exit_requests: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     refreshed_exit_orders: list[dict[str, Any]] = []
+    intended_refresh_cancellations: list[dict[str, Any]] = []
     refresh_errors: list[dict[str, Any]] = []
+    router = ExecutionRouter()
     for position in positions:
         symbol = str(position.get("symbol", "")).upper()
         broker_id = str(position.get("broker_id", "alpaca_live")).strip().lower() or "alpaca_live"
@@ -1359,9 +1646,13 @@ def live_exit_management(context: TickContext) -> PipelineResult:
             if not order_id:
                 skipped.append({"symbol": symbol, "reason": "open_exit_order_missing_id"})
                 continue
-            try:
-                adapter = get_broker_adapter(context, broker_id)
-                adapter.cancel_order(context, order_id=order_id)
+            routed_cancel = router.route_cancel_order(
+                context=context,
+                broker_id=broker_id,
+                order_id=order_id,
+                lane="live",
+            )
+            if routed_cancel.canceled:
                 refreshed_exit_orders.append(
                     {
                         **open_exit_order,
@@ -1371,13 +1662,23 @@ def live_exit_management(context: TickContext) -> PipelineResult:
                         "exit_refresh_reason": refresh_reason,
                     }
                 )
-            except BrokerAdapterError as exc:
+            elif routed_cancel.status == "live_dry_intent":
+                intended_refresh_cancellations.append(
+                    {
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "broker_id": broker_id,
+                        "reason": refresh_reason,
+                        "intent": routed_cancel.intended_order or {},
+                    }
+                )
+            else:
                 refresh_errors.append(
                     {
                         "symbol": symbol,
                         "order_id": order_id,
                         "reason": refresh_reason,
-                        "error": str(exc),
+                        "error": routed_cancel.error or routed_cancel.status,
                     }
                 )
                 skipped.append({"symbol": symbol, "reason": "exit_order_refresh_failed"})
@@ -1451,17 +1752,22 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         return result
 
     submitted_orders: list[dict[str, Any]] = []
+    intended_exit_orders: list[dict[str, Any]] = []
     submission_errors: list[dict[str, Any]] = []
+    router = ExecutionRouter()
     for exit_request in exit_requests:
-        try:
-            adapter = get_broker_adapter(context, exit_request["broker_id"])
-            broker_order = adapter.submit_order(
-                context,
-                order_request=exit_request["order_request"],
-            )
+        routed = router.route_order_request(
+            context=context,
+            broker_id=exit_request["broker_id"],
+            order_request=exit_request["order_request"],
+            lane="live",
+            action="exit",
+            strategy_id=exit_request.get("strategy_id"),
+        )
+        if routed.submitted and routed.order is not None:
             submitted_orders.append(
                 {
-                    **broker_order,
+                    **routed.order,
                     "broker_id": exit_request["broker_id"],
                     "proposal_id": exit_request["proposal_id"],
                     "strategy_id": exit_request["strategy_id"],
@@ -1509,13 +1815,23 @@ def live_exit_management(context: TickContext) -> PipelineResult:
                     ),
                 }
             )
-        except BrokerAdapterError as exc:
+        elif routed.status == "live_dry_intent":
+            intended_exit_orders.append(
+                {
+                    "symbol": exit_request["symbol"],
+                    "broker_id": exit_request["broker_id"],
+                    "strategy_id": exit_request["strategy_id"],
+                    "exit_reason": exit_request["exit_reason"],
+                    "intent": routed.intended_order or {},
+                }
+            )
+        elif routed.error:
             submission_errors.append(
                 {
                     "symbol": exit_request["symbol"],
                     "broker_id": exit_request["broker_id"],
                     "strategy_id": exit_request["strategy_id"],
-                    "error": str(exc),
+                    "error": routed.error,
                     "exit_reason": exit_request["exit_reason"],
                 }
             )
@@ -1530,7 +1846,9 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         "broker": "alpaca_live",
         "positions_checked": len(positions),
         "exit_orders_submitted": len(submitted_orders),
+        "exit_orders_intended": len(intended_exit_orders),
         "exit_orders_refreshed": len(refreshed_exit_orders),
+        "exit_refreshes_intended": len(intended_refresh_cancellations),
         "refreshed_orders_saved": refreshed_orders_saved,
         "orders_saved": orders_saved,
         "execution_status": _paper_execution_status(
@@ -1539,6 +1857,9 @@ def live_exit_management(context: TickContext) -> PipelineResult:
         ),
         "mode": "managed_exits",
     }
+    if intended_exit_orders or intended_refresh_cancellations:
+        result["execution_status"] = "live_dry"
+        result["mode"] = "live_dry"
     if submitted_orders:
         result["submitted_symbols"] = [
             str(order.get("symbol", "")).upper() for order in submitted_orders
@@ -1555,9 +1876,11 @@ def live_exit_management(context: TickContext) -> PipelineResult:
     context.state["live_exit_management"] = {
         **result,
         "orders": submitted_orders,
+        "intended_orders": intended_exit_orders,
         "errors": submission_errors,
         "skipped": skipped,
         "refreshed_exit_orders": refreshed_exit_orders,
+        "intended_refresh_cancellations": intended_refresh_cancellations,
         "refresh_errors": refresh_errors,
     }
     return result
@@ -1646,6 +1969,12 @@ def strategy_fitness(context: TickContext) -> PipelineResult:
         tick_id=context.tick_id,
         captured_at=context.started_at,
         summaries=summaries,
+        environment=context.config.centaur_environment,
+        mode=context.config.centaur_mode,
+        source_environment="shadow",
+        broker_id=context.config.paper_execution_equity_broker_id,
+        data_provider="alpaca",
+        execution_provider="shadow",
     )
     result = {
         "strategy_summaries": len(summaries),
@@ -1940,6 +2269,12 @@ def shadow_trade_proposals(context: TickContext) -> PipelineResult:
         min_signal_score=context.config.shadow_min_opportunity_score,
         checkpoint_windows=context.config.shadow_checkpoint_windows,
     )
+    for proposal in proposals:
+        proposal.setdefault("environment", context.config.centaur_environment)
+        proposal.setdefault("mode", context.config.centaur_mode)
+        proposal.setdefault("source_environment", "shadow")
+        proposal.setdefault("data_provider", proposal.get("source", "alpaca"))
+        proposal.setdefault("execution_provider", "shadow")
     context.usage_ledger.record_shadow_trade_proposals(proposals=proposals)
 
     result = {
@@ -1961,6 +2296,13 @@ def shadow_trade_proposals(context: TickContext) -> PipelineResult:
 
 
 def risk_cfo_gate(context: TickContext) -> PipelineResult:
+    """Approve at most the configured micro paper entries after all risk gates.
+
+    The CFO gate is the paper capital-preservation choke point: it combines the
+    kill switch, durable daily protection, account readiness, earned slots,
+    duplicate-symbol checks, strategy allowlist, broker validation, and projected
+    gain floor before an order request can reach execution.
+    """
     config = context.config
     gate = context.state["market_gate"]
     protection = context.state.get("daily_protection", {})
@@ -2128,7 +2470,9 @@ def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
     rejected: list[dict[str, Any]] = []
     approved: list[dict[str, Any]] = []
 
-    if not config.live_execution_enabled:
+    if not _live_runtime_allows_broker_reads(context):
+        reason = "runtime_mode_not_live"
+    elif not config.live_execution_enabled:
         reason = "live_execution_disabled"
     elif config.live_execution_kill_switch:
         reason = "live_kill_switch_on"
@@ -2245,6 +2589,12 @@ def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
 
 
 def execution_paper(context: TickContext) -> PipelineResult:
+    """Submit only CFO-approved paper entries and persist broker responses.
+
+    Execution does not re-rank or resize proposals. It sends the exact approved
+    order request through the selected broker adapter, captures any broker error,
+    and writes submitted orders with their planned exits for later management.
+    """
     approvals = list(context.state["risk_cfo"].get("approved_order_requests", []))
     if not approvals:
         default_brokers = sorted(
@@ -2266,16 +2616,17 @@ def execution_paper(context: TickContext) -> PipelineResult:
 
     submitted_orders: list[dict[str, Any]] = []
     submission_errors: list[dict[str, Any]] = []
+    router = ExecutionRouter()
     for approval in approvals:
-        try:
-            adapter = get_broker_adapter(context, approval["broker_id"])
-            broker_order = adapter.submit_order(
-                context,
-                order_request=approval["order_request"],
-            )
+        routed = router.route_entry_approval(
+            context=context,
+            approval=approval,
+            lane="paper",
+        )
+        if routed.submitted and routed.order is not None:
             submitted_orders.append(
                 {
-                    **broker_order,
+                    **routed.order,
                     "broker_id": approval["broker_id"],
                     "proposal_id": approval["proposal_id"],
                     "strategy_id": approval["strategy_id"],
@@ -2308,13 +2659,13 @@ def execution_paper(context: TickContext) -> PipelineResult:
                     "planned_trailing_stop_mode": approval.get("trailing_stop_mode"),
                 }
             )
-        except BrokerAdapterError as exc:
+        elif routed.error:
             submission_errors.append(
                 {
                     "symbol": approval["symbol"],
                     "broker_id": approval["broker_id"],
                     "strategy_id": approval["strategy_id"],
-                    "error": str(exc),
+                    "error": routed.error,
                 }
             )
 
@@ -2358,7 +2709,25 @@ def execution_paper(context: TickContext) -> PipelineResult:
 
 
 def execution_live(context: TickContext) -> PipelineResult:
+    """Submit approved live follower entries and persist the live audit trail.
+
+    Live execution is deliberately downstream of paper submission and live CFO.
+    This step only sends orders that survived those gates, then stores Alpaca
+    Live responses separately so live-vs-paper drift remains reviewable.
+    """
     approvals = list(context.state.get("live_risk_cfo", {}).get("approved_order_requests", []))
+    if not _live_runtime_allows_order_mutation(context):
+        result = {
+            "broker": "alpaca_live",
+            "orders_submitted": 0,
+            "orders_saved": 0,
+            "execution_status": "live_dry" if approvals else "idle",
+            "mode": "live_dry" if _live_runtime_allows_broker_reads(context) else "skipped",
+            "reason": "runtime_mode_not_live_order_mutation",
+            "intended_orders": len(approvals),
+        }
+        context.state["execution_live"] = result
+        return result
     if not approvals:
         result = {
             "broker": "alpaca_live",
@@ -2371,16 +2740,17 @@ def execution_live(context: TickContext) -> PipelineResult:
 
     submitted_orders: list[dict[str, Any]] = []
     submission_errors: list[dict[str, Any]] = []
+    router = ExecutionRouter()
     for approval in approvals:
-        try:
-            adapter = get_broker_adapter(context, approval["broker_id"])
-            broker_order = adapter.submit_order(
-                context,
-                order_request=approval["order_request"],
-            )
+        routed = router.route_entry_approval(
+            context=context,
+            approval=approval,
+            lane="live",
+        )
+        if routed.submitted and routed.order is not None:
             submitted_orders.append(
                 {
-                    **broker_order,
+                    **routed.order,
                     "broker_id": approval["broker_id"],
                     "proposal_id": approval["proposal_id"],
                     "strategy_id": approval["strategy_id"],
@@ -2406,13 +2776,13 @@ def execution_live(context: TickContext) -> PipelineResult:
                     "planned_profit_capture_pct": context.config.paper_execution_profit_capture_pct,
                 }
             )
-        except BrokerAdapterError as exc:
+        elif routed.error:
             submission_errors.append(
                 {
                     "symbol": approval["symbol"],
                     "broker_id": approval["broker_id"],
                     "strategy_id": approval["strategy_id"],
-                    "error": str(exc),
+                    "error": routed.error,
                 }
             )
 
@@ -2571,6 +2941,7 @@ def build_default_pipeline() -> list[StepDefinition]:
         StepDefinition(name="alpaca_live.sync", runner=alpaca_live_sync),
         StepDefinition(name="risk.daily_protection", runner=daily_protection),
         StepDefinition(name="risk.live_daily_protection", runner=live_daily_protection),
+        StepDefinition(name="risk.trailing_drawdown_observer", runner=trailing_drawdown_observer),
         StepDefinition(name="maintenance.stale_orders", runner=stale_order_reaper),
         StepDefinition(name="maintenance.live_stale_orders", runner=live_stale_order_reaper),
         StepDefinition(name="market.gate", runner=market_gate),
@@ -2604,6 +2975,12 @@ def _build_paper_trade_approval(
     position_symbols: set[str],
     open_order_symbols: set[str],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Convert one shadow proposal into an auditable paper approval or veto.
+
+    The returned approval carries the broker id, fixed notional, entry/exit plan,
+    and order request that will be persisted if submitted. Rejections are kept as
+    structured reasons so status can explain why a signal did not become a trade.
+    """
     symbol = str(proposal.get("symbol", "")).upper()
     strategy_id = str(proposal.get("strategy_id", ""))
     asset_class = str(proposal.get("asset_class", "")).lower()
@@ -2624,6 +3001,16 @@ def _build_paper_trade_approval(
         and not bool(market_gate.get("market_open"))
     ):
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "market_closed"}
+    if asset_class == "equity" and _equity_friday_entry_cutoff_active(
+        config,
+        context.started_at,
+        next_close=market_gate.get("next_close"),
+    ):
+        return None, {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "reason": "friday_entry_cutoff_no_weekend_carry",
+        }
     if asset_class == "crypto" and not bool(market_gate.get("crypto_scan_ready")):
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "crypto_unavailable"}
     if direction != "long":
@@ -2656,8 +3043,8 @@ def _build_paper_trade_approval(
         asset_class=asset_class,
     )
     try:
-        adapter = get_broker_adapter(context, broker_id)
-    except BrokerAdapterError:
+        adapter = get_execution_adapter(context, broker_id)
+    except ExecutionAdapterError:
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
@@ -2686,13 +3073,14 @@ def _build_paper_trade_approval(
     )
     try:
         order_request = adapter.build_entry_order_request(
+            context=context,
             proposal=proposal,
             client_order_id=client_order_id,
             notional_usd=notional_usd,
             limit_buffer_bps=_paper_limit_buffer_bps(config, asset_class),
             usd_to_gbp=_as_float(context.state.get("fx_gbp_reference", {}).get("usd_to_gbp")),
         )
-    except BrokerAdapterError:
+    except ExecutionAdapterError:
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
@@ -2747,6 +3135,13 @@ def _build_live_trade_approval(
     position_symbols: set[str],
     open_order_symbols: set[str],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Apply live follower entry checks without creating an independent strategy.
+
+    Live approvals mirror paper economics but remain gated by the live broker,
+    live daily protection, activation acknowledgement, and same-paper-order
+    follower rule handled upstream. This helper only builds a candidate request
+    after those capital-preservation assumptions are still true.
+    """
     symbol = str(proposal.get("symbol", "")).upper()
     strategy_id = str(proposal.get("strategy_id", ""))
     asset_class = str(proposal.get("asset_class", "")).lower()
@@ -2767,6 +3162,16 @@ def _build_live_trade_approval(
         and not bool(market_gate.get("market_open"))
     ):
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "market_closed"}
+    if asset_class == "equity" and _equity_friday_entry_cutoff_active(
+        config,
+        context.started_at,
+        next_close=market_gate.get("next_close"),
+    ):
+        return None, {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "reason": "friday_entry_cutoff_no_weekend_carry_live",
+        }
     if asset_class == "crypto" and not bool(market_gate.get("crypto_scan_ready")):
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "crypto_unavailable"}
     if direction != "long":
@@ -2799,8 +3204,8 @@ def _build_live_trade_approval(
         asset_class=asset_class,
     )
     try:
-        adapter = get_broker_adapter(context, broker_id)
-    except BrokerAdapterError:
+        adapter = get_execution_adapter(context, broker_id)
+    except ExecutionAdapterError:
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
@@ -2830,13 +3235,14 @@ def _build_live_trade_approval(
     )
     try:
         order_request = adapter.build_entry_order_request(
+            context=context,
             proposal=proposal,
             client_order_id=client_order_id,
             notional_usd=notional_usd,
             limit_buffer_bps=_live_limit_buffer_bps(config, asset_class),
             usd_to_gbp=_as_float(context.state.get("fx_gbp_reference", {}).get("usd_to_gbp")),
         )
-    except BrokerAdapterError:
+    except ExecutionAdapterError:
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
@@ -2926,6 +3332,12 @@ def _earned_slot_policy(
     base_max_positions: int,
     slot_size_usd: float,
 ) -> dict[str, Any]:
+    """Calculate dynamic slots from tracked P/L without changing order size.
+
+    The earned-slot rule compounds capacity only in full fixed-notional units
+    above the pre-first-order baseline. It never widens per-trade notional, and
+    the returned values are recorded so slot changes are auditable.
+    """
     base_slots = max(0, int(base_max_positions))
     slot_size = max(0.0, float(slot_size_usd or 0.0))
     account_state = context.state.get(account_state_key, {})
@@ -2977,6 +3389,82 @@ def _earned_slot_policy(
         "effective_max_open_positions": base_slots + earned_slots,
         "tracking_started_at": tracking_started_at,
     }
+
+
+def _account_state_key_for_broker(broker_id: str) -> str:
+    normalized = str(broker_id or "").strip().lower()
+    if normalized == "alpaca_live":
+        return "alpaca_live_account"
+    if normalized == "alpaca_paper":
+        return "alpaca_account"
+    return f"{normalized}_account"
+
+
+def _build_trailing_drawdown_observation(
+    *,
+    context: TickContext,
+    broker_id: str,
+    account_state_key: str,
+    session_open_at: datetime,
+    threshold_usd: float,
+    threshold_pct: float,
+) -> dict[str, Any]:
+    account_state = context.state.get(account_state_key, {})
+    summary = account_state.get("summary", {}) if isinstance(account_state, dict) else {}
+    raw_account = account_state.get("raw", {}) if isinstance(account_state, dict) else {}
+    current_equity = _as_float(summary.get("equity"))
+    if current_equity is None and isinstance(raw_account, dict):
+        current_equity = _as_float(raw_account.get("equity"))
+    high_water_row = context.usage_ledger.get_broker_account_high_water(
+        broker_id=broker_id,
+        since=session_open_at,
+    )
+    high_water_equity = (
+        _as_float(high_water_row.get("equity")) if isinstance(high_water_row, dict) else None
+    )
+    if high_water_equity is None:
+        high_water_equity = current_equity
+    if current_equity is None or high_water_equity is None or high_water_equity <= 0:
+        return {
+            "broker_id": broker_id,
+            "mode": "observe_only",
+            "status": "unknown",
+            "reason": "equity_unavailable",
+            "threshold_usd": max(0.0, threshold_usd),
+            "threshold_pct": max(0.0, threshold_pct),
+            "would_block_new_entries": False,
+            "affects_execution": False,
+        }
+
+    giveback_usd = round(max(0.0, high_water_equity - current_equity), 6)
+    giveback_pct = round(giveback_usd / high_water_equity, 8)
+    usd_triggered = threshold_usd > 0 and giveback_usd >= threshold_usd
+    pct_triggered = threshold_pct > 0 and giveback_pct >= threshold_pct
+    would_block = bool(usd_triggered or pct_triggered)
+    action = "would_block_new_entries" if would_block else "would_allow_new_entries"
+    observation = {
+        "broker_id": broker_id,
+        "mode": "observe_only",
+        "status": "observed",
+        "current_equity": current_equity,
+        "high_water_equity": high_water_equity,
+        "high_water_tick_id": (
+            high_water_row.get("tick_id") if isinstance(high_water_row, dict) else None
+        ),
+        "high_water_at": (
+            high_water_row.get("captured_at") if isinstance(high_water_row, dict) else None
+        ),
+        "giveback_usd": giveback_usd,
+        "giveback_pct": giveback_pct,
+        "threshold_usd": max(0.0, threshold_usd),
+        "threshold_pct": max(0.0, threshold_pct),
+        "would_block_new_entries": would_block,
+        "would_trigger_usd": bool(usd_triggered),
+        "would_trigger_pct": bool(pct_triggered),
+        "hypothetical_action": action,
+        "affects_execution": False,
+    }
+    return observation
 
 
 def _as_float(value: Any) -> float | None:
@@ -3122,6 +3610,13 @@ def _build_exit_order_request(
     as_of: datetime,
     limit_buffer_bps: float,
 ) -> tuple[dict[str, Any] | None, str | None]:
+    """Build one managed sell request or a skip reason for audit.
+
+    The decision order is capital-preservation first: stop, profit capture,
+    target, Friday no-weekend flatten, and then policy-specific time exits.
+    Red max-hold deferrals deliberately avoid realizing a loss solely because a
+    timer elapsed while leaving stop/profit rules active.
+    """
     symbol = str(position.get("symbol", "")).upper()
     broker_symbol = str(entry_order.get("symbol") or symbol).upper()
     raw_qty = str(position.get("qty", "")).strip()
@@ -3246,6 +3741,7 @@ def _build_exit_order_request(
     entry_submitted_at = _coerce_datetime(
         entry_order.get("submitted_at") or entry_order.get("captured_at")
     )
+    asset_class = str(entry_order.get("asset_class", "")).strip().lower()
 
     low_price = _as_float(latest_bar.get("l"))
     high_price = _as_float(latest_bar.get("h"))
@@ -3276,7 +3772,9 @@ def _build_exit_order_request(
         _as_float(entry_order.get("filled_avg_price"))
         or _as_float(position.get("avg_entry_price"))
         or _as_float(raw.get("entry_price"))
+        or _as_float(raw.get("filled_avg_price"))
         or _as_float(proposal_plan.get("entry_price"))
+        or _as_float(proposal_raw.get("entry_price"))
     )
     profit_capture_price = (
         round(entry_reference_price * (1.0 + profit_capture_pct), 8)
@@ -3297,6 +3795,13 @@ def _build_exit_order_request(
         exit_reason = "profit_capture_hit"
     elif target_price is not None and high_price is not None and high_price >= target_price:
         exit_reason = "take_profit_hit"
+    elif _equity_friday_flatten_due(
+        context.config,
+        asset_class=asset_class,
+        as_of=as_of,
+        next_close=context.state.get("market_gate", {}).get("next_close"),
+    ):
+        exit_reason = "friday_no_weekend_carry"
     elif (
         managed_exit_policy == "profit_after_1h_else_1d"
         and entry_submitted_at is not None
@@ -3317,6 +3822,12 @@ def _build_exit_order_request(
             max_hold_window_minutes > 0
             and as_of >= entry_submitted_at + timedelta(minutes=max_hold_window_minutes)
         ):
+            if (
+                profit_reference_price is not None
+                and entry_reference_price is not None
+                and profit_reference_price < entry_reference_price
+            ):
+                return None, "max_hold_red_deferred"
             exit_reason = "max_holding_window_elapsed"
         else:
             return None, "exit_not_due"
@@ -3326,13 +3837,19 @@ def _build_exit_order_request(
         and as_of >= entry_submitted_at + timedelta(minutes=holding_window_minutes)
     ):
         if managed_exit_policy == "profit_capture_else_1d":
+            time_exit_reference_price = close_price or current_price
+            if (
+                time_exit_reference_price is not None
+                and entry_reference_price is not None
+                and time_exit_reference_price < entry_reference_price
+            ):
+                return None, "max_hold_red_deferred"
             exit_reason = "max_holding_window_elapsed"
         else:
             exit_reason = "holding_window_elapsed"
     else:
         return None, "exit_not_due"
 
-    asset_class = str(entry_order.get("asset_class", "")).strip().lower()
     reference_exit_price = (
         close_price
         or current_price
@@ -3351,8 +3868,9 @@ def _build_exit_order_request(
         entry_order.get("broker_id") or position.get("broker_id") or "alpaca_paper"
     ).strip().lower() or "alpaca_paper"
     try:
-        adapter = get_broker_adapter(context, broker_id)
+        adapter = get_execution_adapter(context, broker_id)
         order_request = adapter.build_exit_order_request(
+            context=context,
             symbol=broker_symbol,
             asset_class=asset_class,
             qty=raw_qty,
@@ -3363,7 +3881,7 @@ def _build_exit_order_request(
             latest_bar=latest_bar,
             usd_to_gbp=_as_float(context.state.get("fx_gbp_reference", {}).get("usd_to_gbp")),
         )
-    except BrokerAdapterError:
+    except ExecutionAdapterError:
         return None, "broker_order_build_failed"
     return (
         {

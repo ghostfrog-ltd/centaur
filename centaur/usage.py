@@ -1,26 +1,38 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .config import RuntimeConfig, SourcePricing
+from app.core.instruments import default_instrument_registry
 from .models import ApiUsageSummary, TickReport
 
 try:
     import psycopg2
+    from psycopg2 import sql
     from psycopg2.extras import RealDictCursor
 except ImportError:  # pragma: no cover
     psycopg2 = None
+    sql = None
     RealDictCursor = None
 
 
 class UsageLedger:
+    """Persistence gateway for live operations, reports, and audit trails.
+
+    PostgreSQL is the production operations store. SQLite remains available for
+    explicit local/dev use, but a configured or required Postgres store must fail
+    closed instead of silently rerouting live monitoring or control ticks.
+    """
+
     def __init__(self, *, config: RuntimeConfig) -> None:
         self.config = config
         self.db_path = config.usage_ledger_db_path
+        self.instrument_registry = default_instrument_registry()
         self.backend = "sqlite"
         self.backend_detail = str(self.db_path)
         self.fallback_reason: str | None = None
@@ -31,12 +43,21 @@ class UsageLedger:
                 self.backend = "postgres"
                 self.backend_detail = (
                     f"postgres:{self.config.database_url_source or 'configured'}"
+                    f"{self._postgres_schema_detail()}"
                 )
                 return
             except Exception as exc:  # pragma: no cover
-                if self.config.operations_db_backend_preference == "postgres":
-                    raise
+                if self._postgres_required():
+                    raise RuntimeError(
+                        "PostgreSQL operations store is required but unavailable; "
+                        "refusing SQLite fallback for live operation/monitoring."
+                    ) from exc
                 self.fallback_reason = f"{type(exc).__name__}: {exc}"
+        elif self._postgres_required():
+            raise RuntimeError(
+                "PostgreSQL operations store is required but not available; "
+                "check DATABASE_URL/POSTGRES_* settings and psycopg2 installation."
+            )
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_sqlite_schema()
@@ -322,6 +343,16 @@ class UsageLedger:
             high_price = self._to_float(bar.get("h"))
             low_price = self._to_float(bar.get("l"))
             close_price = self._to_float(bar.get("c"))
+            asset_class = str(bar.get("asset_class") or "").strip().lower()
+            if not asset_class:
+                source_text = str(source or "").strip().lower()
+                asset_class = "crypto" if "crypto" in source_text or "/" in symbol else "equity"
+            instrument = self._instrument_metadata(
+                item=bar,
+                symbol=str(symbol),
+                asset_class=asset_class,
+                source=source,
+            )
 
             rows.append(
                 {
@@ -329,6 +360,10 @@ class UsageLedger:
                     "captured_at": captured_at.isoformat(),
                     "source": source,
                     "symbol": symbol,
+                    "asset_class": asset_class,
+                    "canonical_instrument_id": instrument["canonical_instrument_id"],
+                    "venue": instrument["venue"],
+                    "venue_symbol": instrument["venue_symbol"],
                     "bar_timestamp": bar.get("t"),
                     "quote_currency": quote_currency,
                     "usd_to_gbp_rate": usd_to_gbp,
@@ -391,12 +426,21 @@ class UsageLedger:
                 high_price = self._to_float(bar.get("h"))
                 low_price = self._to_float(bar.get("l"))
                 close_price = self._to_float(bar.get("c"))
+                instrument = self._instrument_metadata(
+                    item=bar,
+                    symbol=str(symbol),
+                    asset_class=asset_class,
+                    source=source,
+                )
                 rows.append(
                     {
                         "batch_id": batch_id,
                         "captured_at": captured_at.isoformat(),
                         "source": source,
                         "asset_class": asset_class,
+                        "canonical_instrument_id": instrument["canonical_instrument_id"],
+                        "venue": instrument["venue"],
+                        "venue_symbol": instrument["venue_symbol"],
                         "symbol": symbol,
                         "timeframe": timeframe,
                         "bar_timestamp": bar.get("t"),
@@ -488,6 +532,7 @@ class UsageLedger:
         tick_id: str,
         signals: list[dict[str, Any]],
     ) -> None:
+        signals = [self._with_instrument_metadata(item) for item in signals]
         if self.backend == "postgres":
             self._record_strategy_candidate_signals_postgres(
                 tick_id=tick_id,
@@ -592,11 +637,61 @@ class UsageLedger:
         else:
             self._record_broker_account_snapshots_sqlite(rows=[row])
 
+    def record_execution_router_intent(
+        self,
+        *,
+        tick_id: str,
+        recorded_at: datetime,
+        environment: str,
+        mode: str,
+        lane: str,
+        action: str,
+        broker_id: str,
+        status: str,
+        strategy_id: str = "",
+        intended_order: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist dry-run/router intents for audit without mutating brokers."""
+        order_payload = intended_order or {}
+        symbol = str(order_payload.get("symbol") or "").strip().upper()
+        order_id = str(order_payload.get("order_id") or "").strip()
+        asset_class = str(order_payload.get("asset_class") or "").strip().lower()
+        if not asset_class:
+            asset_class = "crypto" if "/" in symbol else "equity"
+        instrument = self._instrument_metadata(
+            item=order_payload,
+            symbol=symbol,
+            asset_class=asset_class,
+            broker_id=broker_id,
+        )
+        row = {
+            "tick_id": str(tick_id),
+            "recorded_at": recorded_at.isoformat(),
+            "environment": str(environment or "").strip().lower() or "paper",
+            "mode": str(mode or "").strip().lower() or "paper",
+            "lane": str(lane or "").strip().lower(),
+            "action": str(action or "").strip().lower(),
+            "broker_id": str(broker_id or "").strip().lower(),
+            "status": str(status or "").strip().lower(),
+            "strategy_id": str(strategy_id or ""),
+            "symbol": symbol,
+            "order_id": order_id,
+            "canonical_instrument_id": instrument["canonical_instrument_id"],
+            "venue": instrument["venue"],
+            "venue_symbol": instrument["venue_symbol"],
+            "intended_order_json": self._to_json(order_payload),
+        }
+        if self.backend == "postgres":
+            self._record_execution_router_intent_postgres(row=row)
+        else:
+            self._record_execution_router_intent_sqlite(row=row)
+
     def record_shadow_trade_proposals(
         self,
         *,
         proposals: list[dict[str, Any]],
     ) -> None:
+        proposals = [self._with_instrument_metadata(item) for item in proposals]
         if self.backend == "postgres":
             self._record_shadow_trade_proposals_postgres(proposals=proposals)
         else:
@@ -610,6 +705,7 @@ class UsageLedger:
         if not outcomes:
             return 0
 
+        outcomes = [self._with_instrument_metadata(item) for item in outcomes]
         if self.backend == "postgres":
             self._record_shadow_trade_outcomes_postgres(outcomes=outcomes)
         else:
@@ -622,6 +718,12 @@ class UsageLedger:
         tick_id: str,
         captured_at: datetime,
         summaries: list[dict[str, Any]],
+        environment: str = "paper",
+        mode: str = "paper",
+        source_environment: str = "shadow",
+        broker_id: str = "alpaca_paper",
+        data_provider: str = "alpaca",
+        execution_provider: str = "shadow",
     ) -> int:
         if not summaries:
             return 0
@@ -631,6 +733,18 @@ class UsageLedger:
             row = {
                 "tick_id": tick_id,
                 "captured_at": captured_at.isoformat(),
+                "environment": str(item.get("environment") or environment or "paper"),
+                "mode": str(item.get("mode") or mode or "paper"),
+                "source_environment": str(
+                    item.get("source_environment") or source_environment or "shadow"
+                ),
+                "broker_id": str(item.get("broker_id") or broker_id or ""),
+                "data_provider": str(
+                    item.get("data_provider") or data_provider or "alpaca"
+                ),
+                "execution_provider": str(
+                    item.get("execution_provider") or execution_provider or "shadow"
+                ),
                 "strategy_id": str(item.get("strategy_id", "")),
                 "strategy_family": str(item.get("strategy_family", "")),
                 "profile_id": str(item.get("profile_id", "")),
@@ -1074,6 +1188,63 @@ class UsageLedger:
             normalized_rows.append(normalized)
         return normalized_rows
 
+    def list_recent_execution_router_intents(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_recent_execution_router_intents_postgres(limit=limit)
+        else:
+            rows = self._list_recent_execution_router_intents_sqlite(limit=limit)
+
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized = dict(row)
+            if "recorded_at" in normalized:
+                normalized["recorded_at"] = self._normalize_db_datetime_value(
+                    normalized["recorded_at"]
+                )
+            if "intended_order_json" in normalized:
+                normalized["intended_order_json"] = self._from_json(
+                    normalized["intended_order_json"],
+                    default={},
+                )
+            normalized_rows.append(normalized)
+        return normalized_rows
+
+    def get_broker_account_high_water(
+        self,
+        *,
+        broker_id: str,
+        since: datetime,
+    ) -> dict[str, Any] | None:
+        """Return the highest recorded equity for a broker since a session start.
+
+        The trailing-drawdown observer uses this as read-only evidence. It does
+        not mutate protection state or trading gates; the persisted tick snapshot
+        records what a future high-water guard would have done.
+        """
+        normalized_broker_id = str(broker_id).strip().lower()
+        if not normalized_broker_id:
+            return None
+        if self.backend == "postgres":
+            row = self._get_broker_account_high_water_postgres(
+                broker_id=normalized_broker_id,
+                since=since,
+            )
+        else:
+            row = self._get_broker_account_high_water_sqlite(
+                broker_id=normalized_broker_id,
+                since=since,
+            )
+        if row is None:
+            return None
+        normalized = dict(row)
+        if "captured_at" in normalized:
+            normalized["captured_at"] = self._normalize_db_datetime_value(
+                normalized["captured_at"]
+            )
+        if "raw_json" in normalized:
+            normalized["raw_json"] = self._from_json(normalized["raw_json"], default={})
+        return normalized
+
     def get_first_paper_trade_order(self, *, broker_id: str | None = None) -> dict[str, Any] | None:
         if self.backend == "postgres":
             row = self._get_first_paper_trade_order_postgres(broker_id=broker_id)
@@ -1206,6 +1377,16 @@ class UsageLedger:
         if psycopg2 is None:
             return False
         return True
+
+    def _postgres_required(self) -> bool:
+        preference = self.config.operations_db_backend_preference
+        if self.config.paper_execution_enabled or self.config.live_execution_enabled:
+            return True
+        if preference == "postgres":
+            return True
+        if preference == "sqlite":
+            return False
+        return bool(self.config.postgres_configured)
 
     def _resolve_estimated_cost(
         self,
@@ -1665,6 +1846,12 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_api_request_events_tick_usage
+                ON api_request_events (tick_id, usage_date, source)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS api_daily_usage (
                     usage_date TEXT NOT NULL,
                     source TEXT NOT NULL,
@@ -1699,6 +1886,52 @@ class UsageLedger:
                     step_profiles_json TEXT NOT NULL DEFAULT '[]',
                     state_snapshot_json TEXT NOT NULL DEFAULT '{}'
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_control_tick_runs_started_at
+                ON control_tick_runs (started_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS execution_router_intents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tick_id TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    environment TEXT NOT NULL DEFAULT 'paper',
+                    mode TEXT NOT NULL DEFAULT 'paper',
+                    lane TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    broker_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    strategy_id TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    order_id TEXT NOT NULL DEFAULT '',
+                    canonical_instrument_id TEXT NOT NULL DEFAULT '',
+                    venue TEXT NOT NULL DEFAULT '',
+                    venue_symbol TEXT NOT NULL DEFAULT '',
+                    intended_order_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_execution_router_intents_recorded
+                ON execution_router_intents (recorded_at DESC, id DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_execution_router_intents_mode_status
+                ON execution_router_intents (mode, status, recorded_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_execution_router_intents_tick
+                ON execution_router_intents (tick_id, recorded_at DESC)
                 """
             )
             connection.execute(
@@ -1795,6 +2028,19 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_broker_account_snapshots_captured
+                ON broker_account_snapshots (captured_at DESC, broker_id ASC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_broker_account_snapshots_high_water
+                ON broker_account_snapshots (broker_id, equity DESC, captured_at ASC)
+                WHERE equity IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS market_data_latest_bars (
                     tick_id TEXT NOT NULL,
                     captured_at TEXT NOT NULL,
@@ -1818,6 +2064,10 @@ class UsageLedger:
                 table_name="market_data_latest_bars",
                 columns={
                     "quote_currency": "TEXT NOT NULL DEFAULT 'USD'",
+                    "asset_class": "TEXT NOT NULL DEFAULT ''",
+                    "canonical_instrument_id": "TEXT NOT NULL DEFAULT ''",
+                    "venue": "TEXT NOT NULL DEFAULT ''",
+                    "venue_symbol": "TEXT NOT NULL DEFAULT ''",
                     "usd_to_gbp_rate": "REAL",
                     "open_price_gbp": "REAL",
                     "high_price_gbp": "REAL",
@@ -1833,11 +2083,27 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_market_data_latest_bars_window
+                ON market_data_latest_bars (source, symbol, captured_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_market_data_latest_bars_instrument
+                ON market_data_latest_bars (canonical_instrument_id, source, captured_at)
+                WHERE canonical_instrument_id <> ''
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS market_data_historical_bars (
                     batch_id TEXT NOT NULL,
                     captured_at TEXT NOT NULL,
                     source TEXT NOT NULL,
                     asset_class TEXT NOT NULL,
+                    canonical_instrument_id TEXT NOT NULL DEFAULT '',
+                    venue TEXT NOT NULL DEFAULT '',
+                    venue_symbol TEXT NOT NULL DEFAULT '',
                     symbol TEXT NOT NULL,
                     timeframe TEXT NOT NULL,
                     bar_timestamp TEXT NOT NULL,
@@ -1859,10 +2125,26 @@ class UsageLedger:
                 )
                 """
             )
+            self._ensure_sqlite_columns(
+                connection,
+                table_name="market_data_historical_bars",
+                columns={
+                    "canonical_instrument_id": "TEXT NOT NULL DEFAULT ''",
+                    "venue": "TEXT NOT NULL DEFAULT ''",
+                    "venue_symbol": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_market_data_historical_bars_symbol_timeframe_timestamp
                 ON market_data_historical_bars (symbol, timeframe, bar_timestamp)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_market_data_historical_bars_instrument_timeframe
+                ON market_data_historical_bars (canonical_instrument_id, timeframe, bar_timestamp)
+                WHERE canonical_instrument_id <> ''
                 """
             )
             connection.execute(
@@ -1886,6 +2168,12 @@ class UsageLedger:
                 """
                 CREATE INDEX IF NOT EXISTS idx_fx_reference_rates_fetched_at
                 ON fx_reference_rates (fetched_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_fx_reference_rates_source_fetched
+                ON fx_reference_rates (source, fetched_at DESC)
                 """
             )
             connection.execute(
@@ -1959,10 +2247,32 @@ class UsageLedger:
                 )
                 """
             )
+            self._ensure_sqlite_columns(
+                connection,
+                table_name="strategy_candidate_signals",
+                columns={
+                    "canonical_instrument_id": "TEXT NOT NULL DEFAULT ''",
+                    "venue": "TEXT NOT NULL DEFAULT ''",
+                    "venue_symbol": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_strategy_candidate_signals_tick_id_score
                 ON strategy_candidate_signals (tick_id, signal_score)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_candidate_signals_tick_strategy
+                ON strategy_candidate_signals (tick_id, strategy_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_candidate_signals_instrument
+                ON strategy_candidate_signals (canonical_instrument_id, strategy_id, tick_id)
+                WHERE canonical_instrument_id <> ''
                 """
             )
             connection.execute(
@@ -1973,7 +2283,12 @@ class UsageLedger:
                     captured_at TEXT NOT NULL,
                     submitted_at TEXT,
                     updated_at TEXT,
+                    environment TEXT NOT NULL DEFAULT 'paper',
+                    mode TEXT NOT NULL DEFAULT 'paper',
+                    source_environment TEXT NOT NULL DEFAULT 'shadow',
                     broker_id TEXT NOT NULL DEFAULT 'alpaca_paper',
+                    data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                    execution_provider TEXT NOT NULL DEFAULT 'alpaca_paper',
                     client_order_id TEXT NOT NULL DEFAULT '',
                     proposal_id TEXT NOT NULL DEFAULT '',
                     strategy_id TEXT NOT NULL DEFAULT '',
@@ -2004,7 +2319,15 @@ class UsageLedger:
                 connection,
                 table_name="paper_trade_orders",
                 columns={
+                    "environment": "TEXT NOT NULL DEFAULT 'paper'",
+                    "mode": "TEXT NOT NULL DEFAULT 'paper'",
+                    "source_environment": "TEXT NOT NULL DEFAULT 'shadow'",
                     "broker_id": "TEXT NOT NULL DEFAULT 'alpaca_paper'",
+                    "data_provider": "TEXT NOT NULL DEFAULT 'alpaca'",
+                    "execution_provider": "TEXT NOT NULL DEFAULT 'alpaca_paper'",
+                    "canonical_instrument_id": "TEXT NOT NULL DEFAULT ''",
+                    "venue": "TEXT NOT NULL DEFAULT ''",
+                    "venue_symbol": "TEXT NOT NULL DEFAULT ''",
                 },
             )
             connection.execute(
@@ -2021,10 +2344,73 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_activity
+                ON paper_trade_orders (COALESCE(submitted_at, captured_at), order_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_broker_activity
+                ON paper_trade_orders (broker_id, COALESCE(submitted_at, captured_at), order_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_env_broker_activity
+                ON paper_trade_orders (environment, mode, broker_id, COALESCE(submitted_at, captured_at))
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_instrument_activity
+                ON paper_trade_orders (canonical_instrument_id, venue, COALESCE(submitted_at, captured_at))
+                WHERE canonical_instrument_id <> ''
+                """
+            )
+            self._backfill_sqlite_instrument_metadata(
+                connection,
+                table_name="paper_trade_orders",
+                timestamp_column="COALESCE(submitted_at, captured_at)",
+                has_broker=True,
+            )
+            connection.execute(
+                """
+                UPDATE paper_trade_orders
+                SET environment = 'live',
+                    mode = 'live',
+                    source_environment = CASE
+                        WHEN proposal_id <> '' THEN 'paper'
+                        ELSE 'live'
+                    END,
+                    execution_provider = broker_id
+                WHERE broker_id LIKE '%_live'
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_strategy_side_status
+                ON paper_trade_orders (strategy_id, side, status, submitted_at)
+                WHERE proposal_id <> ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_proposal_side_submitted
+                ON paper_trade_orders (proposal_id, side, submitted_at)
+                WHERE proposal_id <> ''
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS shadow_trade_proposals (
                     proposal_id TEXT PRIMARY KEY,
                     tick_id TEXT NOT NULL,
                     proposed_at TEXT NOT NULL,
+                    environment TEXT NOT NULL DEFAULT 'paper',
+                    mode TEXT NOT NULL DEFAULT 'paper',
+                    source_environment TEXT NOT NULL DEFAULT 'shadow',
+                    data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                    execution_provider TEXT NOT NULL DEFAULT 'shadow',
                     source TEXT NOT NULL,
                     symbol TEXT NOT NULL,
                     asset_class TEXT NOT NULL,
@@ -2061,6 +2447,14 @@ class UsageLedger:
                     "signal_score": "REAL NOT NULL DEFAULT 0",
                     "signal_confidence": "REAL NOT NULL DEFAULT 0",
                     "rationale": "TEXT NOT NULL DEFAULT ''",
+                    "environment": "TEXT NOT NULL DEFAULT 'paper'",
+                    "mode": "TEXT NOT NULL DEFAULT 'paper'",
+                    "source_environment": "TEXT NOT NULL DEFAULT 'shadow'",
+                    "data_provider": "TEXT NOT NULL DEFAULT 'alpaca'",
+                    "execution_provider": "TEXT NOT NULL DEFAULT 'shadow'",
+                    "canonical_instrument_id": "TEXT NOT NULL DEFAULT ''",
+                    "venue": "TEXT NOT NULL DEFAULT ''",
+                    "venue_symbol": "TEXT NOT NULL DEFAULT ''",
                 },
             )
             connection.execute(
@@ -2071,9 +2465,46 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_proposed_at
+                ON shadow_trade_proposals (proposed_at DESC, proposal_id DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_strategy_training
+                ON shadow_trade_proposals (strategy_id, proposed_at)
+                WHERE strategy_id <> ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_env_source
+                ON shadow_trade_proposals (environment, source_environment, mode, proposed_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_instrument
+                ON shadow_trade_proposals (canonical_instrument_id, venue, proposed_at)
+                WHERE canonical_instrument_id <> ''
+                """
+            )
+            self._backfill_sqlite_instrument_metadata(
+                connection,
+                table_name="shadow_trade_proposals",
+                timestamp_column="proposed_at",
+                has_broker=False,
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS shadow_trade_outcomes (
                     proposal_id TEXT NOT NULL,
                     checkpoint_code TEXT NOT NULL,
+                    environment TEXT NOT NULL DEFAULT 'paper',
+                    mode TEXT NOT NULL DEFAULT 'paper',
+                    source_environment TEXT NOT NULL DEFAULT 'shadow',
+                    data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                    execution_provider TEXT NOT NULL DEFAULT 'shadow',
                     checkpoint_minutes INTEGER NOT NULL DEFAULT 0,
                     due_at TEXT NOT NULL,
                     evaluated_at TEXT,
@@ -2099,9 +2530,44 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_outcomes_evaluated_proposal
+                ON shadow_trade_outcomes (proposal_id, checkpoint_minutes)
+                WHERE evaluated_at IS NOT NULL
+                """
+            )
+            self._ensure_sqlite_columns(
+                connection,
+                table_name="shadow_trade_outcomes",
+                columns={
+                    "environment": "TEXT NOT NULL DEFAULT 'paper'",
+                    "mode": "TEXT NOT NULL DEFAULT 'paper'",
+                    "source_environment": "TEXT NOT NULL DEFAULT 'shadow'",
+                    "data_provider": "TEXT NOT NULL DEFAULT 'alpaca'",
+                    "execution_provider": "TEXT NOT NULL DEFAULT 'shadow'",
+                    "canonical_instrument_id": "TEXT NOT NULL DEFAULT ''",
+                    "venue": "TEXT NOT NULL DEFAULT ''",
+                    "venue_symbol": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_outcomes_instrument_due
+                ON shadow_trade_outcomes (canonical_instrument_id, venue, due_at)
+                WHERE canonical_instrument_id <> ''
+                """
+            )
+            self._backfill_sqlite_shadow_outcome_instrument_metadata(connection)
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS strategy_fitness_snapshots (
                     tick_id TEXT NOT NULL,
                     captured_at TEXT NOT NULL,
+                    environment TEXT NOT NULL DEFAULT 'paper',
+                    mode TEXT NOT NULL DEFAULT 'paper',
+                    source_environment TEXT NOT NULL DEFAULT 'shadow',
+                    broker_id TEXT NOT NULL DEFAULT 'alpaca_paper',
+                    data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                    execution_provider TEXT NOT NULL DEFAULT 'shadow',
                     strategy_id TEXT NOT NULL,
                     strategy_family TEXT NOT NULL,
                     profile_id TEXT NOT NULL,
@@ -2145,10 +2611,34 @@ class UsageLedger:
                 ON strategy_fitness_snapshots (captured_at, fitness_rank, composite_fitness_score)
                 """
             )
+            self._ensure_sqlite_columns(
+                connection,
+                table_name="strategy_fitness_snapshots",
+                columns={
+                    "environment": "TEXT NOT NULL DEFAULT 'paper'",
+                    "mode": "TEXT NOT NULL DEFAULT 'paper'",
+                    "source_environment": "TEXT NOT NULL DEFAULT 'shadow'",
+                    "broker_id": "TEXT NOT NULL DEFAULT 'alpaca_paper'",
+                    "data_provider": "TEXT NOT NULL DEFAULT 'alpaca'",
+                    "execution_provider": "TEXT NOT NULL DEFAULT 'shadow'",
+                },
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_fitness_snapshots_env_source
+                ON strategy_fitness_snapshots (environment, source_environment, mode, captured_at)
+                """
+            )
 
     def _ensure_postgres_schema(self) -> None:
-        with self._connect_postgres() as connection:
+        with self._connect_postgres(apply_schema=False) as connection:
             with connection.cursor() as cursor:
+                self._ensure_postgres_namespace(cursor)
+                # Status/report commands can start together; serialize bootstrap DDL
+                # so concurrent CREATE INDEX IF NOT EXISTS calls do not race.
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('centaur_usage_schema'))"
+                )
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS api_request_events (
@@ -2180,6 +2670,12 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_api_request_events_usage_date_source
                     ON api_request_events (usage_date, source)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_api_request_events_tick_usage
+                    ON api_request_events (tick_id, usage_date, source)
                     """
                 )
                 cursor.execute(
@@ -2218,6 +2714,52 @@ class UsageLedger:
                         step_profiles_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                         state_snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_control_tick_runs_started_at
+                    ON control_tick_runs (started_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS execution_router_intents (
+                        id BIGSERIAL PRIMARY KEY,
+                        tick_id TEXT NOT NULL,
+                        recorded_at TIMESTAMPTZ NOT NULL,
+                        environment TEXT NOT NULL DEFAULT 'paper',
+                        mode TEXT NOT NULL DEFAULT 'paper',
+                        lane TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        broker_id TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT '',
+                        strategy_id TEXT NOT NULL DEFAULT '',
+                        symbol TEXT NOT NULL DEFAULT '',
+                        order_id TEXT NOT NULL DEFAULT '',
+                        canonical_instrument_id TEXT NOT NULL DEFAULT '',
+                        venue TEXT NOT NULL DEFAULT '',
+                        venue_symbol TEXT NOT NULL DEFAULT '',
+                        intended_order_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_execution_router_intents_recorded
+                    ON execution_router_intents (recorded_at DESC, id DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_execution_router_intents_mode_status
+                    ON execution_router_intents (mode, status, recorded_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_execution_router_intents_tick
+                    ON execution_router_intents (tick_id, recorded_at DESC)
                     """
                 )
                 cursor.execute(
@@ -2314,6 +2856,19 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_broker_account_snapshots_captured
+                    ON broker_account_snapshots (captured_at DESC, broker_id ASC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_broker_account_snapshots_high_water
+                    ON broker_account_snapshots (broker_id, equity DESC, captured_at ASC)
+                    WHERE equity IS NOT NULL
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS market_data_latest_bars (
                         tick_id TEXT NOT NULL,
                         captured_at TIMESTAMPTZ NOT NULL,
@@ -2336,6 +2891,30 @@ class UsageLedger:
                     """
                     ALTER TABLE market_data_latest_bars
                     ADD COLUMN IF NOT EXISTS quote_currency TEXT NOT NULL DEFAULT 'USD'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE market_data_latest_bars
+                    ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE market_data_latest_bars
+                    ADD COLUMN IF NOT EXISTS canonical_instrument_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE market_data_latest_bars
+                    ADD COLUMN IF NOT EXISTS venue TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE market_data_latest_bars
+                    ADD COLUMN IF NOT EXISTS venue_symbol TEXT NOT NULL DEFAULT ''
                     """
                 )
                 cursor.execute(
@@ -2376,11 +2955,27 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_market_data_latest_bars_window
+                    ON market_data_latest_bars (source, symbol, captured_at)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_market_data_latest_bars_instrument
+                    ON market_data_latest_bars (canonical_instrument_id, source, captured_at DESC)
+                    WHERE canonical_instrument_id <> ''
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS market_data_historical_bars (
                         batch_id TEXT NOT NULL,
                         captured_at TIMESTAMPTZ NOT NULL,
                         source TEXT NOT NULL,
                         asset_class TEXT NOT NULL,
+                        canonical_instrument_id TEXT NOT NULL DEFAULT '',
+                        venue TEXT NOT NULL DEFAULT '',
+                        venue_symbol TEXT NOT NULL DEFAULT '',
                         symbol TEXT NOT NULL,
                         timeframe TEXT NOT NULL,
                         bar_timestamp TIMESTAMPTZ NOT NULL,
@@ -2404,8 +2999,33 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    ALTER TABLE market_data_historical_bars
+                    ADD COLUMN IF NOT EXISTS canonical_instrument_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE market_data_historical_bars
+                    ADD COLUMN IF NOT EXISTS venue TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE market_data_historical_bars
+                    ADD COLUMN IF NOT EXISTS venue_symbol TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_market_data_historical_bars_symbol_timeframe_timestamp
                     ON market_data_historical_bars (symbol, timeframe, bar_timestamp)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_market_data_historical_bars_instrument_timeframe
+                    ON market_data_historical_bars (canonical_instrument_id, timeframe, bar_timestamp DESC)
+                    WHERE canonical_instrument_id <> ''
                     """
                 )
                 cursor.execute(
@@ -2429,6 +3049,12 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_fx_reference_rates_fetched_at
                     ON fx_reference_rates (fetched_at)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_fx_reference_rates_source_fetched
+                    ON fx_reference_rates (source, fetched_at DESC)
                     """
                 )
                 cursor.execute(
@@ -2504,8 +3130,39 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    ALTER TABLE strategy_candidate_signals
+                    ADD COLUMN IF NOT EXISTS canonical_instrument_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_candidate_signals
+                    ADD COLUMN IF NOT EXISTS venue TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_candidate_signals
+                    ADD COLUMN IF NOT EXISTS venue_symbol TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_strategy_candidate_signals_tick_id_score
                     ON strategy_candidate_signals (tick_id, signal_score DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_candidate_signals_tick_strategy
+                    ON strategy_candidate_signals (tick_id, strategy_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_candidate_signals_instrument
+                    ON strategy_candidate_signals (canonical_instrument_id, strategy_id, tick_id)
+                    WHERE canonical_instrument_id <> ''
                     """
                 )
                 cursor.execute(
@@ -2516,7 +3173,12 @@ class UsageLedger:
                         captured_at TIMESTAMPTZ NOT NULL,
                         submitted_at TIMESTAMPTZ,
                         updated_at TIMESTAMPTZ,
+                        environment TEXT NOT NULL DEFAULT 'paper',
+                        mode TEXT NOT NULL DEFAULT 'paper',
+                        source_environment TEXT NOT NULL DEFAULT 'shadow',
                         broker_id TEXT NOT NULL DEFAULT 'alpaca_paper',
+                        data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                        execution_provider TEXT NOT NULL DEFAULT 'alpaca_paper',
                         client_order_id TEXT NOT NULL DEFAULT '',
                         proposal_id TEXT NOT NULL DEFAULT '',
                         strategy_id TEXT NOT NULL DEFAULT '',
@@ -2546,7 +3208,55 @@ class UsageLedger:
                 cursor.execute(
                     """
                     ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS source_environment TEXT NOT NULL DEFAULT 'shadow'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
                     ADD COLUMN IF NOT EXISTS broker_id TEXT NOT NULL DEFAULT 'alpaca_paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS data_provider TEXT NOT NULL DEFAULT 'alpaca'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS execution_provider TEXT NOT NULL DEFAULT 'alpaca_paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS canonical_instrument_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS venue TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE paper_trade_orders
+                    ADD COLUMN IF NOT EXISTS venue_symbol TEXT NOT NULL DEFAULT ''
                     """
                 )
                 cursor.execute(
@@ -2563,10 +3273,72 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_activity
+                    ON paper_trade_orders ((COALESCE(submitted_at, captured_at)), order_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_broker_activity
+                    ON paper_trade_orders (broker_id, (COALESCE(submitted_at, captured_at)), order_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_env_broker_activity
+                    ON paper_trade_orders (environment, mode, broker_id, (COALESCE(submitted_at, captured_at)) DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_instrument_activity
+                    ON paper_trade_orders (canonical_instrument_id, venue, (COALESCE(submitted_at, captured_at)) DESC)
+                    WHERE canonical_instrument_id <> ''
+                    """
+                )
+                self._backfill_postgres_instrument_metadata(
+                    cursor,
+                    table_name="paper_trade_orders",
+                    has_broker=True,
+                )
+                cursor.execute(
+                    """
+                    UPDATE paper_trade_orders
+                    SET environment = 'live',
+                        mode = 'live',
+                        source_environment = CASE
+                            WHEN proposal_id <> '' THEN 'paper'
+                            ELSE 'live'
+                        END,
+                        execution_provider = broker_id
+                    WHERE broker_id LIKE '%_live'
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_strategy_side_status
+                    ON paper_trade_orders (strategy_id, side, status, submitted_at DESC)
+                    WHERE proposal_id <> ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_paper_trade_orders_proposal_side_submitted
+                    ON paper_trade_orders (proposal_id, side, submitted_at DESC)
+                    WHERE proposal_id <> ''
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS shadow_trade_proposals (
                         proposal_id TEXT PRIMARY KEY,
                         tick_id TEXT NOT NULL,
                         proposed_at TIMESTAMPTZ NOT NULL,
+                        environment TEXT NOT NULL DEFAULT 'paper',
+                        mode TEXT NOT NULL DEFAULT 'paper',
+                        source_environment TEXT NOT NULL DEFAULT 'shadow',
+                        data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                        execution_provider TEXT NOT NULL DEFAULT 'shadow',
                         source TEXT NOT NULL,
                         symbol TEXT NOT NULL,
                         asset_class TEXT NOT NULL,
@@ -2591,6 +3363,54 @@ class UsageLedger:
                         note TEXT NOT NULL DEFAULT '',
                         raw_json JSONB NOT NULL DEFAULT '{}'::jsonb
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS source_environment TEXT NOT NULL DEFAULT 'shadow'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS data_provider TEXT NOT NULL DEFAULT 'alpaca'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS execution_provider TEXT NOT NULL DEFAULT 'shadow'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS canonical_instrument_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS venue TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS venue_symbol TEXT NOT NULL DEFAULT ''
                     """
                 )
                 cursor.execute(
@@ -2637,9 +3457,45 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_proposed_at
+                    ON shadow_trade_proposals (proposed_at DESC, proposal_id DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_strategy_training
+                    ON shadow_trade_proposals (strategy_id, proposed_at)
+                    WHERE strategy_id <> ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_env_source
+                    ON shadow_trade_proposals (environment, source_environment, mode, proposed_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_instrument
+                    ON shadow_trade_proposals (canonical_instrument_id, venue, proposed_at DESC)
+                    WHERE canonical_instrument_id <> ''
+                    """
+                )
+                self._backfill_postgres_instrument_metadata(
+                    cursor,
+                    table_name="shadow_trade_proposals",
+                    has_broker=False,
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS shadow_trade_outcomes (
                         proposal_id TEXT NOT NULL,
                         checkpoint_code TEXT NOT NULL,
+                        environment TEXT NOT NULL DEFAULT 'paper',
+                        mode TEXT NOT NULL DEFAULT 'paper',
+                        source_environment TEXT NOT NULL DEFAULT 'shadow',
+                        data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                        execution_provider TEXT NOT NULL DEFAULT 'shadow',
                         checkpoint_minutes INTEGER NOT NULL DEFAULT 0,
                         due_at TIMESTAMPTZ NOT NULL,
                         evaluated_at TIMESTAMPTZ,
@@ -2665,9 +3521,78 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_outcomes_evaluated_proposal
+                    ON shadow_trade_outcomes (proposal_id, checkpoint_minutes)
+                    WHERE evaluated_at IS NOT NULL
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS source_environment TEXT NOT NULL DEFAULT 'shadow'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS data_provider TEXT NOT NULL DEFAULT 'alpaca'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS execution_provider TEXT NOT NULL DEFAULT 'shadow'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS canonical_instrument_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS venue TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_outcomes
+                    ADD COLUMN IF NOT EXISTS venue_symbol TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_outcomes_instrument_due
+                    ON shadow_trade_outcomes (canonical_instrument_id, venue, due_at)
+                    WHERE canonical_instrument_id <> ''
+                    """
+                )
+                self._backfill_postgres_shadow_outcome_instrument_metadata(cursor)
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS strategy_fitness_snapshots (
                         tick_id TEXT NOT NULL,
                         captured_at TIMESTAMPTZ NOT NULL,
+                        environment TEXT NOT NULL DEFAULT 'paper',
+                        mode TEXT NOT NULL DEFAULT 'paper',
+                        source_environment TEXT NOT NULL DEFAULT 'shadow',
+                        broker_id TEXT NOT NULL DEFAULT 'alpaca_paper',
+                        data_provider TEXT NOT NULL DEFAULT 'alpaca',
+                        execution_provider TEXT NOT NULL DEFAULT 'shadow',
                         strategy_id TEXT NOT NULL,
                         strategy_family TEXT NOT NULL,
                         profile_id TEXT NOT NULL,
@@ -2709,6 +3634,48 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_strategy_fitness_snapshots_rank
                     ON strategy_fitness_snapshots (captured_at DESC, fitness_rank, composite_fitness_score DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_fitness_snapshots
+                    ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_fitness_snapshots
+                    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_fitness_snapshots
+                    ADD COLUMN IF NOT EXISTS source_environment TEXT NOT NULL DEFAULT 'shadow'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_fitness_snapshots
+                    ADD COLUMN IF NOT EXISTS broker_id TEXT NOT NULL DEFAULT 'alpaca_paper'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_fitness_snapshots
+                    ADD COLUMN IF NOT EXISTS data_provider TEXT NOT NULL DEFAULT 'alpaca'
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE strategy_fitness_snapshots
+                    ADD COLUMN IF NOT EXISTS execution_provider TEXT NOT NULL DEFAULT 'shadow'
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_fitness_snapshots_env_source
+                    ON strategy_fitness_snapshots (environment, source_environment, mode, captured_at DESC)
                     """
                 )
 
@@ -2978,6 +3945,65 @@ class UsageLedger:
                     ),
                 )
 
+    def _record_execution_router_intent_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                INSERT INTO execution_router_intents (
+                    tick_id, recorded_at, environment, mode, lane, action,
+                    broker_id, status, strategy_id, symbol, order_id,
+                    canonical_instrument_id, venue, venue_symbol, intended_order_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["tick_id"],
+                    row["recorded_at"],
+                    row["environment"],
+                    row["mode"],
+                    row["lane"],
+                    row["action"],
+                    row["broker_id"],
+                    row["status"],
+                    row["strategy_id"],
+                    row["symbol"],
+                    row["order_id"],
+                    row["canonical_instrument_id"],
+                    row["venue"],
+                    row["venue_symbol"],
+                    row["intended_order_json"],
+                ),
+            )
+
+    def _record_execution_router_intent_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO execution_router_intents (
+                        tick_id, recorded_at, environment, mode, lane, action,
+                        broker_id, status, strategy_id, symbol, order_id,
+                        canonical_instrument_id, venue, venue_symbol, intended_order_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        row["tick_id"],
+                        row["recorded_at"],
+                        row["environment"],
+                        row["mode"],
+                        row["lane"],
+                        row["action"],
+                        row["broker_id"],
+                        row["status"],
+                        row["strategy_id"],
+                        row["symbol"],
+                        row["order_id"],
+                        row["canonical_instrument_id"],
+                        row["venue"],
+                        row["venue_symbol"],
+                        row["intended_order_json"],
+                    ),
+                )
+
     def _record_latest_bars_sqlite(self, rows: list[dict[str, Any]]) -> None:
         with self._connect_sqlite() as connection:
             connection.executemany(
@@ -2987,6 +4013,10 @@ class UsageLedger:
                     captured_at,
                     source,
                     symbol,
+                    asset_class,
+                    canonical_instrument_id,
+                    venue,
+                    venue_symbol,
                     bar_timestamp,
                     quote_currency,
                     usd_to_gbp_rate,
@@ -3002,9 +4032,13 @@ class UsageLedger:
                     trade_count,
                     vwap,
                     raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tick_id, source, symbol) DO UPDATE SET
                     captured_at = excluded.captured_at,
+                    asset_class = excluded.asset_class,
+                    canonical_instrument_id = excluded.canonical_instrument_id,
+                    venue = excluded.venue,
+                    venue_symbol = excluded.venue_symbol,
                     bar_timestamp = excluded.bar_timestamp,
                     quote_currency = excluded.quote_currency,
                     usd_to_gbp_rate = excluded.usd_to_gbp_rate,
@@ -3027,6 +4061,10 @@ class UsageLedger:
                         row["captured_at"],
                         row["source"],
                         row["symbol"],
+                        row["asset_class"],
+                        row["canonical_instrument_id"],
+                        row["venue"],
+                        row["venue_symbol"],
                         row["bar_timestamp"],
                         row["quote_currency"],
                         row["usd_to_gbp_rate"],
@@ -3057,6 +4095,10 @@ class UsageLedger:
                         captured_at,
                         source,
                         symbol,
+                        asset_class,
+                        canonical_instrument_id,
+                        venue,
+                        venue_symbol,
                         bar_timestamp,
                         quote_currency,
                         usd_to_gbp_rate,
@@ -3073,10 +4115,14 @@ class UsageLedger:
                         vwap,
                         raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(tick_id, source, symbol) DO UPDATE SET
                         captured_at = EXCLUDED.captured_at,
+                        asset_class = EXCLUDED.asset_class,
+                        canonical_instrument_id = EXCLUDED.canonical_instrument_id,
+                        venue = EXCLUDED.venue,
+                        venue_symbol = EXCLUDED.venue_symbol,
                         bar_timestamp = EXCLUDED.bar_timestamp,
                         quote_currency = EXCLUDED.quote_currency,
                         usd_to_gbp_rate = EXCLUDED.usd_to_gbp_rate,
@@ -3099,6 +4145,10 @@ class UsageLedger:
                             row["captured_at"],
                             row["source"],
                             row["symbol"],
+                            row["asset_class"],
+                            row["canonical_instrument_id"],
+                            row["venue"],
+                            row["venue_symbol"],
                             row["bar_timestamp"],
                             row["quote_currency"],
                             row["usd_to_gbp_rate"],
@@ -3128,6 +4178,9 @@ class UsageLedger:
                     captured_at,
                     source,
                     asset_class,
+                    canonical_instrument_id,
+                    venue,
+                    venue_symbol,
                     symbol,
                     timeframe,
                     bar_timestamp,
@@ -3145,11 +4198,14 @@ class UsageLedger:
                     trade_count,
                     vwap,
                     raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, symbol, timeframe, bar_timestamp) DO UPDATE SET
                     batch_id = excluded.batch_id,
                     captured_at = excluded.captured_at,
                     asset_class = excluded.asset_class,
+                    canonical_instrument_id = excluded.canonical_instrument_id,
+                    venue = excluded.venue,
+                    venue_symbol = excluded.venue_symbol,
                     quote_currency = excluded.quote_currency,
                     usd_to_gbp_rate = excluded.usd_to_gbp_rate,
                     open_price = excluded.open_price,
@@ -3171,6 +4227,9 @@ class UsageLedger:
                         row["captured_at"],
                         row["source"],
                         row["asset_class"],
+                        row["canonical_instrument_id"],
+                        row["venue"],
+                        row["venue_symbol"],
                         row["symbol"],
                         row["timeframe"],
                         row["bar_timestamp"],
@@ -3203,6 +4262,9 @@ class UsageLedger:
                         captured_at,
                         source,
                         asset_class,
+                        canonical_instrument_id,
+                        venue,
+                        venue_symbol,
                         symbol,
                         timeframe,
                         bar_timestamp,
@@ -3221,12 +4283,15 @@ class UsageLedger:
                         vwap,
                         raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(source, symbol, timeframe, bar_timestamp) DO UPDATE SET
                         batch_id = EXCLUDED.batch_id,
                         captured_at = EXCLUDED.captured_at,
                         asset_class = EXCLUDED.asset_class,
+                        canonical_instrument_id = EXCLUDED.canonical_instrument_id,
+                        venue = EXCLUDED.venue,
+                        venue_symbol = EXCLUDED.venue_symbol,
                         quote_currency = EXCLUDED.quote_currency,
                         usd_to_gbp_rate = EXCLUDED.usd_to_gbp_rate,
                         open_price = EXCLUDED.open_price,
@@ -3248,6 +4313,9 @@ class UsageLedger:
                             row["captured_at"],
                             row["source"],
                             row["asset_class"],
+                            row["canonical_instrument_id"],
+                            row["venue"],
+                            row["venue_symbol"],
                             row["symbol"],
                             row["timeframe"],
                             row["bar_timestamp"],
@@ -3398,7 +4466,9 @@ class UsageLedger:
         with self._connect_sqlite() as connection:
             rows = connection.execute(
                 f"""
-                SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
+                SELECT tick_id, source, symbol, asset_class,
+                       canonical_instrument_id, venue, venue_symbol,
+                       bar_timestamp, quote_currency,
                        open_price, high_price, low_price, close_price,
                        open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
                        volume, trade_count, vwap
@@ -3423,7 +4493,9 @@ class UsageLedger:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
                     """
-                    SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
+                    SELECT tick_id, source, symbol, asset_class,
+                           canonical_instrument_id, venue, venue_symbol,
+                           bar_timestamp, quote_currency,
                            open_price, high_price, low_price, close_price,
                            open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
                            volume, trade_count, vwap
@@ -3688,16 +4760,20 @@ class UsageLedger:
                 """
                 INSERT INTO strategy_candidate_signals (
                     tick_id, strategy_id, strategy_family, profile_id, source, symbol,
-                    asset_class, direction, signal_rank, signal_score, confidence,
+                    asset_class, canonical_instrument_id, venue, venue_symbol,
+                    direction, signal_rank, signal_score, confidence,
                     entry_price, entry_price_gbp, stop_loss_price, stop_loss_price_gbp,
                     target_price, target_price_gbp, risk_pct, target_return_pct,
                     holding_window_code, holding_window_minutes, movement_pct,
                     discovery_score, rationale, note, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tick_id, strategy_id, source, symbol) DO UPDATE SET
                     strategy_family = excluded.strategy_family,
                     profile_id = excluded.profile_id,
                     asset_class = excluded.asset_class,
+                    canonical_instrument_id = excluded.canonical_instrument_id,
+                    venue = excluded.venue,
+                    venue_symbol = excluded.venue_symbol,
                     direction = excluded.direction,
                     signal_rank = excluded.signal_rank,
                     signal_score = excluded.signal_score,
@@ -3727,6 +4803,9 @@ class UsageLedger:
                         item["source"],
                         item["symbol"],
                         item["asset_class"],
+                        item.get("canonical_instrument_id", ""),
+                        item.get("venue", ""),
+                        item.get("venue_symbol", item.get("symbol", "")),
                         item.get("direction", "long"),
                         item.get("signal_rank", 0),
                         item.get("signal_score", 0),
@@ -3766,18 +4845,22 @@ class UsageLedger:
                     """
                     INSERT INTO strategy_candidate_signals (
                         tick_id, strategy_id, strategy_family, profile_id, source, symbol,
-                        asset_class, direction, signal_rank, signal_score, confidence,
+                        asset_class, canonical_instrument_id, venue, venue_symbol,
+                        direction, signal_rank, signal_score, confidence,
                         entry_price, entry_price_gbp, stop_loss_price, stop_loss_price_gbp,
                         target_price, target_price_gbp, risk_pct, target_return_pct,
                         holding_window_code, holding_window_minutes, movement_pct,
                         discovery_score, rationale, note, raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(tick_id, strategy_id, source, symbol) DO UPDATE SET
                         strategy_family = EXCLUDED.strategy_family,
                         profile_id = EXCLUDED.profile_id,
                         asset_class = EXCLUDED.asset_class,
+                        canonical_instrument_id = EXCLUDED.canonical_instrument_id,
+                        venue = EXCLUDED.venue,
+                        venue_symbol = EXCLUDED.venue_symbol,
                         direction = EXCLUDED.direction,
                         signal_rank = EXCLUDED.signal_rank,
                         signal_score = EXCLUDED.signal_score,
@@ -3807,6 +4890,9 @@ class UsageLedger:
                             item["source"],
                             item["symbol"],
                             item["asset_class"],
+                            item.get("canonical_instrument_id", ""),
+                            item.get("venue", ""),
+                            item.get("venue_symbol", item.get("symbol", "")),
                             item.get("direction", "long"),
                             item.get("signal_rank", 0),
                             item.get("signal_score", 0),
@@ -3916,6 +5002,145 @@ class UsageLedger:
                     ),
                 )
 
+    def _backfill_sqlite_instrument_metadata(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table_name: str,
+        timestamp_column: str,
+        has_broker: bool,
+    ) -> None:
+        del timestamp_column
+        broker_expr = "broker_id" if has_broker else "''"
+        connection.execute(
+            f"""
+            UPDATE {table_name}
+            SET canonical_instrument_id = CASE
+                    WHEN canonical_instrument_id <> '' THEN canonical_instrument_id
+                    WHEN lower(asset_class) = 'crypto' AND instr(upper(symbol), '/') > 0
+                        THEN replace(upper(symbol), '/', '-') || '-SPOT'
+                    WHEN lower(asset_class) = 'crypto' AND upper(symbol) LIKE '%USDT'
+                        THEN substr(upper(symbol), 1, length(upper(symbol)) - 4) || '-USD-SPOT'
+                    WHEN lower(asset_class) = 'crypto' AND upper(symbol) LIKE '%USD'
+                        THEN substr(upper(symbol), 1, length(upper(symbol)) - 3) || '-USD-SPOT'
+                    WHEN lower(asset_class) IN ('equity', 'etf')
+                        THEN upper(symbol) || '-US-EQUITY'
+                    ELSE upper(symbol)
+                END,
+                venue = CASE
+                    WHEN venue <> '' THEN venue
+                    WHEN lower(COALESCE(source, '')) LIKE '%alpaca%'
+                      OR lower(COALESCE({broker_expr}, '')) LIKE '%alpaca%' THEN 'alpaca'
+                    WHEN lower(COALESCE(source, '')) LIKE '%binance%'
+                      OR lower(COALESCE({broker_expr}, '')) LIKE '%binance%' THEN 'binance'
+                    WHEN lower(COALESCE(source, '')) LIKE '%coinbase%'
+                      OR lower(COALESCE({broker_expr}, '')) LIKE '%coinbase%' THEN 'coinbase'
+                    ELSE venue
+                END,
+                venue_symbol = CASE
+                    WHEN venue_symbol <> '' THEN venue_symbol
+                    ELSE upper(symbol)
+                END
+            WHERE symbol <> ''
+              AND (canonical_instrument_id = '' OR venue = '' OR venue_symbol = '')
+            """
+        )
+
+    def _backfill_postgres_instrument_metadata(
+        self,
+        cursor: Any,
+        *,
+        table_name: str,
+        has_broker: bool,
+    ) -> None:
+        broker_expr = "broker_id" if has_broker else "''"
+        cursor.execute(
+            f"""
+            UPDATE {table_name}
+            SET canonical_instrument_id = CASE
+                    WHEN canonical_instrument_id <> '' THEN canonical_instrument_id
+                    WHEN lower(asset_class) = 'crypto' AND strpos(upper(symbol), '/') > 0
+                        THEN replace(upper(symbol), '/', '-') || '-SPOT'
+                    WHEN lower(asset_class) = 'crypto' AND upper(symbol) LIKE '%USDT'
+                        THEN substring(upper(symbol) from 1 for length(upper(symbol)) - 4) || '-USD-SPOT'
+                    WHEN lower(asset_class) = 'crypto' AND upper(symbol) LIKE '%USD'
+                        THEN substring(upper(symbol) from 1 for length(upper(symbol)) - 3) || '-USD-SPOT'
+                    WHEN lower(asset_class) IN ('equity', 'etf')
+                        THEN upper(symbol) || '-US-EQUITY'
+                    ELSE upper(symbol)
+                END,
+                venue = CASE
+                    WHEN venue <> '' THEN venue
+                    WHEN lower(COALESCE(source, '')) LIKE '%alpaca%'
+                      OR lower(COALESCE({broker_expr}, '')) LIKE '%alpaca%' THEN 'alpaca'
+                    WHEN lower(COALESCE(source, '')) LIKE '%binance%'
+                      OR lower(COALESCE({broker_expr}, '')) LIKE '%binance%' THEN 'binance'
+                    WHEN lower(COALESCE(source, '')) LIKE '%coinbase%'
+                      OR lower(COALESCE({broker_expr}, '')) LIKE '%coinbase%' THEN 'coinbase'
+                    ELSE venue
+                END,
+                venue_symbol = CASE
+                    WHEN venue_symbol <> '' THEN venue_symbol
+                    ELSE upper(symbol)
+                END
+            WHERE symbol <> ''
+              AND (canonical_instrument_id = '' OR venue = '' OR venue_symbol = '')
+            """
+        )
+
+    def _backfill_sqlite_shadow_outcome_instrument_metadata(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE shadow_trade_outcomes
+            SET canonical_instrument_id = COALESCE(
+                    (
+                        SELECT NULLIF(p.canonical_instrument_id, '')
+                        FROM shadow_trade_proposals p
+                        WHERE p.proposal_id = shadow_trade_outcomes.proposal_id
+                    ),
+                    canonical_instrument_id
+                ),
+                venue = COALESCE(
+                    (
+                        SELECT NULLIF(p.venue, '')
+                        FROM shadow_trade_proposals p
+                        WHERE p.proposal_id = shadow_trade_outcomes.proposal_id
+                    ),
+                    venue
+                ),
+                venue_symbol = COALESCE(
+                    (
+                        SELECT NULLIF(p.venue_symbol, '')
+                        FROM shadow_trade_proposals p
+                        WHERE p.proposal_id = shadow_trade_outcomes.proposal_id
+                    ),
+                    venue_symbol
+                )
+            WHERE EXISTS (
+                SELECT 1
+                FROM shadow_trade_proposals p
+                WHERE p.proposal_id = shadow_trade_outcomes.proposal_id
+            )
+              AND (canonical_instrument_id = '' OR venue = '' OR venue_symbol = '')
+            """
+        )
+
+    def _backfill_postgres_shadow_outcome_instrument_metadata(self, cursor: Any) -> None:
+        cursor.execute(
+            """
+            UPDATE shadow_trade_outcomes o
+            SET canonical_instrument_id = COALESCE(NULLIF(p.canonical_instrument_id, ''), o.canonical_instrument_id),
+                venue = COALESCE(NULLIF(p.venue, ''), o.venue),
+                venue_symbol = COALESCE(NULLIF(p.venue_symbol, ''), o.venue_symbol)
+            FROM shadow_trade_proposals p
+            WHERE p.proposal_id = o.proposal_id
+              AND (o.canonical_instrument_id = '' OR o.venue = '' OR o.venue_symbol = '')
+            """
+        )
+
     def _record_broker_account_snapshots_sqlite(
         self,
         *,
@@ -4019,18 +5244,28 @@ class UsageLedger:
                 """
                 INSERT INTO paper_trade_orders (
                     order_id, tick_id, captured_at, submitted_at, updated_at,
-                    broker_id, client_order_id, proposal_id, strategy_id, strategy_family,
+                    environment, mode, source_environment, broker_id, data_provider,
+                    execution_provider, canonical_instrument_id, venue, venue_symbol,
+                    client_order_id, proposal_id, strategy_id, strategy_family,
                     profile_id, source, symbol, asset_class, side, order_type,
                     time_in_force, order_class, status, is_open, qty, filled_qty,
                     notional_usd, filled_avg_price, limit_price, stop_price,
                     take_profit_price, stop_loss_price, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     tick_id = excluded.tick_id,
                     captured_at = excluded.captured_at,
                     submitted_at = COALESCE(excluded.submitted_at, paper_trade_orders.submitted_at),
                     updated_at = COALESCE(excluded.updated_at, paper_trade_orders.updated_at),
+                    environment = COALESCE(NULLIF(excluded.environment, ''), paper_trade_orders.environment),
+                    mode = COALESCE(NULLIF(excluded.mode, ''), paper_trade_orders.mode),
+                    source_environment = COALESCE(NULLIF(excluded.source_environment, ''), paper_trade_orders.source_environment),
                     broker_id = COALESCE(NULLIF(excluded.broker_id, ''), paper_trade_orders.broker_id),
+                    data_provider = COALESCE(NULLIF(excluded.data_provider, ''), paper_trade_orders.data_provider),
+                    execution_provider = COALESCE(NULLIF(excluded.execution_provider, ''), paper_trade_orders.execution_provider),
+                    canonical_instrument_id = COALESCE(NULLIF(excluded.canonical_instrument_id, ''), paper_trade_orders.canonical_instrument_id),
+                    venue = COALESCE(NULLIF(excluded.venue, ''), paper_trade_orders.venue),
+                    venue_symbol = COALESCE(NULLIF(excluded.venue_symbol, ''), paper_trade_orders.venue_symbol),
                     client_order_id = CASE
                         WHEN excluded.client_order_id <> '' THEN excluded.client_order_id
                         ELSE paper_trade_orders.client_order_id
@@ -4083,7 +5318,15 @@ class UsageLedger:
                         row["captured_at"],
                         row["submitted_at"],
                         row["updated_at"],
+                        row["environment"],
+                        row["mode"],
+                        row["source_environment"],
                         row["broker_id"],
+                        row["data_provider"],
+                        row["execution_provider"],
+                        row["canonical_instrument_id"],
+                        row["venue"],
+                        row["venue_symbol"],
                         row["client_order_id"],
                         row["proposal_id"],
                         row["strategy_id"],
@@ -4123,20 +5366,30 @@ class UsageLedger:
                     """
                     INSERT INTO paper_trade_orders (
                         order_id, tick_id, captured_at, submitted_at, updated_at,
-                        broker_id, client_order_id, proposal_id, strategy_id, strategy_family,
+                        environment, mode, source_environment, broker_id, data_provider,
+                        execution_provider, canonical_instrument_id, venue, venue_symbol,
+                        client_order_id, proposal_id, strategy_id, strategy_family,
                         profile_id, source, symbol, asset_class, side, order_type,
                         time_in_force, order_class, status, is_open, qty, filled_qty,
                         notional_usd, filled_avg_price, limit_price, stop_price,
                         take_profit_price, stop_loss_price, raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(order_id) DO UPDATE SET
                         tick_id = EXCLUDED.tick_id,
                         captured_at = EXCLUDED.captured_at,
                         submitted_at = COALESCE(EXCLUDED.submitted_at, paper_trade_orders.submitted_at),
                         updated_at = COALESCE(EXCLUDED.updated_at, paper_trade_orders.updated_at),
+                        environment = COALESCE(NULLIF(EXCLUDED.environment, ''), paper_trade_orders.environment),
+                        mode = COALESCE(NULLIF(EXCLUDED.mode, ''), paper_trade_orders.mode),
+                        source_environment = COALESCE(NULLIF(EXCLUDED.source_environment, ''), paper_trade_orders.source_environment),
                         broker_id = COALESCE(NULLIF(EXCLUDED.broker_id, ''), paper_trade_orders.broker_id),
+                        data_provider = COALESCE(NULLIF(EXCLUDED.data_provider, ''), paper_trade_orders.data_provider),
+                        execution_provider = COALESCE(NULLIF(EXCLUDED.execution_provider, ''), paper_trade_orders.execution_provider),
+                        canonical_instrument_id = COALESCE(NULLIF(EXCLUDED.canonical_instrument_id, ''), paper_trade_orders.canonical_instrument_id),
+                        venue = COALESCE(NULLIF(EXCLUDED.venue, ''), paper_trade_orders.venue),
+                        venue_symbol = COALESCE(NULLIF(EXCLUDED.venue_symbol, ''), paper_trade_orders.venue_symbol),
                         client_order_id = COALESCE(NULLIF(EXCLUDED.client_order_id, ''), paper_trade_orders.client_order_id),
                         proposal_id = COALESCE(NULLIF(EXCLUDED.proposal_id, ''), paper_trade_orders.proposal_id),
                         strategy_id = COALESCE(NULLIF(EXCLUDED.strategy_id, ''), paper_trade_orders.strategy_id),
@@ -4168,7 +5421,15 @@ class UsageLedger:
                             row["captured_at"],
                             row["submitted_at"],
                             row["updated_at"],
+                            row["environment"],
+                            row["mode"],
+                            row["source_environment"],
                             row["broker_id"],
+                            row["data_provider"],
+                            row["execution_provider"],
+                            row["canonical_instrument_id"],
+                            row["venue"],
+                            row["venue_symbol"],
                             row["client_order_id"],
                             row["proposal_id"],
                             row["strategy_id"],
@@ -4207,14 +5468,24 @@ class UsageLedger:
                 """
                 INSERT INTO shadow_trade_proposals (
                     proposal_id, tick_id, proposed_at, strategy_id, strategy_family, profile_id,
+                    environment, mode, source_environment, data_provider, execution_provider,
+                    canonical_instrument_id, venue, venue_symbol,
                     source, symbol, asset_class, direction, status, action_bias, opportunity_score,
                     signal_score, signal_confidence, confidence,
                     discovery_score, entry_price, entry_price_gbp, stop_loss_price,
                     stop_loss_price_gbp, target_price, target_price_gbp, risk_pct,
                     target_return_pct, holding_window_code, holding_window_minutes,
                     thesis, risks_json, rationale, note, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id) DO UPDATE SET
+                    environment = excluded.environment,
+                    mode = excluded.mode,
+                    source_environment = excluded.source_environment,
+                    data_provider = excluded.data_provider,
+                    execution_provider = excluded.execution_provider,
+                    canonical_instrument_id = excluded.canonical_instrument_id,
+                    venue = excluded.venue,
+                    venue_symbol = excluded.venue_symbol,
                     strategy_id = excluded.strategy_id,
                     strategy_family = excluded.strategy_family,
                     profile_id = excluded.profile_id,
@@ -4249,6 +5520,14 @@ class UsageLedger:
                         item.get("strategy_id", ""),
                         item.get("strategy_family", ""),
                         item.get("profile_id", ""),
+                        item.get("environment", "paper"),
+                        item.get("mode", "paper"),
+                        item.get("source_environment", "shadow"),
+                        item.get("data_provider", item.get("source", "alpaca")),
+                        item.get("execution_provider", "shadow"),
+                        item.get("canonical_instrument_id", ""),
+                        item.get("venue", ""),
+                        item.get("venue_symbol", item.get("symbol", "")),
                         item["source"],
                         item["symbol"],
                         item["asset_class"],
@@ -4286,6 +5565,14 @@ class UsageLedger:
                         (
                             item["proposal_id"],
                             checkpoint["checkpoint_code"],
+                            item.get("environment", "paper"),
+                            item.get("mode", "paper"),
+                            item.get("source_environment", "shadow"),
+                            item.get("data_provider", item.get("source", "alpaca")),
+                            item.get("execution_provider", "shadow"),
+                            item.get("canonical_instrument_id", ""),
+                            item.get("venue", ""),
+                            item.get("venue_symbol", item.get("symbol", "")),
                             checkpoint["checkpoint_minutes"],
                             checkpoint["due_at"],
                             "pending",
@@ -4295,8 +5582,11 @@ class UsageLedger:
                 connection.executemany(
                     """
                     INSERT INTO shadow_trade_outcomes (
-                        proposal_id, checkpoint_code, checkpoint_minutes, due_at, outcome_status
-                    ) VALUES (?, ?, ?, ?, ?)
+                        proposal_id, checkpoint_code, environment, mode,
+                        source_environment, data_provider, execution_provider,
+                        canonical_instrument_id, venue, venue_symbol,
+                        checkpoint_minutes, due_at, outcome_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(proposal_id, checkpoint_code) DO NOTHING
                     """,
                     checkpoint_rows,
@@ -4313,6 +5603,8 @@ class UsageLedger:
                     """
                 INSERT INTO shadow_trade_proposals (
                         proposal_id, tick_id, proposed_at, strategy_id, strategy_family, profile_id,
+                        environment, mode, source_environment, data_provider, execution_provider,
+                        canonical_instrument_id, venue, venue_symbol,
                         source, symbol, asset_class, direction, status, action_bias, opportunity_score,
                         signal_score, signal_confidence, confidence,
                         discovery_score, entry_price, entry_price_gbp, stop_loss_price,
@@ -4320,9 +5612,17 @@ class UsageLedger:
                         target_return_pct, holding_window_code, holding_window_minutes,
                         thesis, risks_json, rationale, note, raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(proposal_id) DO UPDATE SET
+                        environment = EXCLUDED.environment,
+                        mode = EXCLUDED.mode,
+                        source_environment = EXCLUDED.source_environment,
+                        data_provider = EXCLUDED.data_provider,
+                        execution_provider = EXCLUDED.execution_provider,
+                        canonical_instrument_id = EXCLUDED.canonical_instrument_id,
+                        venue = EXCLUDED.venue,
+                        venue_symbol = EXCLUDED.venue_symbol,
                         strategy_id = EXCLUDED.strategy_id,
                         strategy_family = EXCLUDED.strategy_family,
                         profile_id = EXCLUDED.profile_id,
@@ -4357,6 +5657,14 @@ class UsageLedger:
                             item.get("strategy_id", ""),
                             item.get("strategy_family", ""),
                             item.get("profile_id", ""),
+                            item.get("environment", "paper"),
+                            item.get("mode", "paper"),
+                            item.get("source_environment", "shadow"),
+                            item.get("data_provider", item.get("source", "alpaca")),
+                            item.get("execution_provider", "shadow"),
+                            item.get("canonical_instrument_id", ""),
+                            item.get("venue", ""),
+                            item.get("venue_symbol", item.get("symbol", "")),
                             item["source"],
                             item["symbol"],
                             item["asset_class"],
@@ -4392,19 +5700,30 @@ class UsageLedger:
                     for checkpoint in item.get("checkpoint_windows", []):
                         checkpoint_rows.append(
                             (
-                                item["proposal_id"],
-                                checkpoint["checkpoint_code"],
-                                checkpoint["checkpoint_minutes"],
-                                checkpoint["due_at"],
-                                "pending",
+                            item["proposal_id"],
+                            checkpoint["checkpoint_code"],
+                            item.get("environment", "paper"),
+                            item.get("mode", "paper"),
+                            item.get("source_environment", "shadow"),
+                            item.get("data_provider", item.get("source", "alpaca")),
+                            item.get("execution_provider", "shadow"),
+                            item.get("canonical_instrument_id", ""),
+                            item.get("venue", ""),
+                            item.get("venue_symbol", item.get("symbol", "")),
+                            checkpoint["checkpoint_minutes"],
+                            checkpoint["due_at"],
+                            "pending",
                             )
                         )
                 if checkpoint_rows:
                     cursor.executemany(
                         """
                         INSERT INTO shadow_trade_outcomes (
-                            proposal_id, checkpoint_code, checkpoint_minutes, due_at, outcome_status
-                        ) VALUES (%s, %s, %s, %s, %s)
+                            proposal_id, checkpoint_code, environment, mode,
+                            source_environment, data_provider, execution_provider,
+                            canonical_instrument_id, venue, venue_symbol,
+                            checkpoint_minutes, due_at, outcome_status
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT(proposal_id, checkpoint_code) DO NOTHING
                         """,
                         checkpoint_rows,
@@ -4421,14 +5740,24 @@ class UsageLedger:
                 """
                 INSERT INTO shadow_trade_outcomes (
                     proposal_id, checkpoint_code, checkpoint_minutes, due_at, evaluated_at,
+                    environment, mode, source_environment, data_provider, execution_provider,
+                    canonical_instrument_id, venue, venue_symbol,
                     outcome_status, exit_price, exit_price_gbp, realized_return_pct,
                     max_favorable_excursion_pct, max_adverse_excursion_pct, fitness_score,
                     bars_observed, notes, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id, checkpoint_code) DO UPDATE SET
                     checkpoint_minutes = excluded.checkpoint_minutes,
                     due_at = excluded.due_at,
                     evaluated_at = excluded.evaluated_at,
+                    environment = excluded.environment,
+                    mode = excluded.mode,
+                    source_environment = excluded.source_environment,
+                    data_provider = excluded.data_provider,
+                    execution_provider = excluded.execution_provider,
+                    canonical_instrument_id = excluded.canonical_instrument_id,
+                    venue = excluded.venue,
+                    venue_symbol = excluded.venue_symbol,
                     outcome_status = excluded.outcome_status,
                     exit_price = excluded.exit_price,
                     exit_price_gbp = excluded.exit_price_gbp,
@@ -4447,6 +5776,14 @@ class UsageLedger:
                         item.get("checkpoint_minutes", 0),
                         item["due_at"],
                         item.get("evaluated_at"),
+                        item.get("environment", "paper"),
+                        item.get("mode", "paper"),
+                        item.get("source_environment", "shadow"),
+                        item.get("data_provider", "alpaca"),
+                        item.get("execution_provider", "shadow"),
+                        item.get("canonical_instrument_id", ""),
+                        item.get("venue", ""),
+                        item.get("venue_symbol", item.get("symbol", "")),
                         item.get("outcome_status", "pending"),
                         item.get("exit_price"),
                         item.get("exit_price_gbp"),
@@ -4490,16 +5827,26 @@ class UsageLedger:
                     """
                     INSERT INTO shadow_trade_outcomes (
                         proposal_id, checkpoint_code, checkpoint_minutes, due_at, evaluated_at,
+                        environment, mode, source_environment, data_provider, execution_provider,
+                        canonical_instrument_id, venue, venue_symbol,
                         outcome_status, exit_price, exit_price_gbp, realized_return_pct,
                         max_favorable_excursion_pct, max_adverse_excursion_pct, fitness_score,
                         bars_observed, notes, raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(proposal_id, checkpoint_code) DO UPDATE SET
                         checkpoint_minutes = EXCLUDED.checkpoint_minutes,
                         due_at = EXCLUDED.due_at,
                         evaluated_at = EXCLUDED.evaluated_at,
+                        environment = EXCLUDED.environment,
+                        mode = EXCLUDED.mode,
+                        source_environment = EXCLUDED.source_environment,
+                        data_provider = EXCLUDED.data_provider,
+                        execution_provider = EXCLUDED.execution_provider,
+                        canonical_instrument_id = EXCLUDED.canonical_instrument_id,
+                        venue = EXCLUDED.venue,
+                        venue_symbol = EXCLUDED.venue_symbol,
                         outcome_status = EXCLUDED.outcome_status,
                         exit_price = EXCLUDED.exit_price,
                         exit_price_gbp = EXCLUDED.exit_price_gbp,
@@ -4518,6 +5865,14 @@ class UsageLedger:
                             item.get("checkpoint_minutes", 0),
                             item["due_at"],
                             item.get("evaluated_at"),
+                            item.get("environment", "paper"),
+                            item.get("mode", "paper"),
+                            item.get("source_environment", "shadow"),
+                            item.get("data_provider", "alpaca"),
+                            item.get("execution_provider", "shadow"),
+                            item.get("canonical_instrument_id", ""),
+                            item.get("venue", ""),
+                            item.get("venue_symbol", item.get("symbol", "")),
                             item.get("outcome_status", "pending"),
                             item.get("exit_price"),
                             item.get("exit_price_gbp"),
@@ -4556,8 +5911,10 @@ class UsageLedger:
             connection.executemany(
                 """
                 INSERT INTO strategy_fitness_snapshots (
-                    tick_id, captured_at, strategy_id, strategy_family, profile_id,
-                    asset_class, checkpoint_code, lookback_days, fitness_rank,
+                    tick_id, captured_at, environment, mode, source_environment,
+                    broker_id, data_provider, execution_provider,
+                    strategy_id, strategy_family, profile_id, asset_class,
+                    checkpoint_code, lookback_days, fitness_rank,
                     evaluated_proposals, checkpoints_evaluated, win_count, loss_count,
                     target_hit_count, stop_hit_count, time_exit_count, ambiguous_count,
                     win_rate, loss_rate, target_hit_rate, stop_hit_rate, time_exit_rate,
@@ -4566,9 +5923,15 @@ class UsageLedger:
                     avg_signal_score, avg_signal_confidence, avg_discovery_score,
                     sample_weight, composite_fitness_score, first_proposed_at,
                     last_evaluated_at, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tick_id, strategy_id, asset_class, checkpoint_code) DO UPDATE SET
                     captured_at = excluded.captured_at,
+                    environment = excluded.environment,
+                    mode = excluded.mode,
+                    source_environment = excluded.source_environment,
+                    broker_id = excluded.broker_id,
+                    data_provider = excluded.data_provider,
+                    execution_provider = excluded.execution_provider,
                     strategy_family = excluded.strategy_family,
                     profile_id = excluded.profile_id,
                     lookback_days = excluded.lookback_days,
@@ -4604,6 +5967,12 @@ class UsageLedger:
                     (
                         row["tick_id"],
                         row["captured_at"],
+                        row["environment"],
+                        row["mode"],
+                        row["source_environment"],
+                        row["broker_id"],
+                        row["data_provider"],
+                        row["execution_provider"],
                         row["strategy_id"],
                         row["strategy_family"],
                         row["profile_id"],
@@ -4651,8 +6020,10 @@ class UsageLedger:
                 cursor.executemany(
                     """
                     INSERT INTO strategy_fitness_snapshots (
-                        tick_id, captured_at, strategy_id, strategy_family, profile_id,
-                        asset_class, checkpoint_code, lookback_days, fitness_rank,
+                        tick_id, captured_at, environment, mode, source_environment,
+                        broker_id, data_provider, execution_provider,
+                        strategy_id, strategy_family, profile_id, asset_class,
+                        checkpoint_code, lookback_days, fitness_rank,
                         evaluated_proposals, checkpoints_evaluated, win_count, loss_count,
                         target_hit_count, stop_hit_count, time_exit_count, ambiguous_count,
                         win_rate, loss_rate, target_hit_rate, stop_hit_rate, time_exit_rate,
@@ -4662,10 +6033,16 @@ class UsageLedger:
                         sample_weight, composite_fitness_score, first_proposed_at,
                         last_evaluated_at, raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(tick_id, strategy_id, asset_class, checkpoint_code) DO UPDATE SET
                         captured_at = EXCLUDED.captured_at,
+                        environment = EXCLUDED.environment,
+                        mode = EXCLUDED.mode,
+                        source_environment = EXCLUDED.source_environment,
+                        broker_id = EXCLUDED.broker_id,
+                        data_provider = EXCLUDED.data_provider,
+                        execution_provider = EXCLUDED.execution_provider,
                         strategy_family = EXCLUDED.strategy_family,
                         profile_id = EXCLUDED.profile_id,
                         lookback_days = EXCLUDED.lookback_days,
@@ -4701,6 +6078,12 @@ class UsageLedger:
                         (
                             row["tick_id"],
                             row["captured_at"],
+                            row["environment"],
+                            row["mode"],
+                            row["source_environment"],
+                            row["broker_id"],
+                            row["data_provider"],
+                            row["execution_provider"],
                             row["strategy_id"],
                             row["strategy_family"],
                             row["profile_id"],
@@ -4784,6 +6167,9 @@ class UsageLedger:
                 """
                 SELECT o.proposal_id, o.checkpoint_code, o.checkpoint_minutes, o.due_at,
                        o.evaluated_at, p.proposed_at, p.source, p.symbol, p.asset_class,
+                       p.environment, p.mode, p.source_environment, p.data_provider,
+                       p.execution_provider, p.canonical_instrument_id, p.venue,
+                       p.venue_symbol,
                        p.entry_price, p.entry_price_gbp, p.stop_loss_price, p.target_price,
                        p.risk_pct, p.holding_window_code, p.holding_window_minutes,
                        p.raw_json
@@ -4810,6 +6196,9 @@ class UsageLedger:
                     """
                     SELECT o.proposal_id, o.checkpoint_code, o.checkpoint_minutes, o.due_at,
                            o.evaluated_at, p.proposed_at, p.source, p.symbol, p.asset_class,
+                           p.environment, p.mode, p.source_environment, p.data_provider,
+                           p.execution_provider, p.canonical_instrument_id, p.venue,
+                           p.venue_symbol,
                            p.entry_price, p.entry_price_gbp, p.stop_loss_price, p.target_price,
                            p.risk_pct, p.holding_window_code, p.holding_window_minutes,
                            p.raw_json
@@ -5072,6 +6461,7 @@ class UsageLedger:
             rows = connection.execute(
                 f"""
                 SELECT batch_id, captured_at, source, asset_class, symbol, timeframe,
+                       canonical_instrument_id, venue, venue_symbol,
                        bar_timestamp, quote_currency, usd_to_gbp_rate,
                        open_price, high_price, low_price, close_price,
                        open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
@@ -5174,6 +6564,7 @@ class UsageLedger:
                 cursor.execute(
                     f"""
                     SELECT batch_id, captured_at, source, asset_class, symbol, timeframe,
+                           canonical_instrument_id, venue, venue_symbol,
                            bar_timestamp, quote_currency, usd_to_gbp_rate,
                            open_price, high_price, low_price, close_price,
                            open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
@@ -6077,6 +7468,86 @@ class UsageLedger:
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def _list_recent_execution_router_intents_sqlite(
+        self,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM execution_router_intents
+                ORDER BY recorded_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_recent_execution_router_intents_postgres(
+        self,
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM execution_router_intents
+                    ORDER BY recorded_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _get_broker_account_high_water_sqlite(
+        self,
+        *,
+        broker_id: str,
+        since: datetime,
+    ) -> dict[str, Any] | None:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM broker_account_snapshots
+                WHERE broker_id = ?
+                  AND captured_at >= ?
+                  AND equity IS NOT NULL
+                ORDER BY equity DESC, captured_at ASC
+                LIMIT 1
+                """,
+                (broker_id, since.isoformat()),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_broker_account_high_water_postgres(
+        self,
+        *,
+        broker_id: str,
+        since: datetime,
+    ) -> dict[str, Any] | None:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM broker_account_snapshots
+                    WHERE broker_id = %s
+                      AND captured_at >= %s
+                      AND equity IS NOT NULL
+                    ORDER BY equity DESC, captured_at ASC
+                    LIMIT 1
+                    """,
+                    (broker_id, since),
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
     def _list_recent_shadow_trade_proposals_sqlite(
         self,
         *,
@@ -6283,6 +7754,17 @@ class UsageLedger:
         resolved_broker_id = str(
             order.get("broker_id") or broker_id or "alpaca_paper"
         ).strip().lower() or "alpaca_paper"
+        metadata = self._order_environment_metadata(
+            order=order,
+            broker_id=resolved_broker_id,
+        )
+        instrument = self._instrument_metadata(
+            item=order,
+            symbol=symbol,
+            asset_class=asset_class,
+            source=str(order.get("source", "")),
+            broker_id=resolved_broker_id,
+        )
 
         take_profit = order.get("take_profit")
         stop_loss = order.get("stop_loss")
@@ -6303,7 +7785,15 @@ class UsageLedger:
             "captured_at": captured_at.isoformat(),
             "submitted_at": order.get("submitted_at"),
             "updated_at": order.get("updated_at"),
+            "environment": metadata["environment"],
+            "mode": metadata["mode"],
+            "source_environment": metadata["source_environment"],
             "broker_id": resolved_broker_id,
+            "data_provider": metadata["data_provider"],
+            "execution_provider": metadata["execution_provider"],
+            "canonical_instrument_id": instrument["canonical_instrument_id"],
+            "venue": instrument["venue"],
+            "venue_symbol": instrument["venue_symbol"],
             "client_order_id": str(order.get("client_order_id", "")).strip(),
             "proposal_id": str(order.get("proposal_id", "")).strip(),
             "strategy_id": str(order.get("strategy_id", "")).strip(),
@@ -6327,6 +7817,141 @@ class UsageLedger:
             "take_profit_price": take_profit_price,
             "stop_loss_price": stop_loss_price,
             "raw_json": self._to_json(order),
+        }
+
+    def _instrument_metadata(
+        self,
+        *,
+        item: dict[str, Any],
+        symbol: str,
+        asset_class: str,
+        source: str = "",
+        broker_id: str = "",
+    ) -> dict[str, str]:
+        venue = str(item.get("venue") or "").strip().lower()
+        if not venue:
+            source_text = str(source or item.get("source") or "").strip().lower()
+            broker_text = str(broker_id or item.get("broker_id") or "").strip().lower()
+            combined = f"{source_text} {broker_text}"
+            if "alpaca" in combined:
+                venue = "alpaca"
+            elif "binance" in combined:
+                venue = "binance"
+            elif "coinbase" in combined:
+                venue = "coinbase"
+            elif "kraken" in combined:
+                venue = "kraken"
+
+        venue_symbol = str(item.get("venue_symbol") or symbol or "").strip().upper()
+        instrument_ref = self.instrument_registry.reference_for(
+            venue=venue,
+            venue_symbol=venue_symbol,
+            asset_class=asset_class,
+            canonical_instrument_id=str(item.get("canonical_instrument_id") or ""),
+        )
+        canonical_id = instrument_ref.canonical_instrument_id
+        venue = instrument_ref.venue
+        venue_symbol = instrument_ref.venue_symbol
+        if not canonical_id:
+            canonical_id = self._fallback_canonical_instrument_id(
+                symbol=venue_symbol,
+                asset_class=asset_class,
+            )
+        return {
+            "canonical_instrument_id": canonical_id,
+            "venue": venue,
+            "venue_symbol": venue_symbol,
+        }
+
+    def _with_instrument_metadata(self, item: dict[str, Any]) -> dict[str, Any]:
+        symbol = str(item.get("symbol", "")).upper()
+        asset_class = str(item.get("asset_class", "")).strip().lower()
+        if not asset_class:
+            asset_class = "crypto" if "/" in symbol else "equity"
+        instrument = self._instrument_metadata(
+            item=item,
+            symbol=symbol,
+            asset_class=asset_class,
+            source=str(item.get("source", "")),
+            broker_id=str(item.get("broker_id", "")),
+        )
+        return {
+            **item,
+            "canonical_instrument_id": instrument["canonical_instrument_id"],
+            "venue": instrument["venue"],
+            "venue_symbol": instrument["venue_symbol"],
+        }
+
+    def _fallback_canonical_instrument_id(
+        self,
+        *,
+        symbol: str,
+        asset_class: str,
+    ) -> str:
+        normalized_asset_class = str(asset_class or "").strip().lower()
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            return ""
+        if normalized_asset_class == "crypto":
+            if "/" in normalized_symbol:
+                base, quote = normalized_symbol.split("/", 1)
+            elif normalized_symbol.endswith("USD"):
+                base, quote = normalized_symbol[:-3], "USD"
+            elif normalized_symbol.endswith("USDT"):
+                base, quote = normalized_symbol[:-4], "USD"
+            else:
+                return f"{normalized_symbol}-SPOT"
+            return f"{base}-{quote.replace('USDT', 'USD')}-SPOT"
+        if normalized_asset_class in {"equity", "etf"}:
+            return f"{normalized_symbol}-US-EQUITY"
+        return normalized_symbol
+
+    def _order_environment_metadata(
+        self,
+        *,
+        order: dict[str, Any],
+        broker_id: str,
+    ) -> dict[str, str]:
+        """Infer explicit paper/live provenance for a broker order row."""
+        normalized_broker = str(broker_id or "").strip().lower()
+        inferred_environment = "live" if normalized_broker.endswith("_live") else "paper"
+        environment = str(
+            order.get("environment") or inferred_environment
+        ).strip().lower()
+        if environment not in {"paper", "live"}:
+            environment = inferred_environment
+
+        inferred_mode = "live" if environment == "live" else "paper"
+        mode = str(order.get("mode") or inferred_mode).strip().lower()
+        if mode not in {"shadow", "paper", "live_dry", "live"}:
+            mode = inferred_mode
+
+        source_environment = str(order.get("source_environment") or "").strip().lower()
+        if source_environment not in {"shadow", "paper", "live", "backtest"}:
+            if environment == "live" and str(order.get("proposal_id") or "").strip():
+                source_environment = "paper"
+            elif str(order.get("proposal_id") or "").strip():
+                source_environment = "shadow"
+            else:
+                source_environment = environment
+
+        source = str(order.get("source") or "").strip().lower()
+        data_provider = str(order.get("data_provider") or "").strip().lower()
+        if not data_provider:
+            data_provider = "alpaca" if "alpaca" in normalized_broker or "alpaca" in source else source
+        if not data_provider:
+            data_provider = "unknown"
+
+        execution_provider = str(order.get("execution_provider") or "").strip().lower()
+        if not execution_provider:
+            execution_provider = normalized_broker or "unknown"
+
+        return {
+            "environment": environment,
+            "mode": mode,
+            "source_environment": source_environment,
+            "data_provider": data_provider,
+            "execution_provider": execution_provider,
         }
 
     def _broker_account_snapshot_row(
@@ -6391,10 +8016,51 @@ class UsageLedger:
         connection.row_factory = sqlite3.Row
         return connection
 
-    def _connect_postgres(self):
+    def _connect_postgres(self, *, apply_schema: bool = True):
         if psycopg2 is None:  # pragma: no cover
             raise RuntimeError("psycopg2 is not installed.")
-        return psycopg2.connect(self.config.database_url, connect_timeout=5)
+        connection = psycopg2.connect(self.config.database_url, connect_timeout=5)
+        if apply_schema:
+            with connection.cursor() as cursor:
+                self._set_postgres_search_path(cursor)
+        return connection
+
+    def _ensure_postgres_namespace(self, cursor) -> None:
+        schema_name = self._postgres_schema_name()
+        if not schema_name:
+            return
+        if sql is None:  # pragma: no cover
+            raise RuntimeError("psycopg2.sql is not available.")
+        cursor.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                sql.Identifier(schema_name)
+            )
+        )
+        self._set_postgres_search_path(cursor)
+
+    def _set_postgres_search_path(self, cursor) -> None:
+        schema_name = self._postgres_schema_name()
+        if not schema_name:
+            return
+        if sql is None:  # pragma: no cover
+            raise RuntimeError("psycopg2.sql is not available.")
+        cursor.execute(
+            sql.SQL("SET search_path TO {}, public").format(
+                sql.Identifier(schema_name)
+            )
+        )
+
+    def _postgres_schema_name(self) -> str:
+        schema_name = str(getattr(self.config, "postgres_schema", "") or "").strip()
+        if not schema_name:
+            return ""
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema_name):
+            raise RuntimeError(f"Invalid PostgreSQL schema name: {schema_name!r}")
+        return schema_name
+
+    def _postgres_schema_detail(self) -> str:
+        schema_name = str(getattr(self.config, "postgres_schema", "") or "").strip()
+        return f":schema={schema_name}" if schema_name else ""
 
     def _row_to_summary(self, row: dict[str, Any]) -> ApiUsageSummary:
         usage_date = row["usage_date"]

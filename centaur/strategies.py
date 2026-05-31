@@ -5,6 +5,7 @@ from math import log10
 from typing import Any
 
 from .config import RuntimeConfig
+from app.core.instruments import InstrumentRef, instrument_ref_from_metadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +58,10 @@ class StrategySignal:
     break_even_trigger_price: float | None = None
     break_even_trigger_price_gbp: float | None = None
     trailing_stop_mode: str = ""
+    canonical_instrument_id: str = ""
+    venue: str = ""
+    venue_symbol: str = ""
+    instrument_ref: InstrumentRef | None = None
 
     def with_rank(self, rank: int) -> "StrategySignal":
         return StrategySignal(
@@ -92,10 +97,14 @@ class StrategySignal:
             break_even_trigger_price=self.break_even_trigger_price,
             break_even_trigger_price_gbp=self.break_even_trigger_price_gbp,
             trailing_stop_mode=self.trailing_stop_mode,
+            canonical_instrument_id=self.canonical_instrument_id,
+            venue=self.venue,
+            venue_symbol=self.venue_symbol,
+            instrument_ref=self.instrument_ref,
         )
 
     def as_dict(self, *, tick_id: str) -> dict[str, Any]:
-        return {
+        payload = {
             "tick_id": tick_id,
             "strategy_id": self.strategy_id,
             "strategy_family": self.strategy_family,
@@ -103,6 +112,9 @@ class StrategySignal:
             "source": self.source,
             "symbol": self.symbol,
             "asset_class": self.asset_class,
+            "canonical_instrument_id": self.canonical_instrument_id,
+            "venue": self.venue,
+            "venue_symbol": self.venue_symbol,
             "direction": self.direction,
             "signal_rank": self.signal_rank,
             "signal_score": self.signal_score,
@@ -130,6 +142,9 @@ class StrategySignal:
             "break_even_trigger_price_gbp": self.break_even_trigger_price_gbp,
             "trailing_stop_mode": self.trailing_stop_mode,
         }
+        if self.instrument_ref is not None:
+            payload["instrument_ref"] = self.instrument_ref.as_dict()
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,6 +512,10 @@ class MomentumVolatilityBreakoutStrategy(StrategyDefinition):
             source=str(candidate.get("source", "")),
             symbol=str(candidate.get("symbol", "")).upper(),
             asset_class=asset_class,
+            canonical_instrument_id=str(candidate.get("canonical_instrument_id", "")),
+            venue=str(candidate.get("venue", "")),
+            venue_symbol=str(candidate.get("venue_symbol", "")),
+            instrument_ref=instrument_ref_from_metadata(candidate),
             direction="long",
             signal_rank=0,
             signal_score=signal_score,
@@ -776,6 +795,10 @@ def _build_signal(
         source=str(candidate.get("source", "")),
         symbol=str(candidate.get("symbol", "")).upper(),
         asset_class=str(candidate.get("asset_class", "equity")),
+        canonical_instrument_id=str(candidate.get("canonical_instrument_id", "")),
+        venue=str(candidate.get("venue", "")),
+        venue_symbol=str(candidate.get("venue_symbol", "")),
+        instrument_ref=instrument_ref_from_metadata(candidate),
         direction="long",
         signal_rank=0,
         signal_score=signal_score,

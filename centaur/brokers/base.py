@@ -16,6 +16,13 @@ class UnsupportedBrokerError(BrokerAdapterError):
 
 
 class BrokerAdapter(ABC):
+    """Broker boundary for execution, validation, and audit normalization.
+
+    Pipeline risk gates call adapters only after strategy and account checks have
+    passed, and adapters may still veto a request when the broker cannot honor
+    Centaur's notional, asset-class, leverage, or activation constraints.
+    """
+
     broker_id = "unknown"
     label = "Unknown broker"
     native_currency = "USD"
@@ -33,6 +40,7 @@ class BrokerAdapter(ABC):
         notional_usd: float,
         usd_to_gbp: float | None = None,
     ) -> str | None:
+        """Return a broker-specific veto reason before an entry order is built."""
         asset_class = str(proposal.get("asset_class", "")).strip().lower()
         if asset_class and not self.supports_asset_class(asset_class):
             return "unsupported_asset_class"
@@ -107,6 +115,7 @@ class BrokerAdapter(ABC):
         limit_buffer_bps: float,
         usd_to_gbp: float | None = None,
     ) -> dict[str, Any]:
+        """Build an entry request only after risk gates and adapter vetoes pass."""
         raise NotImplementedError
 
     @abstractmethod
@@ -123,4 +132,5 @@ class BrokerAdapter(ABC):
         latest_bar: dict[str, Any] | None = None,
         usd_to_gbp: float | None = None,
     ) -> dict[str, Any]:
+        """Build a protective/managed exit request without widening quantity."""
         raise NotImplementedError

@@ -17,6 +17,13 @@ _DEFAULT_EPICS = {
 
 
 class IgBrokerAdapter(BrokerAdapter):
+    """Scaffold-only IG adapter that can veto unsafe spread-bet economics.
+
+    IG is not active for execution. Its current job is to prove that a proposed
+    future route could obey the fixed notional and 1x exposure rules before any
+    order-building or account-mutating methods are enabled.
+    """
+
     broker_id = "ig_spreadbet"
     label = "IG Spread Betting"
     native_currency = "GBP"
@@ -98,6 +105,7 @@ class IgBrokerAdapter(BrokerAdapter):
         notional_usd: float,
         usd_to_gbp: float | None = None,
     ) -> str | None:
+        """Reject IG candidates that cannot fit the fixed-notional risk envelope."""
         base_reason = super().validate_entry_constraints(
             context=context,
             proposal=proposal,
@@ -196,6 +204,7 @@ class IgBrokerAdapter(BrokerAdapter):
         limit_buffer_bps: float,
         usd_to_gbp: float | None = None,
     ) -> dict[str, Any]:
+        """Remain disabled until IG can honor the fixed notional and leverage rules."""
         raise BrokerAdapterError("IG adapter order construction is not enabled until the adapter leaves shadow mode.")
 
     def build_exit_order_request(
@@ -211,6 +220,7 @@ class IgBrokerAdapter(BrokerAdapter):
         latest_bar: dict[str, Any] | None = None,
         usd_to_gbp: float | None = None,
     ) -> dict[str, Any]:
+        """Remain disabled while IG has no active position/order management lane."""
         raise BrokerAdapterError("IG adapter exit construction is not enabled until the adapter leaves shadow mode.")
 
 

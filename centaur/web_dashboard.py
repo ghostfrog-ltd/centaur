@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from .config import RuntimeConfig, load_runtime_config
 from .status import StatusReporter
 
-APP_BUILD = "2026-05-29-live-execution-intelligence"
+APP_BUILD = "2026-05-31-honest-status-labels"
 
 
 def run_web_dashboard(
@@ -93,8 +93,14 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
     centaur_activity = _as_dict(snapshot.get("centaur_activity"))
     flow = _as_dict(centaur_activity.get("flow"))
     blockers = _as_dict(centaur_activity.get("blockers"))
-    market_gate = _as_dict(_as_dict(latest_tick.get("state_snapshot_json")).get("market_gate"))
-    risk_cfo = _as_dict(_as_dict(latest_tick.get("state_snapshot_json")).get("risk_cfo"))
+    tick_state = _as_dict(latest_tick.get("state_snapshot_json"))
+    market_gate = _as_dict(tick_state.get("market_gate"))
+    risk_cfo = _as_dict(tick_state.get("risk_cfo"))
+    trailing_observer = _as_dict(tick_state.get("trailing_drawdown_observer"))
+    trailing_lanes = _as_dict(trailing_observer.get("lanes"))
+    trailing_paper = _as_dict(
+        trailing_lanes.get(str(config.paper_execution_equity_broker_id or "alpaca_paper").lower())
+    )
 
     cards = [
         _metric_card(
@@ -103,23 +109,23 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
             detail=_fmt_dt(latest_tick.get("started_at")),
         ),
         _metric_card(
-            label="Market",
-            value="OPEN" if market_gate.get("market_open") else "CLOSED",
+            label="Equity market gate",
+            value=_market_gate_value(market_gate),
             detail=str(market_gate.get("reason", "-") or "-"),
         ),
         _metric_card(
-            label="CFO",
+            label="Paper CFO",
             value=str(risk_cfo.get("decision", "-") or "-"),
             detail=str(risk_cfo.get("reason", "-") or "-"),
         ),
         _metric_card(
-            label="Day P/L",
+            label="Paper day P/L",
             value=_fmt_signed_currency(account.get("day_change_usd")),
             detail=_fmt_signed_pct(account.get("day_change_pct")),
             tone=_tone_from_number(account.get("day_change_usd")),
         ),
         _metric_card(
-            label="Open positions",
+            label="Paper positions",
             value=str(int(account.get("open_positions_count", 0) or 0)),
             detail=(
                 f"slots {int(account.get('open_positions_count', 0) or 0)}"
@@ -130,6 +136,16 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
             label="Primary blocker",
             value=str(blockers.get("primary_stage", "-") or "-"),
             detail=str(blockers.get("cfo_reason", "-") or "-"),
+        ),
+        _metric_card(
+            label="Paper peak giveback",
+            value=_fmt_currency(trailing_paper.get("giveback_usd")),
+            detail=(
+                "would block"
+                if trailing_paper.get("would_block_new_entries")
+                else "observe only"
+            ),
+            tone="bad" if trailing_paper.get("would_block_new_entries") else "neutral",
         ),
     ]
 
@@ -261,7 +277,7 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
     <main class="shell">
       <section class="header">
         <div>
-          <p class="subtle">Project Centaur live monitor</p>
+          <p class="subtle">Project Centaur paper/live operations monitor</p>
           <h1 class="title">Web Dashboard</h1>
           <p class="subtle">Checked {_html(_fmt_dt(now))} | build={_html(APP_BUILD)} | auto refresh every 15s</p>
         </div>
@@ -279,7 +295,7 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
       <section class="layout">
         <div class="stack">
           {_panel(
-              title="Account",
+              title="Paper account",
               body=_account_panel(account),
               eyebrow=_pill_from_number(account.get("day_change_usd"), label="day move")
           )}
@@ -289,15 +305,17 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
               eyebrow=_pill(str(int(account.get("open_positions_count", 0) or 0)) + " open")
           )}
           {_panel(
-              title="Recent paper orders",
+              title="Recent broker orders",
               body=_orders_table(_as_list(snapshot.get("recent_orders"))),
+              eyebrow=_pill("paper/live ledger")
           )}
           {_panel(
               title="Recent shadow proposals",
               body=_proposals_table(_as_list(snapshot.get("recent_proposals"))),
+              eyebrow=_pill("counterfactual")
           )}
           {_panel(
-              title="Signal pipeline",
+              title="Latest tick signal pipeline",
               body=''.join(activity_tables),
               eyebrow=_pill(
                   f"raw {int(flow.get('raw_signals', 0) or 0)} | survived {int(flow.get('surviving_signals', 0) or 0)} | proposals {int(flow.get('proposals_created', 0) or 0)}"
@@ -317,6 +335,7 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
           {_panel(
               title="Holding-window fitness",
               body=_bullet_list(_render_holding_window_summary(_as_dict(snapshot.get("holding_window_advice"))), mono=True),
+              eyebrow=_pill("shadow-only")
           )}
           {_panel(
               title="Broker accounts",
@@ -329,6 +348,7 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
           {_panel(
               title="Live execution intelligence",
               body=_bullet_list(_render_live_execution_intelligence(_as_dict(snapshot.get("live_execution_intelligence"))), mono=True),
+              eyebrow=_pill("read-only")
           )}
           {_panel(
               title="API cost",
@@ -342,11 +362,11 @@ def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -
       </section>
 
       <footer class="footer">
-        <span>Paper mode {'enabled' if config.paper_execution_enabled else 'disabled'}</span>
+        <span>Paper execution {'enabled' if config.paper_execution_enabled else 'disabled'}</span>
         <span>Kill switch {'on' if config.paper_execution_kill_switch else 'off'}</span>
-        <span>Max open positions {int(account.get('effective_max_open_positions', config.paper_execution_max_open_positions) or config.paper_execution_max_open_positions)}</span>
-        <span>Order cap per tick {config.paper_execution_max_orders_per_tick}</span>
-        <span>Allowed strategies {_html(', '.join(config.paper_execution_allowed_strategies) or 'none')}</span>
+        <span>Paper max open positions {int(account.get('effective_max_open_positions', config.paper_execution_max_open_positions) or config.paper_execution_max_open_positions)}</span>
+        <span>Paper order cap per tick {config.paper_execution_max_orders_per_tick}</span>
+        <span>Paper allowed strategies {_html(', '.join(config.paper_execution_allowed_strategies) or 'none')}</span>
       </footer>
     </main>
   </body>
@@ -359,7 +379,7 @@ def _account_panel(account: dict[str, Any]) -> str:
 
     blocks = [
         (
-            "Balances",
+            "Paper balances",
             [
                 f"Equity {_fmt_currency(account.get('equity'))}",
                 f"Cash {_fmt_currency(account.get('cash'))}",
@@ -368,7 +388,7 @@ def _account_panel(account: dict[str, Any]) -> str:
             ],
         ),
         (
-            "P/L and capital",
+            "Paper P/L and capital envelope",
             [
                 f"Day change {_fmt_signed_currency(account.get('day_change_usd'))} {_fmt_signed_pct(account.get('day_change_pct'))}",
                 f"Open unrealized {_fmt_signed_currency(account.get('open_position_unrealized_pl_usd'))}",
@@ -421,7 +441,7 @@ def _positions_table(rows: list[Any]) -> str:
 def _orders_table(rows: list[Any]) -> str:
     typed_rows = [row for row in rows if isinstance(row, dict)]
     if not typed_rows:
-        return "<p class='subtle'>No recent paper orders.</p>"
+        return "<p class='subtle'>No recent broker orders.</p>"
 
     body = []
     for row in typed_rows:
@@ -430,6 +450,7 @@ def _orders_table(rows: list[Any]) -> str:
             f"<td>{_html(_fmt_dt(row.get('submitted_at') or row.get('captured_at')))}</td>"
             f"<td class='mono'>{_html(str(row.get('symbol', '-') or '-'))}</td>"
             f"<td>{_html(str(row.get('status', '-') or '-'))}</td>"
+            f"<td>{_html(str(row.get('broker_id', '-') or '-'))}</td>"
             f"<td>{_html(str(row.get('side', '-') or '-'))}</td>"
             f"<td>{_fmt_currency(row.get('notional_usd'))}</td>"
             f"<td>{_html(str(row.get('strategy_id', '-') or '-'))}</td>"
@@ -437,7 +458,7 @@ def _orders_table(rows: list[Any]) -> str:
         )
     return (
         "<table><thead><tr>"
-        "<th>When</th><th>Symbol</th><th>Status</th><th>Side</th><th>Notional</th><th>Strategy</th>"
+        "<th>When</th><th>Symbol</th><th>Status</th><th>Broker</th><th>Side</th><th>Notional</th><th>Strategy</th>"
         "</tr></thead><tbody>"
         + "".join(body)
         + "</tbody></table>"
@@ -551,7 +572,8 @@ def _render_holding_window_summary(advice: dict[str, Any]) -> list[str]:
     policy_all = _as_dict(advice.get("policy_stats_all"))
     rows = [
         (
-            f"strategy={advice.get('strategy_id', '-')}"
+            f"mode=recommendation_only"
+            f" | strategy={advice.get('strategy_id', '-')}"
             f" | current={advice.get('current_window', '-')}"
             f" | action={recommendation.get('action', '-')}"
             f" | confidence={recommendation.get('confidence', '-')}"
@@ -614,7 +636,7 @@ def _render_live_execution_intelligence(overview: dict[str, Any]) -> list[str]:
             f" | independent_live_strategy_fitness={'yes' if overview.get('live_independent_strategy_fitness') else 'no'}"
         ),
         (
-            "entry sample"
+            "recent order-ledger sample"
             f" | paper={int(overview.get('paper_entry_orders_sampled', 0) or 0)}"
             f" | live={int(overview.get('live_entry_orders_sampled', 0) or 0)}"
             f" | matched={int(overview.get('matched_live_followups', 0) or 0)}"
@@ -751,6 +773,14 @@ def _tone_from_number(value: Any) -> str:
     if number < 0:
         return "bad"
     return "neutral"
+
+
+def _market_gate_value(market_gate: dict[str, Any]) -> str:
+    if market_gate.get("market_open"):
+        return "OPEN"
+    if market_gate.get("crypto_scan_ready"):
+        return "CRYPTO ONLY"
+    return "CLOSED"
 
 
 def _fmt_dt(value: Any) -> str:

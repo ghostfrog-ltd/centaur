@@ -32,6 +32,8 @@ class SourcePricing:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
+    centaur_mode: str
+    centaur_environment: str
     env_name: str
     centaur_timezone: str
     market_timezone: str
@@ -45,6 +47,10 @@ class RuntimeConfig:
     usage_ledger_db_path: Path
     database_url: str
     database_url_source: str
+    postgres_schema: str
+    postgres_core_schema: str
+    postgres_paper_schema: str
+    postgres_live_schema: str
     api_daily_cost_warning_usd: float
     api_daily_cost_limit_usd: float
     alpaca_api_key: str
@@ -127,6 +133,14 @@ class RuntimeConfig:
     paper_execution_high_score_override_enabled: bool
     paper_execution_high_score_override_min_score: float
     paper_execution_high_score_override_fitness_margin: float
+    paper_execution_equity_no_weekend_carry_enabled: bool
+    paper_execution_equity_friday_entry_cutoff_minutes_before_close: int
+    paper_execution_equity_friday_flatten_minutes_before_close: int
+    trailing_drawdown_observer_enabled: bool
+    trailing_drawdown_observer_paper_giveback_usd: float
+    trailing_drawdown_observer_paper_giveback_pct: float
+    trailing_drawdown_observer_live_giveback_usd: float
+    trailing_drawdown_observer_live_giveback_pct: float
     paper_execution_equity_broker_id: str
     paper_execution_crypto_broker_id: str
     paper_execution_allowed_strategies: tuple[str, ...]
@@ -165,6 +179,7 @@ class RuntimeConfig:
 
 def load_runtime_config() -> RuntimeConfig:
     load_dotenv(DEFAULT_ENV_PATH)
+    load_config_defaults_from_file()
 
     usage_db_path = _resolve_project_path(
         os.getenv("USAGE_LEDGER_DB_PATH", "var/centaur_usage.sqlite3")
@@ -172,6 +187,8 @@ def load_runtime_config() -> RuntimeConfig:
     database_url, database_url_source = _resolve_database_url()
 
     return RuntimeConfig(
+        centaur_mode=_resolve_centaur_mode(),
+        centaur_environment=_resolve_centaur_environment(),
         env_name=os.getenv("CENTAUR_ENV", "development"),
         centaur_timezone=os.getenv("CENTAUR_TIMEZONE", "Europe/London"),
         market_timezone=os.getenv("MARKET_TIMEZONE", "America/New_York"),
@@ -199,6 +216,16 @@ def load_runtime_config() -> RuntimeConfig:
         usage_ledger_db_path=usage_db_path,
         database_url=database_url,
         database_url_source=database_url_source,
+        postgres_schema=_normalize_postgres_schema(os.getenv("POSTGRES_SCHEMA", "")),
+        postgres_core_schema=_normalize_postgres_schema(
+            os.getenv("CORE_POSTGRES_SCHEMA", "core")
+        ),
+        postgres_paper_schema=_normalize_postgres_schema(
+            os.getenv("PAPER_POSTGRES_SCHEMA", "paper")
+        ),
+        postgres_live_schema=_normalize_postgres_schema(
+            os.getenv("LIVE_POSTGRES_SCHEMA", "live")
+        ),
         api_daily_cost_warning_usd=_parse_float(
             os.getenv("API_DAILY_COST_WARNING_USD"),
             default=5.0,
@@ -509,6 +536,38 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN"),
             default=0.25,
         ),
+        paper_execution_equity_no_weekend_carry_enabled=_parse_bool(
+            os.getenv("PAPER_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED"),
+            default=True,
+        ),
+        paper_execution_equity_friday_entry_cutoff_minutes_before_close=_parse_int(
+            os.getenv("PAPER_EXECUTION_EQUITY_FRIDAY_ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE"),
+            default=60,
+        ),
+        paper_execution_equity_friday_flatten_minutes_before_close=_parse_int(
+            os.getenv("PAPER_EXECUTION_EQUITY_FRIDAY_FLATTEN_MINUTES_BEFORE_CLOSE"),
+            default=15,
+        ),
+        trailing_drawdown_observer_enabled=_parse_bool(
+            os.getenv("TRAILING_DRAWDOWN_OBSERVER_ENABLED"),
+            default=True,
+        ),
+        trailing_drawdown_observer_paper_giveback_usd=_parse_float(
+            os.getenv("TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_USD"),
+            default=2.0,
+        ),
+        trailing_drawdown_observer_paper_giveback_pct=_parse_float(
+            os.getenv("TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_PCT"),
+            default=0.0,
+        ),
+        trailing_drawdown_observer_live_giveback_usd=_parse_float(
+            os.getenv("TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_USD"),
+            default=2.0,
+        ),
+        trailing_drawdown_observer_live_giveback_pct=_parse_float(
+            os.getenv("TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_PCT"),
+            default=0.0,
+        ),
         paper_execution_equity_broker_id=(
             os.getenv("PAPER_EXECUTION_EQUITY_BROKER_ID", "alpaca_paper").strip().lower()
             or "alpaca_paper"
@@ -640,6 +699,111 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+def load_config_defaults_from_file() -> None:
+    config_path_value = os.getenv("CENTAUR_CONFIG", "").strip()
+    if not config_path_value:
+        return
+    config_path = _resolve_project_path(config_path_value)
+    if not config_path.exists():
+        return
+
+    config_values = _parse_simple_yaml_config(config_path)
+    mode = str(config_values.get("mode", "") or "").strip().lower()
+    strategy_csv = _csv_config_value(config_values.get("enabled_strategies"))
+    live_strategy_csv = _csv_config_value(config_values.get("live_enabled_strategies"))
+
+    mapping: dict[str, str] = {
+        "mode": "CENTAUR_MODE",
+        "environment": "CENTAUR_ENVIRONMENT",
+        "database": "POSTGRES_DB",
+        "postgres_schema": "POSTGRES_SCHEMA",
+        "core_postgres_schema": "CORE_POSTGRES_SCHEMA",
+        "paper_postgres_schema": "PAPER_POSTGRES_SCHEMA",
+        "live_postgres_schema": "LIVE_POSTGRES_SCHEMA",
+    }
+    for config_key, env_key in mapping.items():
+        value = config_values.get(config_key)
+        if value not in (None, ""):
+            os.environ.setdefault(env_key, str(value))
+
+    if strategy_csv:
+        os.environ.setdefault("PAPER_EXECUTION_ALLOWED_STRATEGIES", strategy_csv)
+    if live_strategy_csv:
+        os.environ.setdefault("LIVE_EXECUTION_ALLOWED_STRATEGIES", live_strategy_csv)
+
+    if config_values.get("max_notional_per_trade") not in (None, ""):
+        target_key = (
+            "LIVE_EXECUTION_DEFAULT_NOTIONAL_USD"
+            if mode == "live"
+            else "PAPER_EXECUTION_DEFAULT_NOTIONAL_USD"
+        )
+        os.environ.setdefault(target_key, str(config_values["max_notional_per_trade"]))
+    if config_values.get("base_slots") not in (None, ""):
+        target_key = (
+            "LIVE_EXECUTION_MAX_OPEN_POSITIONS"
+            if mode == "live"
+            else "PAPER_EXECUTION_MAX_OPEN_POSITIONS"
+        )
+        os.environ.setdefault(target_key, str(config_values["base_slots"]))
+    if config_values.get("max_live_open_positions") not in (None, ""):
+        os.environ.setdefault(
+            "LIVE_EXECUTION_MAX_OPEN_POSITIONS",
+            str(config_values["max_live_open_positions"]),
+        )
+    if config_values.get("max_daily_live_loss") not in (None, ""):
+        os.environ.setdefault(
+            "LIVE_EXECUTION_MAX_DAILY_DRAWDOWN_USD",
+            str(config_values["max_daily_live_loss"]),
+        )
+
+
+def _parse_simple_yaml_config(path: Path) -> dict[str, object]:
+    values: dict[str, object] = {}
+    current_list_key = ""
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- ") and current_list_key:
+            current = values.setdefault(current_list_key, [])
+            if isinstance(current, list):
+                current.append(_coerce_config_scalar(stripped[2:].strip()))
+            continue
+        current_list_key = ""
+        if ":" not in stripped:
+            continue
+        key, raw_value = stripped.split(":", 1)
+        key = key.strip()
+        value = raw_value.strip()
+        if not value:
+            values[key] = []
+            current_list_key = key
+            continue
+        values[key] = _coerce_config_scalar(value)
+    return values
+
+
+def _coerce_config_scalar(value: str) -> object:
+    cleaned = value.strip().strip('"').strip("'")
+    lowered = cleaned.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    try:
+        if "." in cleaned:
+            return float(cleaned)
+        return int(cleaned)
+    except ValueError:
+        return cleaned
+
+
+def _csv_config_value(value: object) -> str:
+    if isinstance(value, list):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
 def _load_provider_pricing() -> dict[str, SourcePricing]:
     return {
         "gemini_api": SourcePricing(
@@ -748,6 +912,58 @@ def _normalize_backend_preference(value: str) -> str:
     if normalized in {"auto", "postgres", "sqlite"}:
         return normalized
     return "auto"
+
+
+def _normalize_postgres_schema(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    allowed = []
+    for char in normalized:
+        if char.isalnum() or char == "_":
+            allowed.append(char.lower())
+    return "".join(allowed)
+
+
+def _normalize_centaur_mode(value: str) -> str:
+    normalized = str(value or "paper").strip().lower()
+    if normalized in {"shadow", "paper", "live_dry", "live"}:
+        return normalized
+    return "paper"
+
+
+def _normalize_centaur_environment(value: str) -> str:
+    normalized = str(value or "paper").strip().lower()
+    if normalized in {"paper", "live"}:
+        return normalized
+    return "paper"
+
+
+def _resolve_centaur_mode() -> str:
+    configured = os.getenv("CENTAUR_MODE")
+    if configured is not None and configured.strip():
+        return _normalize_centaur_mode(configured)
+
+    # Transition helper for the existing same-as-paper live follower lane: older
+    # .env files predate CENTAUR_MODE, so reflect an already-armed live lane
+    # honestly in status/metadata without changing any live activation gates.
+    if (
+        _parse_bool(os.getenv("LIVE_EXECUTION_ENABLED"), default=False)
+        and not _parse_bool(os.getenv("LIVE_EXECUTION_KILL_SWITCH"), default=True)
+        and os.getenv("LIVE_EXECUTION_ACTIVATION_ACK", "").strip()
+        == "LIVE_TRADING_APPROVED"
+    ):
+        return "live"
+
+    return "paper"
+
+
+def _resolve_centaur_environment() -> str:
+    configured = os.getenv("CENTAUR_ENVIRONMENT")
+    if configured is not None and configured.strip():
+        return _normalize_centaur_environment(configured)
+
+    return "live" if _resolve_centaur_mode() in {"live", "live_dry"} else "paper"
 
 
 def _parse_csv(value: str | None) -> tuple[str, ...]:
