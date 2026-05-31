@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from centaur.evidence_report import EvidenceReport
+from app.reporting.evidence_report import EvidenceReport
 
 
 class FakeUsageLedger:
@@ -78,7 +78,7 @@ class FakeUsageLedger:
 
 
 class StorageSeparationReportTests(unittest.TestCase):
-    def test_report_summarizes_row_level_provenance(self) -> None:
+    def test_report_summarizes_lane_schema_separation(self) -> None:
         reporter = EvidenceReport(
             config=SimpleNamespace(
                 centaur_mode="live",
@@ -95,7 +95,8 @@ class StorageSeparationReportTests(unittest.TestCase):
         report = reporter.render_storage_separation_report()
 
         self.assertIn("Centaur Paper/Live Storage Separation Report", report)
-        self.assertIn("physical_split=row_level_provenance_shared_postgres", report)
+        self.assertIn("physical_split=schema_separated_shared_postgres", report)
+        self.assertIn("separation_enforcement=shared_core_plus_lane_schemas", report)
         self.assertIn("lane=core | schema=core", report)
         self.assertIn("lane=paper | schema=paper", report)
         self.assertIn("lane=live | schema=live", report)

@@ -1,3 +1,60 @@
+<?php
+declare(strict_types=1);
+
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+
+$initialSnapshotJson = initialSnapshotJson();
+
+function initialSnapshotJson(): string
+{
+    $apiUrl = getenv('CENTAUR_DASHBOARD_API_URL') ?: 'http://host.docker.internal:8788/api/snapshot';
+    if (filter_var($apiUrl, FILTER_VALIDATE_URL) === false) {
+        return 'null';
+    }
+
+    $body = null;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($apiUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_CONNECTTIMEOUT => 2,
+            CURLOPT_TIMEOUT => 5,
+            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        ]);
+        $result = curl_exec($ch);
+        $statusCode = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $error = curl_error($ch);
+        unset($ch);
+        if ($result !== false && $error === '' && $statusCode >= 200 && $statusCode < 300) {
+            $body = $result;
+        }
+    } else {
+        $context = stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'timeout' => 5,
+                'ignore_errors' => true,
+                'header' => "Accept: application/json\r\n",
+            ],
+        ]);
+        $result = @file_get_contents($apiUrl, false, $context);
+        if ($result !== false) {
+            $body = $result;
+        }
+    }
+
+    if ($body === null) {
+        return 'null';
+    }
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded)) {
+        return 'null';
+    }
+    return json_encode($decoded, JSON_UNESCAPED_SLASHES) ?: 'null';
+}
+?>
 <!doctype html>
 <html lang="en">
 <head>
@@ -652,7 +709,7 @@
             </div>
             <div class="number-row">
               <input id="cycles" type="range" min="1" max="1000" step="1" value="365">
-              <input id="cycles-number" type="number" min="1" max="10000" step="1" value="365">
+              <input id="cycles-number" type="number" min="1" max="1000" step="1" value="365">
             </div>
           </div>
 
@@ -663,11 +720,11 @@
             </div>
             <div class="number-row">
               <input id="cycles-per-day" type="range" min="1" max="48" step="1" value="1">
-              <input id="cycles-per-day-number" type="number" min="1" max="1440" step="1" value="1">
+              <input id="cycles-per-day-number" type="number" min="1" max="48" step="1" value="1">
             </div>
           </div>
         </div>
-        <p class="note">Read-only projection. Snapshot defaults use closed paper-trade outcomes for win rate, average win, and average loss; account-level P/L still includes open red positions. The saved dashboard snapshot is refreshed in the background every 5 minutes; browser refreshes read that latest saved file. Calendar holidays and closed equity sessions are not automatically modeled; the active-day count is editable.</p>
+        <p class="note">Read-only projection. When the live follower is enabled, dashboard defaults use the live account and live closed-fill outcomes. Slots used per cycle and cycles per active day are derived from observed closed-trade throughput when available, not current open-position occupancy. Cycles per active day models faster slot turnover by multiplying the active-day horizon into closed-trade cycles. Paper values are used only when live is not active or no live account snapshot is available. Account-level P/L can include open red positions. Browser refreshes load the latest dashboard API payload. Calendar holidays and closed equity sessions are not automatically modeled; the active-day count is editable.</p>
       </aside>
 
       <section class="main">
@@ -780,6 +837,8 @@
   </main>
 
   <script>
+    const embeddedSnapshot = <?php echo $initialSnapshotJson; ?>;
+
     const currentEnvelope = {
       baseSlots: 10,
       slotSize: 10,
@@ -907,6 +966,13 @@
       return Number.isFinite(number) ? number : null;
     }
 
+    function firstMeaningfulNumber(...values) {
+      const finite = values.filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)))
+        .map((value) => Number(value));
+      const nonZero = finite.find((value) => Math.abs(value) > 0.000001);
+      return nonZero ?? finite[0] ?? null;
+    }
+
     function withCurrentSlotEconomics(preset) {
       const slotSize = numberOrNull(preset.slotSize) ?? currentEnvelope.slotSize;
       const returnPercent = numberOrNull(preset.returnPercent) ?? 0;
@@ -958,11 +1024,88 @@
       })}`;
     }
 
+    function selectCompoundingAccount(snapshot) {
+      const safeSnapshot = snapshot && typeof snapshot === "object" ? snapshot : {};
+      const liveOverview = safeSnapshot.live_execution_overview || {};
+      const brokerAccounts = Array.isArray(safeSnapshot.broker_accounts) ? safeSnapshot.broker_accounts : [];
+      const liveBrokerId = String(liveOverview.broker_id || "alpaca_live").trim().toLowerCase();
+      const liveAccount = brokerAccounts.find((row) => (
+        row
+        && row.has_snapshot
+        && String(row.broker_id || "").trim().toLowerCase() === liveBrokerId
+      ));
+
+      if (liveOverview.enabled && liveAccount) {
+        const slotSize = numberOrNull(liveOverview.slot_size_usd) ?? currentEnvelope.slotSize;
+        const envelopeMaxUsd = numberOrNull(liveOverview.envelope_max_usd);
+        const positionMarketValueUsd = numberOrNull(liveAccount.position_market_value);
+        const inferredOpenPositions = positionMarketValueUsd !== null && slotSize > 0
+          ? Math.max(0, Math.round(positionMarketValueUsd / slotSize))
+          : null;
+        const equity = numberOrNull(liveAccount.equity);
+        const lastEquity = numberOrNull(liveAccount.last_equity);
+        return {
+          mode: "live",
+          brokerLabel: String(liveAccount.broker_label || "Alpaca Live"),
+          account: {
+            slot_size_usd: slotSize,
+            base_max_open_positions: numberOrNull(liveOverview.max_open_positions),
+            effective_max_open_positions: numberOrNull(liveOverview.max_open_positions),
+            capital_envelope_max_usd: envelopeMaxUsd,
+            capital_committed_usd: positionMarketValueUsd,
+            capital_committed_pct: envelopeMaxUsd && positionMarketValueUsd !== null
+              ? Number(((positionMarketValueUsd / envelopeMaxUsd) * 100).toFixed(2))
+              : null,
+            open_positions_count: inferredOpenPositions,
+            open_position_unrealized_pl_usd: numberOrNull(liveAccount.open_position_unrealized_pl),
+            day_change_usd: equity !== null && lastEquity !== null
+              ? Number((equity - lastEquity).toFixed(6))
+              : null,
+            earned_slot_pnl_usd: null,
+          },
+        };
+      }
+
+      return {
+        mode: "paper",
+        brokerLabel: "Alpaca Paper",
+        account: safeSnapshot.account_overview || {},
+      };
+    }
+
+    function selectOutcomeMetrics(snapshot, selected) {
+      const safeSnapshot = snapshot && typeof snapshot === "object" ? snapshot : {};
+      return selected.mode === "live"
+        ? (safeSnapshot.live_trade_outcome_metrics || {})
+        : (safeSnapshot.paper_trade_outcome_metrics || {});
+    }
+
+    function snapshotSourceLabel(snapshot) {
+      const base = fmtSnapshotLabel(snapshot && snapshot.checked_at);
+      const selected = selectCompoundingAccount(snapshot);
+      const account = selected.account || {};
+      const outcomes = selectOutcomeMetrics(snapshot, selected);
+      const closedTrades = numberOrNull(outcomes.closed_trades) ?? 0;
+      const openPositions = numberOrNull(account.open_positions_count);
+      const effectiveSlots = numberOrNull(account.effective_max_open_positions)
+        ?? numberOrNull(account.base_max_open_positions);
+
+      if (closedTrades > 0) {
+        return `${base} | ${selected.mode} outcomes ${fmtNumber(closedTrades, 0)} closed`;
+      }
+      if (openPositions !== null && effectiveSlots !== null && effectiveSlots > 0) {
+        return `${base} | ${selected.mode} ${fmtNumber(openPositions, 0)}/${fmtNumber(effectiveSlots, 0)} slots | no closed outcomes`;
+      }
+      return `${base} | ${selected.mode} account defaults | no closed outcomes`;
+    }
+
     function getInputs() {
       const slotSize = Math.max(0.01, valueOf("slotSize"));
       const returnPerSlot = backMode === "percent"
         ? slotSize * (valueOf("returnPercent") / 100)
         : valueOf("returnDollars");
+      const activeDays = Math.max(1, Math.floor(valueOf("cycles")));
+      const cyclesPerDay = Math.max(1, Math.floor(valueOf("cyclesPerDay")));
       return {
         baseSlots: Math.max(0, Math.floor(valueOf("baseSlots"))),
         slotSize,
@@ -974,8 +1117,9 @@
         lossPercent: valueOf("lossPercent"),
         slotFill: clamp(valueOf("slotFill"), 0, 100) / 100,
         startingProfit: valueOf("startingProfit"),
-        cycles: Math.max(1, Math.floor(valueOf("cycles"))),
-        cyclesPerDay: Math.max(1, Math.floor(valueOf("cyclesPerDay")))
+        activeDays,
+        cycles: activeDays * cyclesPerDay,
+        cyclesPerDay
       };
     }
 
@@ -1035,7 +1179,7 @@
       nodes.lossPercentReadout.textContent = pct(inputs.lossPercent);
       nodes.slotFillReadout.textContent = pct(inputs.slotFill * 100);
       nodes.startingProfitReadout.textContent = fmtCurrency(inputs.startingProfit);
-      nodes.cyclesReadout.textContent = fmtNumber(inputs.cycles);
+      nodes.cyclesReadout.textContent = fmtNumber(inputs.activeDays);
       nodes.cyclesPerDayReadout.textContent = fmtNumber(inputs.cyclesPerDay);
       nodes.modePercent.classList.toggle("active", backMode === "percent");
       nodes.modeDollars.classList.toggle("active", backMode === "dollars");
@@ -1049,6 +1193,7 @@
       const nextSlotAt = (end.earnedSlots + 1) * inputs.slotSize;
       const nextSlotNeeds = Math.max(0, nextSlotAt - Math.max(0, end.profit));
       const days = end.day;
+      const slotTurnsPerDay = end.effectiveSlots * inputs.slotFill * inputs.cyclesPerDay;
       const returnText = backMode === "percent"
         ? `${pct(inputs.returnPercent)} avg win | ${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`
         : `${fmtCurrency(inputs.returnPerSlot)} avg win | ${pct(inputs.winRate * 100)} win / ${pct((1 - inputs.winRate) * 100)} loss`;
@@ -1058,10 +1203,10 @@
       nodes.statSlots.textContent = fmtNumber(end.effectiveSlots);
       nodes.statSlotsDetail.textContent = `${fmtNumber(end.earnedSlots)} earned from ${fmtCurrency(Math.max(0, end.profit))} tracked P/L`;
       nodes.statCapacity.textContent = fmtCurrency(end.capacity);
-      nodes.statCapacityDetail.textContent = `${fmtNumber(end.effectiveSlots)} x ${fmtCurrency(inputs.slotSize)} | ${returnText} | ${pct(inputs.lossPercent)} loss`;
+      nodes.statCapacityDetail.textContent = `${fmtNumber(end.effectiveSlots)} x ${fmtCurrency(inputs.slotSize)} | ${fmtNumber(slotTurnsPerDay, 1)} projected slot turns/day | ${returnText} | ${pct(inputs.lossPercent)} loss`;
       nodes.statNext.textContent = fmtCurrency(nextSlotNeeds);
       nodes.statNextDetail.textContent = nextSlotNeeds === 0 ? "next slot unlocked" : `next slot at ${fmtCurrency(nextSlotAt)}`;
-      nodes.chartBadge.textContent = `${fmtNumber(inputs.cycles)} cycles | ${fmtNumber(days, 1)} active days`;
+      nodes.chartBadge.textContent = `${fmtNumber(inputs.cycles)} cycles | ${fmtNumber(inputs.cyclesPerDay)} per day | ${fmtNumber(days, 1)} active days`;
       nodes.milestoneBadge.textContent = `${fmtNumber(end.earnedSlots)} earned`;
     }
 
@@ -1367,54 +1512,111 @@
     }
 
     function presetFromSnapshot(snapshot) {
-      const account = snapshot && typeof snapshot === "object" ? snapshot.account_overview || {} : {};
+      const selected = selectCompoundingAccount(snapshot);
+      const account = selected.account || {};
       const performance = snapshot && typeof snapshot === "object" ? snapshot.performance_comparison || {} : {};
-      const outcomes = snapshot && typeof snapshot === "object" ? snapshot.paper_trade_outcome_metrics || {} : {};
+      const outcomes = selectOutcomeMetrics(snapshot, selected);
       const slotSize = numberOrNull(account.slot_size_usd) ?? currentEnvelope.slotSize;
       const baseSlots = numberOrNull(account.base_max_open_positions) ?? currentEnvelope.baseSlots;
-      const trackedPnl = numberOrNull(account.earned_slot_pnl_usd);
-      const trackedDays = Math.max(1, numberOrNull(performance.tracked_days) ?? 1);
-      const returnOnEnvelopePct = numberOrNull(performance.return_on_envelope_pct);
-      const observedNetPctPerDay = returnOnEnvelopePct === null
-        ? defaults.returnPercent
-        : Number((returnOnEnvelopePct / trackedDays).toFixed(4));
+      const effectiveSlots = numberOrNull(account.effective_max_open_positions) ?? baseSlots;
+      const openPositions = numberOrNull(account.open_positions_count);
+      const openPositionUnrealizedPlUsd = numberOrNull(account.open_position_unrealized_pl_usd);
+      const currentSlotFillPct = effectiveSlots > 0 && openPositions !== null
+        ? Number(((openPositions / effectiveSlots) * 100).toFixed(2))
+        : numberOrNull(account.capital_committed_pct);
+      const trackedPnl = firstMeaningfulNumber(
+        numberOrNull(performance.total_pnl_usd),
+        openPositionUnrealizedPlUsd,
+        numberOrNull(account.day_change_usd),
+        numberOrNull(account.earned_slot_pnl_usd)
+      );
       const closedTrades = numberOrNull(outcomes.closed_trades) ?? 0;
       const avgWinPct = numberOrNull(outcomes.avg_win_pct);
       const avgLossPct = numberOrNull(outcomes.avg_loss_pct);
       const winRate = numberOrNull(outcomes.win_rate);
       const observedSlotFillPct = numberOrNull(outcomes.observed_slot_fill_pct);
+      const observedTradesPerDay = numberOrNull(outcomes.observed_trades_per_day);
+      const hasOutcomeMetrics = closedTrades > 0;
+      const observedCyclesPerDay = hasOutcomeMetrics && observedTradesPerDay !== null && effectiveSlots > 0
+        ? Math.max(1, Math.ceil(observedTradesPerDay / effectiveSlots))
+        : defaults.cyclesPerDay;
+      const observedSlotsPerCyclePct = hasOutcomeMetrics && observedTradesPerDay !== null && effectiveSlots > 0
+        ? Number(clamp((observedTradesPerDay / (effectiveSlots * observedCyclesPerDay)) * 100, 1, 100).toFixed(2))
+        : null;
       return {
         ...defaults,
         baseSlots,
         slotSize,
-        returnPercent: closedTrades > 0 && avgWinPct !== null ? avgWinPct : observedNetPctPerDay,
-        winRate: closedTrades > 0 && winRate !== null ? Number((winRate * 100).toFixed(2)) : 100,
-        lossPercent: closedTrades > 0 && avgLossPct !== null ? avgLossPct : 0,
-        slotFill: closedTrades > 0 && observedSlotFillPct !== null ? observedSlotFillPct : defaults.slotFill,
-        startingProfit: trackedPnl === null ? defaults.startingProfit : trackedPnl
+        returnPercent: hasOutcomeMetrics && avgWinPct !== null
+          ? avgWinPct
+          : 0,
+        winRate: hasOutcomeMetrics && winRate !== null ? Number((winRate * 100).toFixed(2)) : 0,
+        lossPercent: hasOutcomeMetrics && avgLossPct !== null ? avgLossPct : 0,
+        slotFill: observedSlotsPerCyclePct !== null
+          ? observedSlotsPerCyclePct
+          : hasOutcomeMetrics && observedSlotFillPct !== null && observedSlotFillPct > 0
+          ? observedSlotFillPct
+          : (currentSlotFillPct ?? defaults.slotFill),
+        startingProfit: trackedPnl === null ? defaults.startingProfit : Number(trackedPnl.toFixed(2)),
+        cyclesPerDay: observedCyclesPerDay
       };
+    }
+
+    function loadJson(url) {
+      if (typeof window.fetch === "function") {
+        return window.fetch(url, { cache: "no-store" }).then((response) => {
+          if (!response.ok) {
+            throw new Error(`Snapshot request failed with ${response.status}`);
+          }
+          return response.json();
+        });
+      }
+      if (typeof window.XMLHttpRequest !== "function") {
+        return Promise.reject(new Error("Snapshot requests are not supported by this browser"));
+      }
+
+      return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open("GET", url, true);
+        request.setRequestHeader("Accept", "application/json");
+        request.onload = () => {
+          if (request.status < 200 || request.status >= 300) {
+            reject(new Error(`Snapshot request failed with ${request.status}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(request.responseText));
+          } catch (error) {
+            reject(error);
+          }
+        };
+        request.onerror = () => reject(new Error("Snapshot request failed"));
+        request.send();
+      });
     }
 
     async function loadSnapshotDefaults() {
       if (!["http:", "https:"].includes(window.location.protocol)) {
         return false;
       }
-      const response = await fetch("/api/snapshot.php", { cache: "no-store" });
-      if (!response.ok) {
-        return false;
-      }
-      const snapshot = await response.json();
-      applyPreset(presetFromSnapshot(snapshot), fmtSnapshotLabel(snapshot.checked_at));
+      const snapshot = await loadJson("/api/snapshot.php");
+      applyPreset(presetFromSnapshot(snapshot), snapshotSourceLabel(snapshot));
       return true;
     }
 
     async function initialize() {
-      applyPreset(defaults, "Current envelope");
+      if (embeddedSnapshot && typeof embeddedSnapshot === "object") {
+        applyPreset(presetFromSnapshot(embeddedSnapshot), snapshotSourceLabel(embeddedSnapshot));
+      } else {
+        applyPreset(defaults, "Current envelope");
+      }
       try {
         await loadSnapshotDefaults();
       } catch (error) {
-        currentDefaultSource = "Current envelope";
-        render();
+        if (!embeddedSnapshot || typeof embeddedSnapshot !== "object") {
+          currentDefaultSource = "Current envelope";
+          render();
+        }
       }
     }
 
@@ -1458,9 +1660,19 @@
     document.getElementById("preset-current").addEventListener("click", async () => {
       try {
         const loaded = await loadSnapshotDefaults();
-        if (!loaded) applyPreset(defaults, "Current envelope");
+        if (!loaded) {
+          if (embeddedSnapshot && typeof embeddedSnapshot === "object") {
+            applyPreset(presetFromSnapshot(embeddedSnapshot), snapshotSourceLabel(embeddedSnapshot));
+          } else {
+            applyPreset(defaults, "Current envelope");
+          }
+        }
       } catch (error) {
-        applyPreset(defaults, "Current envelope");
+        if (embeddedSnapshot && typeof embeddedSnapshot === "object") {
+          applyPreset(presetFromSnapshot(embeddedSnapshot), snapshotSourceLabel(embeddedSnapshot));
+        } else {
+          applyPreset(defaults, "Current envelope");
+        }
       }
     });
     document.getElementById("preset-fast").addEventListener("click", () => applyPreset(fastPreset, "Faster test"));

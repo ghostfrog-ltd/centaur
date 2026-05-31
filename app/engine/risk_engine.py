@@ -1,6 +1,6 @@
 """Risk-gate pipeline facade."""
 
-from centaur.pipelines import (
+from app.engine.pipelines import (
     daily_protection,
     live_risk_cfo_gate,
     risk_cfo_gate,

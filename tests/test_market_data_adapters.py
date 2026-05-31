@@ -10,7 +10,7 @@ from app.adapters.market_data import (
     get_market_data_adapter,
 )
 from app.adapters.market_data.alpaca_data import AlpacaMarketDataAdapter
-from centaur.models import TickContext
+from app.runtime.models import TickContext
 
 
 class MarketDataAdapterTests(unittest.TestCase):
@@ -130,7 +130,7 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertEqual(rows["BTC/USD"][0]["venue_symbol"], "BTC/USD")
 
     def test_alpaca_adapter_wraps_vendor_errors(self) -> None:
-        from centaur.alpaca import AlpacaApiError
+        from app.adapters.alpaca import AlpacaApiError
         from app.adapters.market_data import alpaca_data as alpaca_adapter_module
 
         class FakeClient:

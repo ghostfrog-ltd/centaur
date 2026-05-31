@@ -231,9 +231,6 @@ These live in `.env`. Use `.env.example` as the template.
 `CONTROL_MAX_TICK_RUNTIME_SECONDS`
 : Expected maximum tick runtime before it should be treated as too slow.
 
-`CONTROL_REFRESH_DASHBOARD_SNAPSHOT`
-: Whether each control tick refreshes `var/dashboard_snapshot.json`. Currently false so dashboard work does not slow trading.
-
 `CONTROL_LOCK_NAME`
 : Lock name used by the wrapper so scheduled ticks skip instead of stacking.
 
@@ -723,18 +720,18 @@ The primary dashboard is the DDEV/OrbStack web app:
 https://ghostfrog-centaur.ddev.site
 ```
 
-It reads:
+It reads through the routed PHP proxy:
 
 ```text
-var/dashboard_snapshot.json
+/api/snapshot.php
 ```
 
-That file is runtime output and is ignored by Git. In the current headless trading setup, automatic snapshot refresh after each control tick is disabled so the trade loop does not wait on dashboard work.
+That endpoint proxies the live host dashboard API at `http://host.docker.internal:8788/api/snapshot`. The Python dashboard API is the source of truth; the DDEV web app no longer depends on a repo-local snapshot file bridge.
 
-To refresh manually:
+To run the host dashboard API directly:
 
 ```bash
-.venv-mac/bin/python scripts/dashboard_snapshot.py
+.venv-mac/bin/python main.py --dashboard --host 0.0.0.0 --port 8788
 ```
 
 ## Durable Project Memory
@@ -756,7 +753,7 @@ Ignored by default:
 - virtualenvs
 - Python caches
 - runtime logs
-- `var/` snapshots and SQLite files
+- `/.runtime/` local SQLite fallback files
 - IDE and OS noise
 
 Trackable by default:

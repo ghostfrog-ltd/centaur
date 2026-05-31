@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from centaur.adapter_inventory import AdapterInventoryReport
+from app.reporting.adapter_inventory import AdapterInventoryReport
 
 
 class AdapterInventoryReportTests(unittest.TestCase):

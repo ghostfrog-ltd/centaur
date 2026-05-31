@@ -10,7 +10,7 @@ from app.adapters.execution import (
     get_execution_adapter,
 )
 from app.adapters.execution.broker_bridge import BrokerExecutionAdapter
-from centaur.models import TickContext
+from app.runtime.models import TickContext
 
 
 class ExecutionAdapterTests(unittest.TestCase):

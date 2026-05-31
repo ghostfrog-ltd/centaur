@@ -6,6 +6,19 @@ Last updated: 2026-05-31
 
 ## 2026-05-31
 
+### Simplify runtime configuration to `.env` only
+Decision:
+- remove the paper/live YAML runtime defaults and the `configs/` folder
+- make `.env` the single runtime configuration source
+- group `.env` and `.env.example` into core, paper, and live sections with operator-facing safety notes
+- mirror paper/live execution levers in `.env`; while live is armed, unlisted drift fails closed and reviewed named differences must be listed in `LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES`
+
+Why:
+- paper/live YAML defaults were not active unless a separate environment pointer was set
+- the duplicate path made database and execution levers harder to audit
+- a single sectioned `.env` is easier to inspect before paper or live operation
+- same-as-paper live operation should be obvious in config, while small reviewed differences need an explicit operator lever and runtime validation
+
 ### Add runtime context, execution router, live guard, and instrument registry foundations
 Decision:
 - add a `ModeContext` runtime model that centralizes mode/environment normalization and live-broker permission checks
@@ -31,8 +44,7 @@ Decision:
 - add `scripts/bootstrap_storage_lanes.py` to initialize the configured PostgreSQL `core`, `paper`, and `live` schemas/tables before any active scheduler cutover
 - add `.venv-mac/bin/python main.py --adapter-inventory`, a read-only inventory of active, bridged, scaffold-only, and not-implemented market-data/execution/broker-account adapters
 - surface the canonical instrument id in recent broker-order and shadow-proposal status lines
-- add PostgreSQL-only paper/live config and deployment examples under `configs/` and `deployments/`
-- make `CENTAUR_CONFIG` load those paper/live YAML files as runtime defaults, while keeping `.env` as the final operator override layer
+- keep paper/live lane settings visible in the runtime environment instead of splitting active defaults across multiple config formats
 - create the target physical `app/` architecture tree as facade modules over the current `centaur/` implementation, covering `core`, `engine`, `adapters`, `runtime`, `storage`, `reporting`, and `strategies`
 - move the first implementation slice into `app/`: runtime mode context, live guard, execution router, execution adapters, market-data adapters, canonical instruments, and storage layout
 - keep the old `centaur/` files for those moved boundaries as compatibility wrappers and switch active pipeline imports to the `app/` modules

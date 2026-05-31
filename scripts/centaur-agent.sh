@@ -56,6 +56,7 @@ case "${1:-}" in
     echo "Starting DDEV-routed Centaur dashboard..."
     ddev start
     echo "Dashboard URL: https://ghostfrog-centaur.ddev.site"
+    echo "Live API source: http://host.docker.internal:8788/api/snapshot"
     ;;
 
   status)

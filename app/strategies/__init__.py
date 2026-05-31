@@ -1,6 +1,6 @@
 """Strategy facades for the current deterministic strategy registry."""
 
-from centaur.strategies import (
+from app.strategies.registry import (
     StrategyDefinition,
     StrategyProfile,
     StrategySignal,
@@ -13,4 +13,3 @@ __all__ = [
     "StrategySignal",
     "build_strategy_registry",
 ]
-

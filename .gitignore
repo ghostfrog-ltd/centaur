@@ -20,8 +20,8 @@ __pycache__/
 coverage.xml
 htmlcov/
 
-# Runtime state, generated snapshots, and local databases
-var/
+# Runtime state and local databases
+/.runtime/
 *.sqlite
 *.sqlite3
 *.db

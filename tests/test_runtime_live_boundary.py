@@ -4,8 +4,8 @@ import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-import centaur.pipelines as pipelines
-from centaur.models import TickContext
+import app.engine.pipelines as pipelines
+from app.runtime.models import TickContext
 
 
 class RuntimeLiveBoundaryTests(unittest.TestCase):

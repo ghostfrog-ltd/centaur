@@ -1,6 +1,5 @@
 """Dashboard/status model facade."""
 
-from centaur.status import StatusReporter
+from app.reporting.status import StatusReporter
 
 __all__ = ["StatusReporter"]
-

@@ -1,3 +1,9 @@
+<?php
+declare(strict_types=1);
+
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+?>
 <!doctype html>
 <html lang="en">
 <head>
@@ -17,7 +23,7 @@
       <div class="flex flex-wrap gap-2">
         <button id="refresh-button" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Refresh</button>
         <a href="/" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Slot Compounding</a>
-        <a href="/api/snapshot.php" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Snapshot JSON</a>
+        <a href="/api/snapshot.php" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Live JSON</a>
       </div>
     </header>
 

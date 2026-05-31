@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from centaur.runtime import ModeContext, normalize_runtime_environment
+from app.runtime.mode_context import ModeContext, normalize_runtime_environment
 
 
 class RuntimeContextTests(unittest.TestCase):

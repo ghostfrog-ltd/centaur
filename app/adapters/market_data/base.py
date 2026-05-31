@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from centaur.models import TickContext
+    from app.runtime.models import TickContext
 
 
 class MarketDataAdapterError(RuntimeError):

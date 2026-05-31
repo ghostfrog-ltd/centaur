@@ -1,6 +1,5 @@
 """Strategy-fitness report facade."""
 
-from centaur.strategy_health_report import StrategyHealthReport
+from app.reporting.strategy_health_report import StrategyHealthReport
 
 __all__ = ["StrategyHealthReport"]
-

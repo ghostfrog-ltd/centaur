@@ -7,8 +7,8 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from centaur.config import load_config_defaults_from_file, load_runtime_config
-from centaur.usage import UsageLedger
+from app.runtime.settings import load_runtime_config
+from app.storage.usage import UsageLedger
 
 
 class EnvironmentMetadataTests(unittest.TestCase):
@@ -321,52 +321,42 @@ class EnvironmentMetadataTests(unittest.TestCase):
 
         self.assertEqual(config.postgres_schema, "liveops2026")
 
-    def test_centaur_config_file_supplies_lane_defaults(self) -> None:
-        config_path = Path(self._tmpdir.name) / "live.yaml"
-        config_path.write_text(
-            "\n".join(
-                [
-                    "mode: live",
-                    "environment: live",
-                    "database: centaur_live",
-                    "core_postgres_schema: core",
-                    "paper_postgres_schema: paper",
-                    "live_postgres_schema: live",
-                    "postgres_schema: live",
-                    "enabled_strategies:",
-                    "  - mean_reversion.snapback",
-                    "  - crypto_momentum.trend",
-                    "live_enabled_strategies:",
-                    "  - mean_reversion.snapback",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        for key in (
-            "CENTAUR_MODE",
-            "CENTAUR_ENVIRONMENT",
-            "POSTGRES_DB",
-            "POSTGRES_SCHEMA",
-            "PAPER_EXECUTION_ALLOWED_STRATEGIES",
-            "LIVE_EXECUTION_ALLOWED_STRATEGIES",
+    def test_armed_live_config_fails_when_risk_lever_differs_from_paper(self) -> None:
+        os.environ["LIVE_EXECUTION_ENABLED"] = "true"
+        os.environ["LIVE_EXECUTION_ACTIVATION_ACK"] = "LIVE_TRADING_APPROVED"
+        os.environ["PAPER_EXECUTION_DEFAULT_NOTIONAL_USD"] = "10.00"
+        os.environ["LIVE_EXECUTION_DEFAULT_NOTIONAL_USD"] = "11.00"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "live_same_as_paper_config_mismatch: execution_default_notional_usd",
         ):
-            os.environ.pop(key, None)
-        os.environ["CENTAUR_CONFIG"] = str(config_path)
+            load_runtime_config()
 
-        load_config_defaults_from_file()
+    def test_armed_live_config_can_allow_named_paper_difference(self) -> None:
+        os.environ["LIVE_EXECUTION_ENABLED"] = "true"
+        os.environ["LIVE_EXECUTION_ACTIVATION_ACK"] = "LIVE_TRADING_APPROVED"
+        os.environ["PAPER_EXECUTION_DEFAULT_NOTIONAL_USD"] = "10.00"
+        os.environ["LIVE_EXECUTION_DEFAULT_NOTIONAL_USD"] = "11.00"
+        os.environ[
+            "LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES"
+        ] = "execution_default_notional_usd"
 
-        self.assertEqual(os.environ["CENTAUR_MODE"], "live")
-        self.assertEqual(os.environ["POSTGRES_SCHEMA"], "live")
-        self.assertNotIn("LIVE_EXECUTION_MAX_DAILY_ORDERS", os.environ)
-        self.assertNotIn("LIVE_EXECUTION_MAX_LATEST_BAR_AGE_SECONDS", os.environ)
-        self.assertEqual(
-            os.environ["PAPER_EXECUTION_ALLOWED_STRATEGIES"],
-            "mean_reversion.snapback,crypto_momentum.trend",
-        )
-        self.assertEqual(
-            os.environ["LIVE_EXECUTION_ALLOWED_STRATEGIES"],
-            "mean_reversion.snapback",
-        )
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_execution_default_notional_usd, 10.0)
+        self.assertEqual(config.live_execution_default_notional_usd, 11.0)
+
+    def test_armed_live_config_rejects_unknown_allowed_difference(self) -> None:
+        os.environ["LIVE_EXECUTION_ENABLED"] = "true"
+        os.environ["LIVE_EXECUTION_ACTIVATION_ACK"] = "LIVE_TRADING_APPROVED"
+        os.environ["LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES"] = "made_up_lever"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "live_same_as_paper_unknown_allowed_difference: made_up_lever",
+        ):
+            load_runtime_config()
 
 
 if __name__ == "__main__":

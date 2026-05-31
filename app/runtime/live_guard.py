@@ -8,7 +8,7 @@ from app.core.instruments import InstrumentRegistry, default_instrument_registry
 from .mode_context import mode_context_from_config
 
 if TYPE_CHECKING:
-    from centaur.models import TickContext
+    from app.runtime.models import TickContext
 
 
 class LiveRiskGuardError(RuntimeError):

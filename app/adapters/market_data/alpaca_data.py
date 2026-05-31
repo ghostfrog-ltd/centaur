@@ -8,11 +8,11 @@ from app.core.instruments import InstrumentRegistry, default_instrument_registry
 from .base import MarketDataAdapter, MarketDataAdapterError
 
 if TYPE_CHECKING:
-    from centaur.models import TickContext
+    from app.runtime.models import TickContext
 
 
 def get_alpaca_client(context: "TickContext"):
-    from centaur.alpaca import get_alpaca_client as _get_alpaca_client
+    from app.adapters.alpaca import get_alpaca_client as _get_alpaca_client
 
     return _get_alpaca_client(context)
 
@@ -31,7 +31,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         *,
         symbols: list[str],
     ) -> dict[str, dict[str, Any]]:
-        from centaur.alpaca import AlpacaApiError
+        from app.adapters.alpaca import AlpacaApiError
 
         try:
             bars = get_alpaca_client(context).get_latest_bars(context, symbols=symbols)
@@ -46,7 +46,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         location: str,
         symbols: list[str],
     ) -> dict[str, dict[str, Any]]:
-        from centaur.alpaca import AlpacaApiError
+        from app.adapters.alpaca import AlpacaApiError
 
         try:
             bars = get_alpaca_client(context).get_latest_crypto_bars(
@@ -68,7 +68,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         end: datetime,
         feed: str = "",
     ) -> dict[str, list[dict[str, Any]]]:
-        from centaur.alpaca import AlpacaApiError
+        from app.adapters.alpaca import AlpacaApiError
 
         try:
             bars = get_alpaca_client(context).get_historical_stock_bars(
@@ -96,7 +96,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         start: datetime,
         end: datetime,
     ) -> dict[str, list[dict[str, Any]]]:
-        from centaur.alpaca import AlpacaApiError
+        from app.adapters.alpaca import AlpacaApiError
 
         try:
             bars = get_alpaca_client(context).get_historical_crypto_bars(

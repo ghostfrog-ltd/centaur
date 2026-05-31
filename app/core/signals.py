@@ -1,6 +1,5 @@
 """Strategy signal model facade."""
 
-from centaur.strategies import StrategySignal
+from app.strategies.registry import StrategySignal
 
 __all__ = ["StrategySignal"]
-

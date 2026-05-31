@@ -3,20 +3,19 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 
-from centaur.adapter_inventory import AdapterInventoryReport
-from centaur.backfill import HistoricalBackfillRunner
-from centaur.config import load_runtime_config
-from centaur.control import ControlPipelineRunner
-from centaur.crypto_health_report import CryptoHealthReport
-from centaur.dashboard_snapshot import write_dashboard_snapshot
-from centaur.evidence_report import EvidenceReport
-from centaur.holding_window_advisor import HoldingWindowAdvisor
-from centaur.paper_exit_review import PaperExitReview
-from centaur.replay import HistoricalReplayRunner
-from centaur.status import StatusReporter
-from centaur.strategy_health_report import StrategyHealthReport
-from centaur.threshold_advisor import ThresholdAdvisor
-from centaur.usage import UsageLedger
+from app.engine.backfill import HistoricalBackfillRunner
+from app.engine.replay import HistoricalReplayRunner
+from app.reporting.adapter_inventory import AdapterInventoryReport
+from app.reporting.crypto_health_report import CryptoHealthReport
+from app.reporting.evidence_report import EvidenceReport
+from app.reporting.holding_window_advisor import HoldingWindowAdvisor
+from app.reporting.paper_exit_review import PaperExitReview
+from app.reporting.status import StatusReporter
+from app.reporting.strategy_health_report import StrategyHealthReport
+from app.reporting.threshold_advisor import ThresholdAdvisor
+from app.runtime.control import ControlPipelineRunner
+from app.runtime.settings import load_runtime_config
+from app.storage.usage import UsageLedger
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,7 +238,7 @@ def main() -> None:
         return
 
     if args.dashboard:
-        from centaur.web_dashboard import run_web_dashboard
+        from app.reporting.web_dashboard import run_web_dashboard
 
         run_web_dashboard(
             host=args.host,
@@ -249,7 +248,7 @@ def main() -> None:
         return
 
     if args.dashboard_desktop:
-        from centaur.dashboard import run_dashboard
+        from app.reporting.dashboard import run_dashboard
 
         run_dashboard()
         return
@@ -321,14 +320,7 @@ def main() -> None:
         )
         return
 
-    try:
-        runner.run_tick()
-    finally:
-        if config.control_refresh_dashboard_snapshot:
-            try:
-                write_dashboard_snapshot()
-            except Exception as exc:  # pragma: no cover - best-effort operator surface
-                print(f"Dashboard snapshot refresh failed: {exc}", flush=True)
+    runner.run_tick()
 
 
 def _parse_csv_argument(value: str) -> tuple[str, ...] | None:

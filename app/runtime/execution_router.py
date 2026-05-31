@@ -10,7 +10,7 @@ from .live_guard import LiveRiskGuard, LiveRiskGuardError
 from .mode_context import mode_context_from_config
 
 if TYPE_CHECKING:
-    from centaur.models import TickContext
+    from app.runtime.models import TickContext
 
 ExecutionAdapterFactory = Callable[[Any, str], Any]
 
