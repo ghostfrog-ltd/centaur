@@ -1,3 +1,17 @@
+"""Control-pipeline steps for Centaur's tick loop.
+
+Most trading behavior is implemented as small pipeline runners that share a
+`TickContext`. The strategy-fitness path is intentionally ordered:
+
+1. `shadow_trade_outcomes` evaluates any due shadow checkpoints.
+2. `strategy_fitness` summarizes those outcomes into ranked fitness rows.
+3. `strategy_signals` generates current deterministic signals and allocates
+   them through the latest fitness summaries before risk/execution steps run.
+
+That ordering keeps fitness evidence fresh while preserving the downstream risk
+gates. Changing the order can change which signals reach paper/live execution.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -2121,6 +2135,12 @@ def live_exit_management(context: TickContext) -> PipelineResult:
 
 
 def shadow_trade_outcomes(context: TickContext) -> PipelineResult:
+    """Evaluate due shadow checkpoints and persist risk-adjusted outcomes.
+
+    Shadow outcomes are evidence, not trades. They replay later bars against
+    prior watch-only proposals, apply the configured friction model, and store
+    per-checkpoint fitness scores for the next `strategy_fitness` step.
+    """
     if not context.config.shadow_enabled:
         result = {
             "checkpoints_due": 0,
@@ -2150,6 +2170,8 @@ def shadow_trade_outcomes(context: TickContext) -> PipelineResult:
             end_at=context.started_at,
         )
         bars_loaded += len(bars)
+        # This is the only point in the live tick where due shadow checkpoints
+        # become scored fitness evidence.
         outcome = evaluate_shadow_checkpoint(
             checkpoint=checkpoint,
             bars=bars,
@@ -2191,6 +2213,13 @@ def shadow_trade_outcomes(context: TickContext) -> PipelineResult:
 
 
 def strategy_fitness(context: TickContext) -> PipelineResult:
+    """Build and save the latest strategy-fitness scorecard.
+
+    Storage returns raw aggregates grouped by strategy/asset/checkpoint. The
+    fitness engine applies minimum-sample rules, computes composite scores, and
+    ranks the summaries. These summaries are shared evidence for paper and the
+    approved same-as-paper live follower lane.
+    """
     raw_rows = context.usage_ledger.list_strategy_fitness_rows(
         as_of=context.started_at,
         lookback_days=context.config.strategy_fitness_lookback_days,
@@ -2231,6 +2260,12 @@ def strategy_fitness(context: TickContext) -> PipelineResult:
 
 
 def strategy_signals(context: TickContext) -> PipelineResult:
+    """Generate current signals and apply fitness allocation.
+
+    Deterministic strategy logic creates base signals first. Fitness then acts
+    as a narrow allocation gate: it can weight, favor, suppress, or annotate a
+    signal, but it does not invent trades or relax CFO/execution constraints.
+    """
     candidates = context.state["context_enrichment"].get("candidates", [])
     if not candidates:
         result = {
@@ -2257,6 +2292,8 @@ def strategy_signals(context: TickContext) -> PipelineResult:
     )
     base_signal_dicts = [item.as_dict(tick_id=context.tick_id) for item in batch.signals]
     fitness_summaries = context.state.get("strategy_fitness", {}).get("summaries", [])
+    # First pass: disable suppression so the adaptive threshold adviser can see
+    # the current raw fitness cliff without mutating the signal set.
     _, preliminary_allocation_stats = allocate_strategy_signals(
         signals=base_signal_dicts,
         fitness_summaries=fitness_summaries,
@@ -2283,6 +2320,8 @@ def strategy_signals(context: TickContext) -> PipelineResult:
         context,
         equity_threshold=suppress_threshold,
     )
+    # Second pass: apply the actual thresholds used by paper allocation. Signals
+    # suppressed here do not proceed to proposal/risk/execution gates.
     signal_dicts, allocation_stats = allocate_strategy_signals(
         signals=base_signal_dicts,
         fitness_summaries=fitness_summaries,

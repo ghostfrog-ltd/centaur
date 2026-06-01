@@ -870,6 +870,13 @@ class UsageLedger:
         as_of: datetime,
         lookback_days: int = 0,
     ) -> list[dict[str, Any]]:
+        """Return raw aggregate rows that feed strategy-fitness scoring.
+
+        The SQL implementations below join watch-only shadow proposals to their
+        evaluated outcomes and group by strategy, asset class, and checkpoint
+        window. `app.engine.fitness_engine` applies sample thresholds,
+        composite scoring, ranking, and allocation decisions after this layer.
+        """
         if self.backend == "postgres":
             rows = self._list_strategy_fitness_rows_postgres(
                 as_of=as_of,

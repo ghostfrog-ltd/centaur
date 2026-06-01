@@ -2,6 +2,12 @@
 
 This is the short rolling decision head. Keep the full canonical history in `docs/DECISION_LOG.md`, but do not load it for every task.
 
+## 2026-06-01
+- Architecture constraint tightened from "pipeline-first, LangGraph-compatible" to LangGraph-first with Pydantic-backed state and node contracts.
+- Current `ControlPipelineRunner` remains the behaviour-preserving migration scaffold, but new orchestration work should not deepen untyped dict-only pipeline control flow when a typed graph node/model is practical.
+- Graph visualization/export is now part of orchestration discipline: update generated/visual docs when nodes or edges change.
+- This is an architecture/documentation constraint only; it does not approve any change to notional, thresholds, broker routing, paper/live behaviour, strategy allowlists, or risk gates.
+
 ## 2026-05-31
 - Runtime provenance now labels environment/mode/source/data-provider/execution-provider across shadow proposals/outcomes, broker orders, and strategy fitness where relevant.
 - Explicit `CENTAUR_MODE=paper` skips live broker sync and live order mutation. `live_dry` can record intended live actions without broker mutation.

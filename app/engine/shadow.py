@@ -1,3 +1,21 @@
+"""Shadow-trade evidence and per-checkpoint fitness scoring.
+
+This module is the first half of Centaur's strategy-fitness loop:
+
+1. `build_shadow_proposals` records "what would happen if this signal traded?"
+   checkpoints for current strategy signals. These are evidence records, not
+   broker orders.
+2. `evaluate_shadow_checkpoint` replays later market bars against each due
+   checkpoint, applies the configured spread/slippage/fixed-cost assumptions,
+   and writes a realized outcome.
+3. `_compute_fitness_score` turns that outcome into a bounded risk-adjusted
+   score. The downstream fitness engine aggregates these scores before any
+   signal can be favored or suppressed.
+
+Keep this deterministic and auditable: shadow fitness is allowed to inform
+paper/live allocation, so a scoring change here is a trading-behavior change.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,6 +59,12 @@ def build_shadow_proposals(
     min_signal_score: float,
     checkpoint_windows: tuple[str, ...],
 ) -> list[dict[str, Any]]:
+    """Create watch-only proposal/checkpoint rows from ranked strategy signals.
+
+    Proposals are deliberately separate from execution. They capture the signal,
+    entry/risk plan, and checkpoint windows needed to evaluate the strategy later
+    without assuming that a paper or live order was actually placed.
+    """
     windows = parse_checkpoint_windows(checkpoint_windows)
     if not windows or not strategy_signals:
         return []
@@ -162,6 +186,14 @@ def evaluate_shadow_checkpoint(
     reference_notional_usd: float = 0.0,
     profit_target_ladder_pct: tuple[float, ...] = (),
 ) -> dict[str, Any] | None:
+    """Evaluate one due shadow checkpoint against observed bars.
+
+    The function simulates long-only exit logic in a conservative, auditable
+    order: stop/target touches inside the holding window, then a time exit at
+    the checkpoint if no earlier exit occurred. Return math uses effective
+    entry/exit prices after spread and slippage plus the fixed micro-trade cost,
+    so stored fitness does not depend on idealized fills.
+    """
     raw_checkpoint = checkpoint.get("raw_json", {})
     if not isinstance(raw_checkpoint, dict):
         raw_checkpoint = {}
@@ -303,6 +335,8 @@ def evaluate_shadow_checkpoint(
 
     max_high = _max_value(observed_bars, "high_price")
     min_low = _min_value(observed_bars, "low_price")
+    # Fitness is based on friction-adjusted prices. The raw exit is still
+    # stored for audit, but the scored return includes spread/slippage drag.
     effective_entry_price = _apply_long_entry_friction(
         price=entry_price,
         spread_bps=execution_spread_bps,
@@ -384,6 +418,8 @@ def evaluate_shadow_checkpoint(
         if min_low is not None
         else None
     )
+    # The ladder is evidence-only. It lets reports compare alternate profit
+    # targets without changing managed exits or current allocation gates.
     profit_target_ladder = _profit_target_ladder_outcomes(
         entry_price=entry_price,
         entry_price_gbp=entry_price_gbp,
@@ -510,6 +546,7 @@ def _profit_target_ladder_outcomes(
     fixed_round_trip_cost_usd: float,
     trade_notional_usd: float,
 ) -> list[dict[str, Any]]:
+    """Score alternate profit targets as counterfactual evidence only."""
     if entry_price <= 0:
         return []
 
@@ -714,6 +751,7 @@ def _effective_risk_pct(
     entry_slippage_bps: float,
     exit_slippage_bps: float,
 ) -> float:
+    """Return stop distance after the same friction model used for returns."""
     if stop_loss_price is None or stop_loss_price <= 0 or entry_price <= 0:
         return fallback_risk_pct
 
@@ -753,6 +791,17 @@ def _compute_fitness_score(
     realized_return_pct: float,
     risk_pct: float,
 ) -> float:
+    """Convert one checkpoint outcome into a bounded risk-adjusted score.
+
+    The normal path is R-multiple style scoring:
+
+        realized return percent / effective risk percent * 50
+
+    A full +2R outcome therefore maps to +100, while -2R maps to -100. Scores
+    are clipped to that range so one unusual checkpoint cannot dominate the
+    aggregate strategy-fitness table. Ambiguous same-bar stop/target outcomes
+    are neutral because the stored bars cannot prove the execution sequence.
+    """
     if outcome_status == "ambiguous_range":
         return 0.0
     if risk_pct <= 0:

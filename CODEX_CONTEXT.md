@@ -17,7 +17,7 @@ Centaur is not a gambling bot. It is an auditable research/execution engine that
 7. Any safety-critical path needs clear comments/docstrings explaining the gate, risk boundary, and audit trail.
 
 ## Current System Truth
-- Runtime architecture: pipeline-first, LangGraph-compatible control flow.
+- Runtime architecture direction: LangGraph-first orchestration with Pydantic-backed state/contracts. The current `ControlPipelineRunner` is legacy-compatible scaffolding pending migration; new orchestration work should move toward typed LangGraph nodes rather than adding more opaque dict-only pipeline surface.
 - Runtime modes: `shadow`, `paper`, `live_dry`, `live`.
 - LLM layer: Gemini API only; keep it behind an adapter.
 - Operations database: PostgreSQL for active paper/live operation. Do not silently fall back to SQLite when Postgres is configured or execution is enabled.
@@ -107,6 +107,8 @@ Useful reports:
 - `.venv-mac/bin/python main.py --storage-separation-report`
 
 ## Current Architecture Progress
+- Visualization docs now exist in `TICK_DECISION_FLOW.md`, `docs/VISUALIZATION.md`, and `docs/visuals/`. They are documentation/export scaffolding, not a LangGraph runtime yet.
+- Next orchestration work should introduce Pydantic models for graph state/node contracts and migrate the control flow toward LangGraph while preserving existing capital gates and paper/live behaviour.
 - `ModeContext` centralises mode/environment permission checks.
 - `ExecutionRouter` is the choke point before broker submit/cancel/mutation.
 - `LiveRiskGuard` re-checks activation, kill switch, broker, readiness, capacity, latest-bar/instrument availability, same-paper validation, and notional.

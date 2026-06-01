@@ -1,3 +1,20 @@
+"""Strategy-fitness summarization and signal allocation.
+
+This module is the second half of Centaur's strategy-fitness loop. It does not
+look at raw bars directly; storage has already joined shadow proposals to their
+evaluated outcomes. The flow is:
+
+1. `enrich_strategy_fitness_rows` turns raw aggregate rows into ranked,
+   sample-weighted fitness summaries.
+2. `allocate_strategy_signals` joins those summaries back onto current signals
+   and decides whether each signal is unproven, weighted, favored, suppressed,
+   or admitted by the paper-only high-score near-miss override.
+
+The thresholds in this file are capital-preservation gates. A comment/docstring
+change is safe, but logic, weights, or comparison changes alter execution
+eligibility and need explicit review.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -9,6 +26,12 @@ def enrich_strategy_fitness_rows(
     rows: list[dict[str, Any]],
     min_checkpoints: int,
 ) -> list[dict[str, Any]]:
+    """Build ranked strategy fitness summaries from aggregate outcome rows.
+
+    Input rows come from `UsageLedger.list_strategy_fitness_rows`, grouped by
+    strategy, asset class, and checkpoint window. Rows below the minimum sample
+    count are ignored so tiny samples cannot favor or suppress current trades.
+    """
     enriched: list[dict[str, Any]] = []
     threshold = max(1, min_checkpoints)
 
@@ -37,6 +60,8 @@ def enrich_strategy_fitness_rows(
         stop_hit_rate = round(stop_hits / checkpoints_evaluated, 6)
         time_exit_rate = round(time_exits / checkpoints_evaluated, 6)
         ambiguous_rate = round(ambiguous / checkpoints_evaluated, 6)
+        # Sample weight ramps up linearly until 12 checkpoints. This damps
+        # early evidence instead of letting a handful of wins/losses dominate.
         sample_weight = round(min(1.0, checkpoints_evaluated / 12.0), 6)
         composite_score = _compute_composite_score(
             avg_fitness_score=avg_fitness,
@@ -118,6 +143,13 @@ def allocate_strategy_signals(
     high_score_override_fitness_margin: float = 0.25,
     high_score_override_allowed_strategies: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply historical fitness to current strategy signals.
+
+    The allocator is a gate, not a strategy generator. It never creates new
+    opportunities; it only annotates, boosts, or removes signals that already
+    passed deterministic strategy logic. Suppressed signals are kept in the
+    diagnostics so the dashboard can explain quiet ticks.
+    """
     summary_index = {
         (
             str(item.get("strategy_id", "")),
@@ -156,6 +188,8 @@ def allocate_strategy_signals(
         strategy_id = str(signal_copy.get("strategy_id", ""))
         asset_class = str(signal_copy.get("asset_class", "")).strip().lower()
         checkpoint_code = str(signal_copy.get("holding_window_code", "")).lower()
+        # Fitness is checkpoint-specific: a strategy can be fit for one holding
+        # window and weak for another, so match on the signal's intended window.
         summary = summary_index.get((strategy_id, asset_class, checkpoint_code))
         threshold_used = _resolve_suppress_threshold(
             default_threshold=suppress_threshold,
@@ -180,12 +214,18 @@ def allocate_strategy_signals(
             if checkpoints_evaluated < threshold:
                 stats["unproven"] += 1
             else:
+                # Positive composite fitness nudges ranking up; negative
+                # composite fitness nudges it down. The helper caps the bonus
+                # tightly so fitness cannot overwhelm the raw setup score.
                 score_bonus = _allocation_bonus(
                     composite_fitness_score=composite_score,
                     sample_weight=sample_weight,
                 )
                 adjusted_score = round(base_score + score_bonus, 6)
 
+                # Suppression is the capital-preservation side of fitness.
+                # Asset classes may have separate thresholds, but live still
+                # follows the shared paper/shadow strategy-fitness evidence.
                 if composite_score <= threshold_used:
                     override_allowed = (
                         high_score_override_enabled
@@ -273,6 +313,7 @@ def _append_signal_diagnostic(
     *,
     limit: int = 12,
 ) -> None:
+    """Keep a bounded preview of allocation decisions for reports/status."""
     if len(diagnostics) >= limit:
         return
     diagnostics.append(
@@ -307,6 +348,13 @@ def _compute_composite_score(
     win_rate: float,
     sample_weight: float,
 ) -> float:
+    """Blend outcome quality, hit rate, and raw returns into one fitness score.
+
+    `avg_fitness_score` is already risk-adjusted at the checkpoint level.
+    `win_rate_edge` rewards consistency relative to a 50% baseline.
+    `return_component` keeps actual net return visible after friction.
+    `sample_weight` damps small sample sizes before clipping to [-100, 100].
+    """
     win_rate_edge = ((win_rate * 100.0) - 50.0) * 0.6
     return_component = avg_realized_return_pct * 4.0
     raw_score = (avg_fitness_score * 0.65) + win_rate_edge + return_component
@@ -323,6 +371,7 @@ def _allocation_bonus(
     composite_fitness_score: float,
     sample_weight: float,
 ) -> float:
+    """Translate composite fitness into a small ranking adjustment."""
     damped_weight = 0.5 + max(0.0, min(1.0, sample_weight))
     bonus = composite_fitness_score * damped_weight
     if bonus > 8.0:
@@ -376,6 +425,7 @@ def _resolve_suppress_threshold(
     asset_class: str,
     asset_class_suppress_thresholds: dict[str, float] | None,
 ) -> float:
+    """Choose the active suppress threshold for the signal asset class."""
     if asset_class_suppress_thresholds:
         specific = asset_class_suppress_thresholds.get(str(asset_class).strip().lower())
         if specific is not None:

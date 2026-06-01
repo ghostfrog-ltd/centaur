@@ -12,7 +12,7 @@ Default:
 Do not load full historical logs for ordinary code edits.
 
 ## Current Truth
-- Pipeline-first, LangGraph-compatible architecture.
+- LangGraph-first architecture direction with Pydantic-backed state/contracts; the current ordered pipeline is migration scaffolding, not the desired end state.
 - Gemini API only for LLM work; keep it adapter-backed.
 - PostgreSQL for active paper/live operations; no silent SQLite fallback when execution is enabled or Postgres is configured.
 - Adapter-first design: Alpaca is one adapter, not the product.
@@ -33,6 +33,7 @@ Do not load full historical logs for ordinary code edits.
 ## Working Style
 - No vibes around constraints.
 - No silent broker/risk/live behaviour changes.
+- New orchestration work should either add typed LangGraph/Pydantic structure or clearly document why it is a temporary migration bridge.
 - No new paper strategy execution without explicit approval.
 - Prefer deterministic logic over opaque AI behaviour for risk, execution, fitness, and replay.
 - Keep dashboards/status honest: recent activity, all-time evidence, paper, live, shadow, and observe-only data must be labelled separately.

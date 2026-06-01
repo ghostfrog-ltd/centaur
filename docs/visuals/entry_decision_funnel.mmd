@@ -1,0 +1,36 @@
+flowchart TD
+  universe["Configured symbol universe<br/>DISCOVERY_EQUITY_SYMBOLS<br/>DISCOVERY_CRYPTO_SYMBOLS"]
+  bars["Latest market bars<br/>equity batch + crypto batch"]
+  candidates["Ranked candidates<br/>movement + liquidity"]
+  selected["Selected candidates<br/>top DISCOVERY_TARGET_COUNT"]
+  strategies["Strategy evaluation<br/>profile-specific setup rules"]
+  signals["Strategy signals<br/>entry, stop, target, score, confidence"]
+  fitness{"Fitness allocation"}
+  suppressed["Suppressed<br/>stop before proposal"]
+  surviving["Surviving signals<br/>unproven / weighted / favored / override"]
+  proposals["Shadow proposals<br/>watch/evidence rows"]
+  cfo{"CFO risk gate"}
+  hold["Hold<br/>no new entry"]
+  paper["Paper order request<br/>approved"]
+  execution["Execution router<br/>broker adapter"]
+  order["Submitted order<br/>if broker accepts"]
+  live{"Live follower gate<br/>same-as-paper only"}
+  live_order["Live order<br/>only after paper submitted<br/>and live gates pass"]
+
+  universe --> bars
+  bars --> candidates
+  candidates --> selected
+  selected --> strategies
+  strategies --> signals
+  signals --> fitness
+  fitness -->|below threshold| suppressed
+  fitness -->|passes allocation| surviving
+  surviving --> proposals
+  proposals --> cfo
+  cfo -->|rejected / no slots / kill switch / protection| hold
+  cfo -->|approved| paper
+  paper --> execution
+  execution --> order
+  order --> live
+  live -->|blocked| hold
+  live -->|approved follower| live_order

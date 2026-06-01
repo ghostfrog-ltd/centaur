@@ -6,6 +6,23 @@ Last updated: 2026-06-01
 
 ## 2026-06-01
 
+### Make LangGraph and Pydantic the orchestration target
+Decision:
+- tighten the architecture constraint from "pipeline-first, LangGraph-compatible" to LangGraph-first orchestration with Pydantic-backed state and node contracts
+- treat the current `ControlPipelineRunner`/`StepDefinition` pipeline as behaviour-preserving migration scaffolding, not the desired end state
+- require new orchestration work to add typed LangGraph/Pydantic structure or explicitly document why it is a temporary migration bridge
+- require graph visualization/export updates when nodes or edges change
+
+Why:
+- the proof-of-concept pipeline now has enough moving parts that untyped dict flow is becoming hard to understand, audit, and visualize
+- the original system intent was explicit graph orchestration with visible node boundaries, especially around market, signal, fitness, CFO, execution, and live-follower gates
+- Pydantic contracts should make state transitions easier to inspect and safer to refactor without weakening capital-preservation rules
+
+Implementation notes:
+- this decision changes architecture direction and documentation discipline only
+- it does not approve changes to notional, thresholds, broker routing, paper/live behaviour, strategy allowlists, or risk gates
+- current visualization scaffolding lives in `TICK_DECISION_FLOW.md`, `docs/VISUALIZATION.md`, and `docs/visuals/`
+
 ### Use most protective stop for aggregated managed positions
 Decision:
 - when Alpaca aggregates multiple same-symbol managed lots into one long position, choose the highest stop-loss among still-open managed entry lots for the full-position managed exit
