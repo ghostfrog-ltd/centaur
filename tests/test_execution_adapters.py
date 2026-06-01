@@ -40,6 +40,12 @@ class ExecutionAdapterTests(unittest.TestCase):
         with self.assertRaises(UnsupportedExecutionAdapterError):
             get_execution_adapter(self._context(), "ig_spreadbet")
 
+    def test_get_execution_adapter_resolves_trading212_paper(self) -> None:
+        adapter = get_execution_adapter(self._context(), "trading212_paper")
+
+        self.assertIsInstance(adapter, BrokerExecutionAdapter)
+        self.assertEqual(adapter.broker_id, "trading212_paper")
+
     def test_broker_bridge_delegates_submit_and_cancel(self) -> None:
         calls = []
 

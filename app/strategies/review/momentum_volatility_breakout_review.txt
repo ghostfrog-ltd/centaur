@@ -1,0 +1,169 @@
+Momentum Volatility Breakout Strategy Review
+===========================================
+
+Overall verdict
+---------------
+
+This is pretty solid. It is much better than the looser/simple momentum ideas because it has a clear technical trigger, explicit confirmation gates, and a persisted ATR-based risk plan.
+
+The file appears to do what the docstring says: it only emits long-only StrategySignal objects and leaves the actual execution filtering to the later pipeline.
+
+Main positives
+--------------
+
+The strategy is clear:
+
+    close price > prior 20-bar high
+    volume_ratio_20 > 2.0
+    atr_pct_20 > 1.0
+
+That is much better than simply saying “price moved up a bit, maybe buy”. It forces the candidate to show a breakout, volume confirmation, and volatility confirmation.
+
+The risk model is also good:
+
+    stop = entry - 2 ATR
+    target = entry + 4 ATR
+    break_even = entry + 2 ATR
+
+That gives a visible 2:1 reward/risk structure and avoids the common mistake of using the same fixed percentage stop on every instrument regardless of volatility.
+
+The fail-closed approach is also good. Missing technical context, missing ATR, bad entry price, or a malformed stop/target all return None. That is the right behaviour for a live-ish trading system.
+
+Main issue: breakout high must be the prior 20-bar high
+-------------------------------------------------------
+
+The comment says:
+
+    # The core breakout rule: price must be above the 20-bar high.
+
+But the strategy depends entirely on the upstream field:
+
+    candidate.get("price_trigger_20")
+
+The important question is whether breakout_high_20 is calculated excluding the current bar.
+
+You want this conceptually:
+
+    entry_price > max(highs from previous 20 completed bars)
+
+Not this:
+
+    entry_price > max(highs including current bar)
+
+If the upstream calculation includes the current close/high in the 20-bar high, then the breakout condition can become broken or meaningless because the current price may be part of the high it is trying to break.
+
+Recommendation: add a clear upstream test or assertion to guarantee breakout_high_20 is based on the previous 20 completed bars only.
+
+Possible issue: ATR floor may be too aggressive
+-----------------------------------------------
+
+This gate:
+
+    if atr_pct <= float(profile.parameters["atr_floor_pct"]):
+        return None
+
+With this parameter:
+
+    "atr_floor_pct": 1.0
+
+means ATR must be greater than 1% of price.
+
+That may be fine for small caps or volatile equities, but it could exclude many decent liquid large-cap breakouts. It depends on the universe being scanned.
+
+Bluntly: this will probably bias the strategy toward jumpier names. That might be intentional, but it should be known and measured.
+
+A future improvement would be to make the value configurable by profile/config:
+
+    "atr_floor_pct": config.momentum_breakout_atr_floor_pct
+
+For now, hardcoded is acceptable for research/shadow mode.
+
+Possible issue: scoring may over-reward ATR and volume
+------------------------------------------------------
+
+The score is calculated as:
+
+    42.0
+    + breakout_margin_pct * 18.0
+    + min(volume_ratio, 5.0) * 8.0
+    + min(atr_pct, 6.0) * 4.0
+    + discovery_score * 2.0
+
+At the minimum passing values, the score is roughly:
+
+    42 + 0 + 16 + 4 + discovery contribution
+
+So without much breakout margin, it may still land around 62+ if discovery_score is decent.
+
+That may be okay because min_signal_score defaults to at least 62.0, but it would be worth reviewing emitted signals where:
+
+    breakout_margin_pct < 0.1
+
+Those may be weak “barely broke the high” signals.
+
+Missing sanity gate: symbol / instrument identity
+-------------------------------------------------
+
+The signal currently does this:
+
+    symbol=str(candidate.get("symbol", "")).upper()
+    canonical_instrument_id=str(candidate.get("canonical_instrument_id", ""))
+
+But there is no explicit gate requiring either of these to exist.
+
+That might be fine if downstream rejects them, but I would fail closed here too:
+
+    symbol = str(candidate.get("symbol", "")).upper()
+    canonical_instrument_id = str(candidate.get("canonical_instrument_id", ""))
+
+    if not symbol or not canonical_instrument_id:
+        return None
+
+A strategy signal without a reliable instrument identity is not useful and can create weird downstream behaviour.
+
+Minor concern: unused market_context
+------------------------------------
+
+The method accepts:
+
+    market_context: dict[str, Any]
+
+but does not use it.
+
+That is not necessarily a bug if the strategy interface requires it. However, it means this strategy is currently blind to broader regime. For example, it does not care whether the market is generally risk-on, risk-off, open, closed, or extremely choppy.
+
+That is acceptable because the execution boundary says market-hours and execution filtering happen later. But later, this would benefit from a market-regime gate.
+
+Suggested small improvement
+---------------------------
+
+I would add the identity fail-closed check and then use those cleaned variables when building the final signal:
+
+    symbol = str(candidate.get("symbol", "")).upper()
+    canonical_instrument_id = str(candidate.get("canonical_instrument_id", ""))
+
+    if not symbol or not canonical_instrument_id:
+        return None
+
+Then use:
+
+    symbol=symbol,
+    canonical_instrument_id=canonical_instrument_id,
+
+instead of repeatedly calling candidate.get().
+
+Final verdict
+-------------
+
+This is a good shadow/research strategy.
+
+I would not call it ready for live trading yet, but as a paper/shadow signal generator it is sensible. The biggest thing to verify is that breakout_high_20 and price_trigger_20 are calculated from the previous completed 20 bars, not including the current bar.
+
+If that upstream calculation is correct, then this strategy is logically sound.
+
+Rating:
+
+    8/10 for research mode
+    6.5/10 for live readiness
+
+The lower live-readiness score is because it still needs backtest/paper evidence, stronger identity checks, and ideally some broader regime/context filtering before being trusted with real execution.

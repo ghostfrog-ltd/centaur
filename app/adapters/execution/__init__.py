@@ -3,7 +3,9 @@ from __future__ import annotations
 from .base import ExecutionAdapter, ExecutionAdapterError, UnsupportedExecutionAdapterError
 from .broker_bridge import BrokerExecutionAdapter
 
-SUPPORTED_EXECUTION_BROKERS = frozenset({"alpaca_paper", "alpaca_live"})
+SUPPORTED_EXECUTION_BROKERS = frozenset(
+    {"alpaca_paper", "alpaca_live", "trading212_paper"}
+)
 
 
 def get_execution_adapter(context, broker_id: str) -> ExecutionAdapter:

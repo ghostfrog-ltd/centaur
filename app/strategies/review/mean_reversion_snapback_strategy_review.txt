@@ -1,0 +1,186 @@
+Mean Reversion Snapback Strategy Review
+
+Overall verdict:
+This is pretty solid. The structure is clean, the execution boundary is sensible, and the strategy only creates an auditable StrategySignal while leaving paper/live eligibility, notional sizing, market-hours checks, kill switches, duplicate-position checks, and broker routing to the later pipeline risk/execution gates.
+
+That separation is exactly right.
+
+What is good
+
+1. Clear strategy intent
+
+The file clearly defines a long-only mean reversion idea:
+
+- Look for equities that have pulled back sharply.
+- Require enough discovery/liquidity evidence to make a bounce worth watching.
+- Never suggest shorting a falling name.
+
+That is a good safety boundary. It avoids the dangerous behaviour of blindly shorting or blindly buying every falling asset.
+
+2. Good fail-closed gates
+
+The strategy correctly returns None when key conditions are not met:
+
+- Wrong asset class
+- Missing or shallow movement_pct
+- Discovery score too low
+- Trade count too low
+- Missing or invalid close price
+- Final signal score below the profile minimum
+
+This is good. No valid price means no signal. Wrong asset class means no signal. Weak liquidity means no signal.
+
+3. Useful comments
+
+The comments are actually helpful rather than just noise.
+
+The most important comment is that movement_pct is a percent value, not a decimal ratio:
+
+- -0.18 means down 0.18%
+- It does not mean down 18%
+
+That distinction matters because this would be very easy to misunderstand later.
+
+Main concern
+
+The main thing I would challenge is the scoring formula:
+
+    signal_score = (
+        (drawdown_strength * 100.0)
+        + (discovery_score * 7.0)
+        + (score_liquidity * 6.0)
+    )
+
+Because movement_pct is already a percent value, a -0.18% move only contributes:
+
+    0.18 * 100 = 18 points
+
+That may be okay, but it means discovery and liquidity can dominate the score more than the actual pullback.
+
+Example:
+
+    movement: -0.18% = 18 points
+    discovery: 4.0 * 7 = 28 points
+    liquidity: maybe 3 * 6 = 18 points
+    total = 64
+
+So a relatively small dip could still pass if discovery and liquidity are strong.
+
+That might be intentional, but for a strategy called Mean Reversion Snapback, I would expect the actual pullback strength to matter slightly more.
+
+Suggested tuning
+
+If this is meant to be a true snapback strategy, I would consider tightening the parameters slightly:
+
+    parameters={
+        # movement_pct is a percent value, not a decimal ratio.
+        # -0.30 means down 0.30% from the previous comparable bar.
+        "max_movement_pct": -0.30,
+        "min_discovery_score": 4.0,
+        "min_trade_count": 50,
+    }
+
+This would make it less likely to fire on tiny dips and more aligned with the name "snapback".
+
+Alternatively, keep max_movement_pct at -0.18 but reduce how much discovery/liquidity can push the score over the threshold.
+
+Confidence calculation
+
+The confidence calculation is sensible, but it has a similar behaviour:
+
+    confidence = min(
+        0.9,
+        0.3 + (drawdown_strength * 0.35) + min(discovery_score / 22.0, 0.25)
+    )
+
+With movement_pct = -0.18:
+
+    0.18 * 0.35 = 0.063
+
+So confidence is mostly driven by:
+
+- 0.3 base confidence
+- discovery score contribution
+- a smaller drawdown contribution
+
+This is not wrong, but it means confidence is more about discovery quality than pullback strength.
+
+That may be okay if the strategy is intended to find liquid, high-quality dips rather than aggressive deep reversals.
+
+Suggested rationale improvement
+
+The current rationale is okay:
+
+    f"{profile.label} sees a pullback of {movement_pct:.3f}% "
+    f"with enough liquidity to test a bounce."
+
+But for audit/debugging later, I would include more detail:
+
+    rationale=(
+        f"{profile.label} sees a {movement_pct:.3f}% pullback "
+        f"with discovery score {discovery_score:.2f} and trade count {trade_count}, "
+        f"making it suitable for bounce observation."
+    )
+
+This would make later signal reviews easier because the reason for the signal would include the key evidence.
+
+Blunt assessment
+
+Keep it.
+
+It is safe enough as a research/paper signal and the structure is good.
+
+However, the current thresholds make it feel more like:
+
+    "Minor dip with good flow"
+
+rather than:
+
+    "Sharp pullback snapback"
+
+If the intention is genuinely snapback, tighten the movement threshold from -0.18 to around -0.30 and possibly increase min_trade_count from 40 to 50.
+
+Recommended patch
+
+Change this:
+
+    parameters={
+        "max_movement_pct": -0.18,
+        "min_discovery_score": 4.0,
+        "min_trade_count": 40,
+    }
+
+To this:
+
+    parameters={
+        # movement_pct is a percent value, not a decimal ratio.
+        # -0.30 means down 0.30% from the previous comparable bar.
+        "max_movement_pct": -0.30,
+        "min_discovery_score": 4.0,
+        "min_trade_count": 50,
+    }
+
+And optionally improve the rationale:
+
+    rationale=(
+        f"{profile.label} sees a {movement_pct:.3f}% pullback "
+        f"with discovery score {discovery_score:.2f} and trade count {trade_count}, "
+        f"making it suitable for bounce observation."
+    )
+
+Final recommendation
+
+Approve the strategy as a shadow/research profile.
+
+Do not treat it as live-ready by itself.
+
+The next useful step would be to run it in shadow mode and log:
+
+- Number of signals fired per day
+- Average movement_pct at entry
+- Average liquidity score
+- Bounce rate after 15 minutes, 30 minutes, and 1 hour
+- Maximum adverse excursion before bounce
+- How often it overlaps with momentum/flow strategies
+
+That evidence will show whether this is genuinely detecting snapbacks or just buying small dips in liquid names.

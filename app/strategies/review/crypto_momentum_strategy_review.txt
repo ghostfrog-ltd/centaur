@@ -1,0 +1,175 @@
+Crypto Momentum Strategy Review / Handoff Notes
+==============================================
+
+File reviewed: CryptoMomentumStrategy
+Strategy family: crypto_momentum
+Profile: crypto_momentum.trend
+
+Overall verdict
+---------------
+This is a sensible paper-test momentum signal file, not a proven money-making strategy yet.
+
+The engineering structure is good. It is defensive, lane-specific, and suitable for paper testing. However, the strategy logic is still simple and the scoring formula is arbitrary until proven with backtesting and paper-trade data.
+
+I would merge this for paper testing, but I would not trust it with live money until it has stats for win rate, average win/loss, drawdown, slippage impact, and whether the 1% stop is actually survivable in crypto.
+
+What is good
+------------
+1. Crypto-only and fail-closed
+
+The strategy checks the candidate asset_class and rejects anything that is not in the configured crypto profile asset classes. This is good because equity candidates cannot accidentally leak into the crypto lane.
+
+2. Risk defaults are defensive
+
+The stop loss is forced to be at least 1%:
+
+    stop_loss_pct=max(float(config.crypto_momentum_stop_loss_pct), 0.01)
+
+The target multiple is forced to be at least 1.5:
+
+    target_multiple=max(float(config.crypto_momentum_target_multiple), 1.5)
+
+That prevents accidentally tiny stops or bad config values from creating unsafe or nonsense signals.
+
+3. Candidate gates are reasonable for a first version
+
+The strategy requires:
+
+- positive movement above a configured minimum
+- enough discovery score
+- enough trade count
+- a valid close price
+
+So it is not just buying any green candle.
+
+Main concerns
+-------------
+1. The scoring formula is arbitrary
+
+Current scoring formula:
+
+    signal_score = round(
+        min(
+            100.0,
+            (movement_pct * 135.0) + (discovery_score * 8.0) + (score_liquidity * 4.0),
+        ),
+        6,
+    )
+
+This may be fine for a first version, but the weights are basically assumptions until tested.
+
+Important: confirm that movement_pct is always represented consistently. The comment says 0.15 means 0.15%, which is fine. But if another part of the pipeline ever sends 15 for 15%, the score will instantly cap at 100 and break the signal ranking.
+
+Action:
+- enforce movement_pct units clearly across the pipeline
+- add tests around movement_pct scoring
+- log representative score components during paper trading
+
+2. It may buy late momentum
+
+The strategy currently looks for crypto pairs that are already moving up with enough trade/discovery evidence. That is okay, but it may enter too late after a spike.
+
+Missing protections:
+
+- no max movement/spike filter
+- no spread/slippage filter
+- no minimum GBP volume/liquidity gate beyond trade_count/volume-derived liquidity score
+- no candle structure confirmation
+- no multi-window confirmation
+- no reversal/overextension check
+- no exclusion for extremely pumpy low-quality pairs
+
+Recommended improvements
+------------------------
+Add extra profile parameters:
+
+    "max_movement_pct": float(config.crypto_momentum_max_movement_pct),
+    "min_volume_gbp": float(config.crypto_momentum_min_volume_gbp),
+    "max_spread_pct": float(config.crypto_momentum_max_spread_pct),
+
+Then add rejection gates before building the signal:
+
+    max_movement_pct = float(profile.parameters["max_movement_pct"])
+    if movement_pct > max_movement_pct:
+        return None
+
+    volume_gbp = to_float(candidate.get("volume_gbp")) or 0.0
+    if volume_gbp < float(profile.parameters["min_volume_gbp"]):
+        return None
+
+    spread_pct = to_float(candidate.get("spread_pct"))
+    if spread_pct is not None and spread_pct > float(profile.parameters["max_spread_pct"]):
+        return None
+
+Suggested default values for paper testing only:
+
+    crypto_momentum_max_movement_pct = 2.5
+    crypto_momentum_min_volume_gbp = 50000
+    crypto_momentum_max_spread_pct = 0.25
+
+These are not final trading values. They are just safer first-pass filters for paper testing.
+
+Best next improvement
+---------------------
+Add rejection logging in paper/shadow mode.
+
+At the moment, the strategy only emits passing signals. That means we cannot easily learn from near-misses or understand why candidates were rejected.
+
+Add structured reject reasons such as:
+
+    movement_below_min
+    movement_above_max
+    discovery_below_min
+    trade_count_below_min
+    missing_entry_price
+    volume_below_min
+    spread_above_max
+    score_below_min
+
+The goal is to later answer questions like:
+
+- Are we rejecting too many good trades?
+- Are thresholds too strict?
+- Are we passing too many low-quality candidates?
+- Is movement, discovery, or liquidity doing most of the filtering?
+
+Example approach:
+
+    def reject(reason: str) -> None:
+        # In paper/shadow mode, log candidate symbol, strategy_id, reason, and key metrics.
+        # Do not spam logs in live mode unless debug logging is enabled.
+        logger.info(
+            "crypto_momentum_reject",
+            extra={
+                "reason": reason,
+                "symbol": candidate.get("symbol"),
+                "movement_pct": movement_pct,
+                "discovery_score": discovery_score,
+                "trade_count": trade_count,
+            },
+        )
+
+Acceptance criteria
+-------------------
+1. Strategy still only emits crypto signals.
+2. Invalid/missing entry prices still hard reject.
+3. Stop loss remains floored at 1% or higher.
+4. New max movement, min volume GBP, and max spread gates are configurable.
+5. Rejection reasons are logged in paper/shadow mode.
+6. Unit tests cover:
+   - rejects equity candidate
+   - rejects movement below min
+   - rejects movement above max
+   - rejects low discovery score
+   - rejects low trade count
+   - rejects missing/zero close price
+   - rejects low volume GBP
+   - rejects excessive spread
+   - emits valid crypto momentum signal
+   - score calculation behaves correctly for movement_pct=0.15 meaning 0.15%
+
+Blunt summary
+-------------
+Good engineering structure. Weak-but-valid first strategy logic.
+
+This is fine for paper testing. It is not ready for live money until the strategy has real performance evidence and stronger filters against spikes, thin liquidity, and slippage.

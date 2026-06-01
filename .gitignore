@@ -33,6 +33,8 @@ logs/*
 !logs/.gitkeep
 *.log
 *.pid
+web/cache/*
+!web/cache/.gitkeep
 
 # Editor and OS noise
 .DS_Store

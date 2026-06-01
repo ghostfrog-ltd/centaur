@@ -30,6 +30,14 @@ class AdapterInventoryReportTests(unittest.TestCase):
             records[("market_data", "binance")]["status"],
             "not_implemented",
         )
+        self.assertEqual(
+            records[("broker_account", "trading212_paper")]["status"],
+            "active_paper",
+        )
+        self.assertEqual(
+            records[("execution", "trading212_paper")]["status"],
+            "active_bridge",
+        )
         self.assertFalse(report["non_alpaca_active"])
 
     def test_render_includes_activation_rule_warning(self) -> None:

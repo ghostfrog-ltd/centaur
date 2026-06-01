@@ -322,23 +322,34 @@ These live in `.env`. Use `.env.example` as the template.
 
 ### Crypto Momentum
 
-`CRYPTO_MOMENTUM_STOP_LOSS_PCT`
-: Crypto-specific stop. Currently `0.03`.
+`PAPER_CRYPTO_MOMENTUM_STOP_LOSS_PCT`, `LIVE_CRYPTO_MOMENTUM_STOP_LOSS_PCT`
+: Crypto-specific stop. Currently `0.01` for both lanes. Legacy `CRYPTO_MOMENTUM_STOP_LOSS_PCT` remains a fallback.
 
-`CRYPTO_MOMENTUM_TARGET_MULTIPLE`
-: Crypto-specific target multiple. Currently `2.0`.
+`PAPER_CRYPTO_MOMENTUM_TARGET_MULTIPLE`, `LIVE_CRYPTO_MOMENTUM_TARGET_MULTIPLE`
+: Crypto-specific target multiple. Currently `2.0` for both lanes.
 
-`CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE`
-: Minimum crypto momentum signal score. Currently `60.0`.
+`PAPER_CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE`, `LIVE_CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE`
+: Minimum crypto momentum signal score. Currently `60.0` for both lanes.
 
-`CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT`
-: Required positive crypto movement. Currently `0.15`.
+`PAPER_CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT`, `LIVE_CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT`
+: Required positive crypto movement. Currently `0.15` for both lanes.
 
-`CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE`
-: Discovery floor for crypto candidates. Currently `2.5`.
+`PAPER_CRYPTO_MOMENTUM_MAX_MOVEMENT_PCT`, `LIVE_CRYPTO_MOMENTUM_MAX_MOVEMENT_PCT`
+: Maximum allowed positive crypto movement before the candidate is treated as a possible spike. Currently `2.5` for both lanes.
 
-`CRYPTO_MOMENTUM_MIN_TRADE_COUNT`
-: Minimum trade count. Currently `2`.
+`PAPER_CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE`, `LIVE_CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE`
+: Discovery floor for crypto candidates. Currently `2.5` for both lanes.
+
+`PAPER_CRYPTO_MOMENTUM_MIN_TRADE_COUNT`, `LIVE_CRYPTO_MOMENTUM_MIN_TRADE_COUNT`
+: Minimum trade count. Currently `2` for both lanes.
+
+`PAPER_CRYPTO_MOMENTUM_MIN_VOLUME_GBP`, `LIVE_CRYPTO_MOMENTUM_MIN_VOLUME_GBP`
+: Minimum notional crypto candidate volume in GBP. Candidates can supply `volume_gbp`, or the strategy derives it from `close_price_gbp * volume`. Currently `50000` for both lanes.
+
+`PAPER_CRYPTO_MOMENTUM_MAX_SPREAD_PCT`, `LIVE_CRYPTO_MOMENTUM_MAX_SPREAD_PCT`
+: Maximum crypto spread percentage when spread data is available. Currently `0.25` for both lanes.
+
+Live crypto momentum values default to the paper values. When live is armed, any live-vs-paper difference must be listed in `LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES`.
 
 ### Fitness Allocation
 
@@ -502,6 +513,44 @@ These live in `.env`. Use `.env.example` as the template.
 
 `APP_SHARED_SECRET` / `WEBHOOK_SECRET`
 : Shared app/webhook secrets.
+
+`SLACK_ALERTS_ENABLED` / `SLACK_WEBHOOK_URL`
+: Optional one-way Slack incoming-webhook alerts for operator notifications. Slack must not be used as a live-trading command surface.
+
+`SLACK_ALERT_DEDUPE_MINUTES` / `SLACK_REQUEST_TIMEOUT_SECONDS`
+: Dedupe window and request timeout for Slack alerts. Notification events are persisted so the scheduler does not spam repeated tick-level warnings.
+
+`TEST_MONITOR_ENABLED`
+: Enables the scheduled unit-test monitor. The monitor runs the test command, persists only a small JSON status file, and never mutates trading state.
+
+`TEST_MONITOR_SLACK_ENABLED`
+: Optional override for test monitor Slack alerts. Leave blank to inherit `SLACK_ALERTS_ENABLED`.
+
+`TEST_MONITOR_REMINDER_MINUTES`
+: Reminder cadence while the same test failure remains active and unacknowledged.
+
+`TEST_MONITOR_STATE_PATH` / `TEST_MONITOR_LOG_PATH`
+: JSON state and append-only log paths for scheduled test monitoring.
+
+To acknowledge the current failure fingerprint and stop reminders until tests change or recover:
+
+```bash
+scripts/run_test_monitor.py --reset-failure-notification
+```
+
+To install the macOS launchd monitor, run:
+
+```bash
+scripts/install_test_monitor_launch_agent.sh
+```
+
+For classic cron, use `ops/centaur_tests.cron` as the crontab line.
+
+`LIVE_EQUITY_PDT_REVIEW_REMINDERS_ENABLED`
+: When enabled, Slack sends an action-required reminder after the configured review date while the Alpaca Live equity PDT guard is still active. Turn this off only after reviewing live API/account behaviour and deciding what to do with equity entries.
+
+`LIVE_EQUITY_PDT_REVIEW_REMINDER_START_DATE` / `LIVE_EQUITY_PDT_REVIEW_REMINDER_INTERVAL_MINUTES`
+: Review reminder start date and repeat cadence. Defaults to `2026-06-04` and `30` minutes.
 
 ### Storage Lanes
 

@@ -23,7 +23,7 @@ header('Pragma: no-cache');
       <div class="flex flex-wrap gap-2">
         <button id="refresh-button" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Refresh</button>
         <a href="/" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Slot Compounding</a>
-        <a href="/api/snapshot.php" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Live JSON</a>
+        <a href="/snapshot/" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Live JSON</a>
       </div>
     </header>
 
@@ -128,7 +128,7 @@ header('Pragma: no-cache');
   </main>
 
   <script>
-    const snapshotUrl = "/api/snapshot.php";
+    const snapshotUrl = "/snapshot/";
     const refreshIntervalMs = 15000;
 
     const cardContainer = document.getElementById("metric-cards");

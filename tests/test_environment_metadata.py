@@ -347,6 +347,46 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(config.paper_execution_default_notional_usd, 10.0)
         self.assertEqual(config.live_execution_default_notional_usd, 11.0)
 
+    def test_crypto_momentum_paper_settings_override_legacy_global(self) -> None:
+        os.environ["CENTAUR_MODE"] = "paper"
+        os.environ["CENTAUR_ENVIRONMENT"] = "paper"
+        os.environ["CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE"] = "4.5"
+        os.environ["PAPER_CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE"] = "2.5"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_crypto_momentum_min_discovery_score, 2.5)
+        self.assertEqual(config.live_crypto_momentum_min_discovery_score, 2.5)
+        self.assertEqual(config.crypto_momentum_min_discovery_score, 2.5)
+
+    def test_crypto_momentum_live_settings_are_selected_for_live_environment(self) -> None:
+        os.environ["CENTAUR_MODE"] = "live_dry"
+        os.environ.pop("CENTAUR_ENVIRONMENT", None)
+        os.environ["PAPER_CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE"] = "60.0"
+        os.environ["LIVE_CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE"] = "72.0"
+        os.environ[
+            "LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES"
+        ] = "crypto_momentum_min_signal_score"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.centaur_environment, "live")
+        self.assertEqual(config.paper_crypto_momentum_min_signal_score, 60.0)
+        self.assertEqual(config.live_crypto_momentum_min_signal_score, 72.0)
+        self.assertEqual(config.crypto_momentum_min_signal_score, 72.0)
+
+    def test_armed_live_config_fails_when_crypto_momentum_differs_from_paper(self) -> None:
+        os.environ["LIVE_EXECUTION_ENABLED"] = "true"
+        os.environ["LIVE_EXECUTION_ACTIVATION_ACK"] = "LIVE_TRADING_APPROVED"
+        os.environ["PAPER_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "0.01"
+        os.environ["LIVE_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "0.02"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "live_same_as_paper_config_mismatch: crypto_momentum_stop_loss_pct",
+        ):
+            load_runtime_config()
+
     def test_armed_live_config_rejects_unknown_allowed_difference(self) -> None:
         os.environ["LIVE_EXECUTION_ENABLED"] = "true"
         os.environ["LIVE_EXECUTION_ACTIVATION_ACK"] = "LIVE_TRADING_APPROVED"

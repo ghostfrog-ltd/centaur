@@ -13,7 +13,7 @@ use_dns_when_possible: true
 composer_version: "2"
 web_environment:
     - CENTAUR_DASHBOARD_API_URL=http://host.docker.internal:8788/api/snapshot
-    - CENTAUR_DASHBOARD_API_TIMEOUT_SECONDS=8
+    - CENTAUR_DASHBOARD_API_TIMEOUT_SECONDS=20
 corepack_enable: false
 omit_containers: [db]
 timezone: Europe/London

@@ -52,6 +52,13 @@ class RuntimeConfig:
     postgres_live_schema: str
     api_daily_cost_warning_usd: float
     api_daily_cost_limit_usd: float
+    slack_alerts_enabled: bool
+    slack_webhook_url: str
+    slack_alert_dedupe_minutes: int
+    slack_request_timeout_seconds: int
+    live_equity_pdt_review_reminders_enabled: bool
+    live_equity_pdt_review_reminder_start_date: str
+    live_equity_pdt_review_reminder_interval_minutes: int
     alpaca_api_key: str
     alpaca_secret_key: str
     alpaca_base_url: str
@@ -92,8 +99,29 @@ class RuntimeConfig:
     crypto_momentum_target_multiple: float
     crypto_momentum_min_signal_score: float
     crypto_momentum_min_movement_pct: float
+    crypto_momentum_max_movement_pct: float
     crypto_momentum_min_discovery_score: float
     crypto_momentum_min_trade_count: int
+    crypto_momentum_min_volume_gbp: float
+    crypto_momentum_max_spread_pct: float
+    paper_crypto_momentum_stop_loss_pct: float
+    paper_crypto_momentum_target_multiple: float
+    paper_crypto_momentum_min_signal_score: float
+    paper_crypto_momentum_min_movement_pct: float
+    paper_crypto_momentum_max_movement_pct: float
+    paper_crypto_momentum_min_discovery_score: float
+    paper_crypto_momentum_min_trade_count: int
+    paper_crypto_momentum_min_volume_gbp: float
+    paper_crypto_momentum_max_spread_pct: float
+    live_crypto_momentum_stop_loss_pct: float
+    live_crypto_momentum_target_multiple: float
+    live_crypto_momentum_min_signal_score: float
+    live_crypto_momentum_min_movement_pct: float
+    live_crypto_momentum_max_movement_pct: float
+    live_crypto_momentum_min_discovery_score: float
+    live_crypto_momentum_min_trade_count: int
+    live_crypto_momentum_min_volume_gbp: float
+    live_crypto_momentum_max_spread_pct: float
     shadow_checkpoint_windows: tuple[str, ...]
     shadow_profit_target_ladder_pct: tuple[float, ...]
     shadow_execution_spread_bps: float
@@ -177,10 +205,19 @@ class RuntimeConfig:
     ig_request_timeout_seconds: int
     ig_min_bet_per_point_gbp: float
     ig_epic_overrides: dict[str, str]
+    trading212_paper_api_key: str
+    trading212_paper_api_secret: str
+    trading212_paper_base_url: str
+    trading212_paper_request_timeout_seconds: int
+    trading212_paper_primary_currency: str
+    trading212_paper_ticker_overrides: dict[str, str]
+    trading212_paper_execution_enabled: bool
+    trading212_paper_default_notional_native: float
     gemini_api_configured: bool
     alpaca_api_configured: bool
     alpaca_live_api_configured: bool
     ig_api_configured: bool
+    trading212_paper_api_configured: bool
     postgres_configured: bool
     provider_pricing: dict[str, SourcePricing] = field(default_factory=dict)
 
@@ -192,10 +229,94 @@ def load_runtime_config() -> RuntimeConfig:
         os.getenv("USAGE_LEDGER_DB_PATH", ".runtime/centaur_usage.sqlite3")
     )
     database_url, database_url_source = _resolve_database_url()
+    centaur_mode = _resolve_centaur_mode()
+    centaur_environment = _resolve_centaur_environment()
+    paper_crypto_momentum_stop_loss_pct = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_STOP_LOSS_PCT")
+        or os.getenv("CRYPTO_MOMENTUM_STOP_LOSS_PCT"),
+        default=0.01,
+    )
+    paper_crypto_momentum_target_multiple = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_TARGET_MULTIPLE")
+        or os.getenv("CRYPTO_MOMENTUM_TARGET_MULTIPLE"),
+        default=2.0,
+    )
+    paper_crypto_momentum_min_signal_score = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE")
+        or os.getenv("CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE"),
+        default=60.0,
+    )
+    paper_crypto_momentum_min_movement_pct = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT")
+        or os.getenv("CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT"),
+        default=0.15,
+    )
+    paper_crypto_momentum_max_movement_pct = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_MAX_MOVEMENT_PCT")
+        or os.getenv("CRYPTO_MOMENTUM_MAX_MOVEMENT_PCT"),
+        default=2.5,
+    )
+    paper_crypto_momentum_min_discovery_score = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE")
+        or os.getenv("CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE"),
+        default=2.5,
+    )
+    paper_crypto_momentum_min_trade_count = _parse_int(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_MIN_TRADE_COUNT")
+        or os.getenv("CRYPTO_MOMENTUM_MIN_TRADE_COUNT"),
+        default=2,
+    )
+    paper_crypto_momentum_min_volume_gbp = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_MIN_VOLUME_GBP")
+        or os.getenv("CRYPTO_MOMENTUM_MIN_VOLUME_GBP"),
+        default=50_000.0,
+    )
+    paper_crypto_momentum_max_spread_pct = _parse_float(
+        os.getenv("PAPER_CRYPTO_MOMENTUM_MAX_SPREAD_PCT")
+        or os.getenv("CRYPTO_MOMENTUM_MAX_SPREAD_PCT"),
+        default=0.25,
+    )
+    live_crypto_momentum_stop_loss_pct = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_STOP_LOSS_PCT"),
+        default=paper_crypto_momentum_stop_loss_pct,
+    )
+    live_crypto_momentum_target_multiple = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_TARGET_MULTIPLE"),
+        default=paper_crypto_momentum_target_multiple,
+    )
+    live_crypto_momentum_min_signal_score = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE"),
+        default=paper_crypto_momentum_min_signal_score,
+    )
+    live_crypto_momentum_min_movement_pct = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT"),
+        default=paper_crypto_momentum_min_movement_pct,
+    )
+    live_crypto_momentum_max_movement_pct = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_MAX_MOVEMENT_PCT"),
+        default=paper_crypto_momentum_max_movement_pct,
+    )
+    live_crypto_momentum_min_discovery_score = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE"),
+        default=paper_crypto_momentum_min_discovery_score,
+    )
+    live_crypto_momentum_min_trade_count = _parse_int(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_MIN_TRADE_COUNT"),
+        default=paper_crypto_momentum_min_trade_count,
+    )
+    live_crypto_momentum_min_volume_gbp = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_MIN_VOLUME_GBP"),
+        default=paper_crypto_momentum_min_volume_gbp,
+    )
+    live_crypto_momentum_max_spread_pct = _parse_float(
+        os.getenv("LIVE_CRYPTO_MOMENTUM_MAX_SPREAD_PCT"),
+        default=paper_crypto_momentum_max_spread_pct,
+    )
+    active_crypto_momentum_is_live = centaur_environment == "live"
 
     config = RuntimeConfig(
-        centaur_mode=_resolve_centaur_mode(),
-        centaur_environment=_resolve_centaur_environment(),
+        centaur_mode=centaur_mode,
+        centaur_environment=centaur_environment,
         env_name=os.getenv("CENTAUR_ENV", "development"),
         centaur_timezone=os.getenv("CENTAUR_TIMEZONE", "Europe/London"),
         market_timezone=os.getenv("MARKET_TIMEZONE", "America/New_York"),
@@ -236,6 +357,31 @@ def load_runtime_config() -> RuntimeConfig:
         api_daily_cost_limit_usd=_parse_float(
             os.getenv("API_DAILY_COST_LIMIT_USD"),
             default=20.0,
+        ),
+        slack_alerts_enabled=_parse_bool(
+            os.getenv("SLACK_ALERTS_ENABLED"),
+            default=False,
+        ),
+        slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL", "").strip(),
+        slack_alert_dedupe_minutes=_parse_int(
+            os.getenv("SLACK_ALERT_DEDUPE_MINUTES"),
+            default=360,
+        ),
+        slack_request_timeout_seconds=_parse_int(
+            os.getenv("SLACK_REQUEST_TIMEOUT_SECONDS"),
+            default=5,
+        ),
+        live_equity_pdt_review_reminders_enabled=_parse_bool(
+            os.getenv("LIVE_EQUITY_PDT_REVIEW_REMINDERS_ENABLED"),
+            default=True,
+        ),
+        live_equity_pdt_review_reminder_start_date=os.getenv(
+            "LIVE_EQUITY_PDT_REVIEW_REMINDER_START_DATE",
+            "2026-06-04",
+        ).strip(),
+        live_equity_pdt_review_reminder_interval_minutes=_parse_int(
+            os.getenv("LIVE_EQUITY_PDT_REVIEW_REMINDER_INTERVAL_MINUTES"),
+            default=30,
         ),
         alpaca_api_key=os.getenv("ALPACA_API_KEY", "").strip(),
         alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", "").strip(),
@@ -361,30 +507,69 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("SHADOW_TARGET_MULTIPLE"),
             default=2.0,
         ),
-        crypto_momentum_stop_loss_pct=_parse_float(
-            os.getenv("CRYPTO_MOMENTUM_STOP_LOSS_PCT"),
-            default=0.03,
+        crypto_momentum_stop_loss_pct=(
+            live_crypto_momentum_stop_loss_pct
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_stop_loss_pct
         ),
-        crypto_momentum_target_multiple=_parse_float(
-            os.getenv("CRYPTO_MOMENTUM_TARGET_MULTIPLE"),
-            default=2.0,
+        crypto_momentum_target_multiple=(
+            live_crypto_momentum_target_multiple
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_target_multiple
         ),
-        crypto_momentum_min_signal_score=_parse_float(
-            os.getenv("CRYPTO_MOMENTUM_MIN_SIGNAL_SCORE"),
-            default=60.0,
+        crypto_momentum_min_signal_score=(
+            live_crypto_momentum_min_signal_score
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_min_signal_score
         ),
-        crypto_momentum_min_movement_pct=_parse_float(
-            os.getenv("CRYPTO_MOMENTUM_MIN_MOVEMENT_PCT"),
-            default=0.15,
+        crypto_momentum_min_movement_pct=(
+            live_crypto_momentum_min_movement_pct
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_min_movement_pct
         ),
-        crypto_momentum_min_discovery_score=_parse_float(
-            os.getenv("CRYPTO_MOMENTUM_MIN_DISCOVERY_SCORE"),
-            default=4.5,
+        crypto_momentum_max_movement_pct=(
+            live_crypto_momentum_max_movement_pct
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_max_movement_pct
         ),
-        crypto_momentum_min_trade_count=_parse_int(
-            os.getenv("CRYPTO_MOMENTUM_MIN_TRADE_COUNT"),
-            default=2,
+        crypto_momentum_min_discovery_score=(
+            live_crypto_momentum_min_discovery_score
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_min_discovery_score
         ),
+        crypto_momentum_min_trade_count=(
+            live_crypto_momentum_min_trade_count
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_min_trade_count
+        ),
+        crypto_momentum_min_volume_gbp=(
+            live_crypto_momentum_min_volume_gbp
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_min_volume_gbp
+        ),
+        crypto_momentum_max_spread_pct=(
+            live_crypto_momentum_max_spread_pct
+            if active_crypto_momentum_is_live
+            else paper_crypto_momentum_max_spread_pct
+        ),
+        paper_crypto_momentum_stop_loss_pct=paper_crypto_momentum_stop_loss_pct,
+        paper_crypto_momentum_target_multiple=paper_crypto_momentum_target_multiple,
+        paper_crypto_momentum_min_signal_score=paper_crypto_momentum_min_signal_score,
+        paper_crypto_momentum_min_movement_pct=paper_crypto_momentum_min_movement_pct,
+        paper_crypto_momentum_max_movement_pct=paper_crypto_momentum_max_movement_pct,
+        paper_crypto_momentum_min_discovery_score=paper_crypto_momentum_min_discovery_score,
+        paper_crypto_momentum_min_trade_count=paper_crypto_momentum_min_trade_count,
+        paper_crypto_momentum_min_volume_gbp=paper_crypto_momentum_min_volume_gbp,
+        paper_crypto_momentum_max_spread_pct=paper_crypto_momentum_max_spread_pct,
+        live_crypto_momentum_stop_loss_pct=live_crypto_momentum_stop_loss_pct,
+        live_crypto_momentum_target_multiple=live_crypto_momentum_target_multiple,
+        live_crypto_momentum_min_signal_score=live_crypto_momentum_min_signal_score,
+        live_crypto_momentum_min_movement_pct=live_crypto_momentum_min_movement_pct,
+        live_crypto_momentum_max_movement_pct=live_crypto_momentum_max_movement_pct,
+        live_crypto_momentum_min_discovery_score=live_crypto_momentum_min_discovery_score,
+        live_crypto_momentum_min_trade_count=live_crypto_momentum_min_trade_count,
+        live_crypto_momentum_min_volume_gbp=live_crypto_momentum_min_volume_gbp,
+        live_crypto_momentum_max_spread_pct=live_crypto_momentum_max_spread_pct,
         shadow_checkpoint_windows=_parse_shadow_windows(
             os.getenv("SHADOW_CHECKPOINT_WINDOWS", "15m,1h,1d,7d")
         ),
@@ -703,6 +888,31 @@ def load_runtime_config() -> RuntimeConfig:
         ig_epic_overrides=_parse_symbol_map(
             os.getenv("IG_EPIC_OVERRIDES", "")
         ),
+        trading212_paper_api_key=os.getenv("TRADING212_PAPER_API_KEY", "").strip(),
+        trading212_paper_api_secret=os.getenv("TRADING212_PAPER_API_SECRET", "").strip(),
+        trading212_paper_base_url=os.getenv(
+            "TRADING212_PAPER_BASE_URL",
+            "https://demo.trading212.com/api/v0",
+        ).strip(),
+        trading212_paper_request_timeout_seconds=_parse_int(
+            os.getenv("TRADING212_PAPER_REQUEST_TIMEOUT_SECONDS"),
+            default=10,
+        ),
+        trading212_paper_primary_currency=(
+            os.getenv("TRADING212_PAPER_PRIMARY_CURRENCY", "GBP").strip().upper()
+            or "GBP"
+        ),
+        trading212_paper_ticker_overrides=_parse_symbol_map(
+            os.getenv("TRADING212_PAPER_TICKER_OVERRIDES", "")
+        ),
+        trading212_paper_execution_enabled=_parse_bool(
+            os.getenv("TRADING212_PAPER_EXECUTION_ENABLED"),
+            default=True,
+        ),
+        trading212_paper_default_notional_native=_parse_float(
+            os.getenv("TRADING212_PAPER_DEFAULT_NOTIONAL_NATIVE"),
+            default=10.0,
+        ),
         gemini_api_configured=_is_real_value(os.getenv("GEMINI_API_KEY", "")),
         alpaca_api_configured=(
             _is_real_value(os.getenv("ALPACA_API_KEY", ""))
@@ -716,6 +926,12 @@ def load_runtime_config() -> RuntimeConfig:
             _is_real_value(os.getenv("IG_API_KEY", ""))
             and _is_real_value(os.getenv("IG_USERNAME", ""))
             and _is_real_value(os.getenv("IG_PASSWORD", ""))
+        ),
+        trading212_paper_api_configured=_is_real_value(
+            os.getenv("TRADING212_PAPER_API_KEY", "")
+        )
+        and _is_real_value(
+            os.getenv("TRADING212_PAPER_API_SECRET", "")
         ),
         postgres_configured=bool(database_url),
         provider_pricing=_load_provider_pricing(),
@@ -770,6 +986,51 @@ def _validate_live_same_as_paper_config(config: RuntimeConfig) -> None:
             "trailing_drawdown_observer_giveback_pct",
             "trailing_drawdown_observer_paper_giveback_pct",
             "trailing_drawdown_observer_live_giveback_pct",
+        ),
+        (
+            "crypto_momentum_stop_loss_pct",
+            "paper_crypto_momentum_stop_loss_pct",
+            "live_crypto_momentum_stop_loss_pct",
+        ),
+        (
+            "crypto_momentum_target_multiple",
+            "paper_crypto_momentum_target_multiple",
+            "live_crypto_momentum_target_multiple",
+        ),
+        (
+            "crypto_momentum_min_signal_score",
+            "paper_crypto_momentum_min_signal_score",
+            "live_crypto_momentum_min_signal_score",
+        ),
+        (
+            "crypto_momentum_min_movement_pct",
+            "paper_crypto_momentum_min_movement_pct",
+            "live_crypto_momentum_min_movement_pct",
+        ),
+        (
+            "crypto_momentum_max_movement_pct",
+            "paper_crypto_momentum_max_movement_pct",
+            "live_crypto_momentum_max_movement_pct",
+        ),
+        (
+            "crypto_momentum_min_discovery_score",
+            "paper_crypto_momentum_min_discovery_score",
+            "live_crypto_momentum_min_discovery_score",
+        ),
+        (
+            "crypto_momentum_min_trade_count",
+            "paper_crypto_momentum_min_trade_count",
+            "live_crypto_momentum_min_trade_count",
+        ),
+        (
+            "crypto_momentum_min_volume_gbp",
+            "paper_crypto_momentum_min_volume_gbp",
+            "live_crypto_momentum_min_volume_gbp",
+        ),
+        (
+            "crypto_momentum_max_spread_pct",
+            "paper_crypto_momentum_max_spread_pct",
+            "live_crypto_momentum_max_spread_pct",
         ),
     )
     allowed_differences = set(config.live_execution_allowed_paper_differences)
@@ -850,6 +1111,13 @@ def _load_provider_pricing() -> dict[str, SourcePricing]:
             source="ig_spreadbet",
             cost_per_request_usd=_parse_float(
                 os.getenv("IG_REQUEST_COST_USD"),
+                default=0.0,
+            ),
+        ),
+        "trading212_paper": SourcePricing(
+            source="trading212_paper",
+            cost_per_request_usd=_parse_float(
+                os.getenv("TRADING212_PAPER_REQUEST_COST_USD"),
                 default=0.0,
             ),
         ),

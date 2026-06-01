@@ -4,51 +4,18 @@ declare(strict_types=1);
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
 
+require __DIR__ . '/api/snapshot_cache.php';
+
 $initialSnapshotJson = initialSnapshotJson();
 
 function initialSnapshotJson(): string
 {
-    $apiUrl = getenv('CENTAUR_DASHBOARD_API_URL') ?: 'http://host.docker.internal:8788/api/snapshot';
-    if (filter_var($apiUrl, FILTER_VALIDATE_URL) === false) {
+    $result = centaurResolveSnapshotPayload();
+    if (($result['ok'] ?? false) !== true) {
         return 'null';
     }
 
-    $body = null;
-    if (function_exists('curl_init')) {
-        $ch = curl_init($apiUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_CONNECTTIMEOUT => 2,
-            CURLOPT_TIMEOUT => 5,
-            CURLOPT_HTTPHEADER => ['Accept: application/json'],
-        ]);
-        $result = curl_exec($ch);
-        $statusCode = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        $error = curl_error($ch);
-        unset($ch);
-        if ($result !== false && $error === '' && $statusCode >= 200 && $statusCode < 300) {
-            $body = $result;
-        }
-    } else {
-        $context = stream_context_create([
-            'http' => [
-                'method' => 'GET',
-                'timeout' => 5,
-                'ignore_errors' => true,
-                'header' => "Accept: application/json\r\n",
-            ],
-        ]);
-        $result = @file_get_contents($apiUrl, false, $context);
-        if ($result !== false) {
-            $body = $result;
-        }
-    }
-
-    if ($body === null) {
-        return 'null';
-    }
-    $decoded = json_decode($body, true);
+    $decoded = $result['decoded'] ?? null;
     if (!is_array($decoded)) {
         return 'null';
     }
@@ -589,6 +556,7 @@ function initialSnapshotJson(): string
         <button id="preset-fast" class="button" type="button">Faster Test</button>
         <button id="reset" class="button" type="button">Reset</button>
         <a class="button" href="/reports/50-dollar-day-plan.md" download>Download Plan</a>
+        <a class="button" href="/glossary.php">Glossary</a>
         <a class="button" href="/dashboard.php">Dashboard</a>
       </div>
     </header>
@@ -1599,7 +1567,7 @@ function initialSnapshotJson(): string
       if (!["http:", "https:"].includes(window.location.protocol)) {
         return false;
       }
-      const snapshot = await loadJson("/api/snapshot.php");
+      const snapshot = await loadJson("/snapshot/");
       applyPreset(presetFromSnapshot(snapshot), snapshotSourceLabel(snapshot));
       return true;
     }

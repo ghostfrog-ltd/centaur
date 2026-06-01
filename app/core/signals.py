@@ -1,5 +1,5 @@
 """Strategy signal model facade."""
 
-from app.strategies.registry import StrategySignal
+from app.strategies.base import StrategySignal
 
 __all__ = ["StrategySignal"]

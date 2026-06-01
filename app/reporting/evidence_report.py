@@ -34,6 +34,7 @@ class EvidenceReport:
             "streams": self._evidence_streams(),
             "storage_separation": self._storage_separation_summary(),
             "execution_router_intents": self._execution_router_intent_summary(),
+            "strategy_rejections": self._strategy_rejection_summary(recent_ticks),
             "trailing_drawdown": self._trailing_drawdown_summary(recent_ticks),
         }
 
@@ -65,6 +66,28 @@ class EvidenceReport:
                     f" | action_rule={item.get('action_rule', '-')}"
                 )
             )
+
+        rejection_summary = _as_dict(report.get("strategy_rejections"))
+        lines.append("Strategy rejection summary:")
+        if not rejection_summary.get("total_rejections"):
+            lines.append(f"- {rejection_summary.get('reason', 'No rejection summaries recorded yet.')}")
+        else:
+            lines.append(
+                (
+                    f"- total_recent_rejections={int(rejection_summary.get('total_rejections', 0) or 0)}"
+                    f" | ticks_with_rejections={int(rejection_summary.get('ticks_with_rejections', 0) or 0)}"
+                    f" | latest_tick={rejection_summary.get('latest_tick_id', '-')}"
+                )
+            )
+            for item in rejection_summary.get("top_reasons", [])[:8]:
+                reason = _as_dict(item)
+                lines.append(
+                    (
+                        f"- {reason.get('strategy_id', '-')}"
+                        f" | reason={reason.get('reason', '-')}"
+                        f" | count={int(reason.get('count', 0) or 0)}"
+                    )
+                )
 
         storage = _as_dict(report.get("storage_separation"))
         lines.append("Paper/live storage separation:")
@@ -150,6 +173,12 @@ class EvidenceReport:
                 "mode": "diagnostic",
                 "source": "raw/suppressed/surviving signal previews in tick snapshots",
                 "action_rule": "distinguish no signal from fitness suppression",
+            },
+            {
+                "name": "Strategy rejection summary",
+                "mode": "diagnostic",
+                "source": "strategy_signals.rejection_summary in tick snapshots",
+                "action_rule": "review filter reasons before loosening thresholds or allowlists",
             },
             {
                 "name": "Crypto overnight health",
@@ -331,6 +360,60 @@ class EvidenceReport:
             "latest_tick_id": latest.get("tick_id"),
             "latest_status": latest.get("status"),
             "recent": rows,
+        }
+
+    def _strategy_rejection_summary(self, ticks: list[dict[str, Any]]) -> dict[str, Any]:
+        counts: dict[tuple[str, str], int] = defaultdict(int)
+        total = 0
+        ticks_with_rejections = 0
+        latest_tick_id = ""
+        samples: list[dict[str, Any]] = []
+        for tick in ticks:
+            snapshot = _as_dict(tick.get("state_snapshot_json"))
+            strategy_state = _as_dict(snapshot.get("strategy_signals"))
+            summary = _as_dict(strategy_state.get("rejection_summary"))
+            tick_total = int(summary.get("total_rejections", 0) or 0)
+            if tick_total <= 0:
+                continue
+            if not latest_tick_id:
+                latest_tick_id = str(tick.get("tick_id") or "")
+            ticks_with_rejections += 1
+            total += tick_total
+            for row in summary.get("by_strategy_reason", []):
+                item = _as_dict(row)
+                key = (str(item.get("strategy_id") or ""), str(item.get("reason") or ""))
+                counts[key] += int(item.get("count", 0) or 0)
+            for row in summary.get("samples", []):
+                if len(samples) >= 8:
+                    break
+                samples.append(_as_dict(row))
+
+        if total <= 0:
+            return {
+                "status": "insufficient_data",
+                "total_rejections": 0,
+                "reason": "No strategy rejection summaries found in recent tick snapshots.",
+            }
+
+        top_reasons = [
+            {
+                "strategy_id": strategy_id,
+                "reason": reason,
+                "count": count,
+            }
+            for (strategy_id, reason), count in counts.items()
+        ]
+        top_reasons.sort(
+            key=lambda item: (int(item["count"]), item["strategy_id"], item["reason"]),
+            reverse=True,
+        )
+        return {
+            "status": "ok",
+            "total_rejections": total,
+            "ticks_with_rejections": ticks_with_rejections,
+            "latest_tick_id": latest_tick_id,
+            "top_reasons": top_reasons[:25],
+            "samples": samples,
         }
 
     def _trailing_drawdown_summary(self, ticks: list[dict[str, Any]]) -> dict[str, Any]:

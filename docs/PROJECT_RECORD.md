@@ -115,6 +115,7 @@ Current micro paper mode rules:
 - default size is `$10`
 - allowed strategies are currently `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`
 - projected gain must be at least `1.5%` for equities and `2.0%` for crypto
+- `crypto_momentum.trend` uses a `1.0%` stop by explicit operator override on 2026-06-01, reducing future `$10` stop losses from roughly `$0.30` to roughly `$0.10` while keeping crypto enabled
 - paper entries and exits use marketable limit orders rather than raw market orders
 - already allowed paper strategies may use a high-score near-miss override when raw `signal_score >= 90.0` and composite fitness is within `0.25` of the active suppress threshold; this does not change notional, stops, projected-gain floors, broker routing, max orders, or live execution
 - paper managed exits may capture profit at `1.25%` for both equity and crypto positions while preserving the higher entry projected-gain gates

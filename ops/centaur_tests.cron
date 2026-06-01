@@ -1,0 +1,1 @@
+*/15 * * * * /Volumes/Bob/www/ghostfrog-centaur/.venv-mac/bin/python /Volumes/Bob/www/ghostfrog-centaur/scripts/run_test_monitor.py

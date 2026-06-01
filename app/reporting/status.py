@@ -93,6 +93,8 @@ class StatusReporter:
                 f"base_max_open_positions={self.config.paper_execution_max_open_positions} | "
                 f"max_orders_per_tick={self.config.paper_execution_max_orders_per_tick} | "
                 f"equity_broker={self.config.paper_execution_equity_broker_id} | "
+                f"secondary_equity_broker="
+                f"{'trading212_paper' if getattr(self.config, 'trading212_paper_execution_enabled', False) and getattr(self.config, 'trading212_paper_api_configured', False) else '-'} | "
                 f"crypto_broker={self.config.paper_execution_crypto_broker_id}"
             )
         )
@@ -1516,6 +1518,7 @@ class StatusReporter:
             self.config.live_execution_equity_broker_id,
             self.config.live_execution_crypto_broker_id,
             "ig_spreadbet",
+            "trading212_paper",
         ):
             normalized = str(broker_id or "").strip().lower()
             if normalized and normalized not in desired_brokers:
@@ -1533,6 +1536,12 @@ class StatusReporter:
                 roles.append("equity_exec")
             if broker_id == self.config.paper_execution_crypto_broker_id:
                 roles.append("crypto_exec")
+            if (
+                broker_id == "trading212_paper"
+                and getattr(self.config, "trading212_paper_execution_enabled", False)
+                and getattr(self.config, "trading212_paper_api_configured", False)
+            ):
+                roles.append("equity_exec_secondary")
             if broker_id == self.config.live_execution_equity_broker_id:
                 roles.append("live_equity_follower")
             if (
@@ -1545,6 +1554,9 @@ class StatusReporter:
             if row is None:
                 if broker_id == "ig_spreadbet":
                     note = "scaffold only; no live account snapshot yet"
+                    status = "scaffold_only"
+                elif broker_id == "trading212_paper":
+                    note = "paper scaffold only; no account snapshot yet"
                     status = "scaffold_only"
                 elif broker_id == "alpaca_live":
                     note = "dormant live follower; no live account snapshot yet"
@@ -1607,7 +1619,9 @@ class StatusReporter:
         slot_size = float(self.config.live_execution_default_notional_usd)
         max_slots = int(self.config.live_execution_max_open_positions)
         envelope_max_usd = round(slot_size * max_slots, 6)
+        pdt_min_equity_usd = 25000.0
         blockers: list[str] = []
+        equity_entry_blockers: list[str] = []
         if not self.config.live_execution_enabled:
             blockers.append("live_execution_disabled")
         if self.config.live_execution_kill_switch:
@@ -1618,6 +1632,23 @@ class StatusReporter:
             blockers.append("activation_ack_missing")
         if not self.config.live_execution_allowed_strategies:
             blockers.append("no_live_strategies_allowed")
+        if str(self.config.live_execution_equity_broker_id).strip().lower() == "alpaca_live":
+            live_rows = [
+                row
+                for row in self.usage_ledger.list_recent_broker_account_snapshots(limit=24)
+                if str(row.get("broker_id", "")).strip().lower() == "alpaca_live"
+            ]
+            latest_live = live_rows[0] if live_rows else {}
+            pdt_basis_equity = (
+                self._to_float(latest_live.get("last_equity"))
+                or self._to_float(latest_live.get("equity"))
+            )
+            if pdt_basis_equity is None:
+                equity_entry_blockers.append("pdt_equity_status_unknown_live")
+            elif pdt_basis_equity < pdt_min_equity_usd:
+                equity_entry_blockers.append("pdt_equity_entry_blocked_live")
+        else:
+            pdt_basis_equity = None
 
         status = "safe_off"
         if self.config.live_execution_enabled or not self.config.live_execution_kill_switch:
@@ -1664,6 +1695,9 @@ class StatusReporter:
             "crypto_broker_id": self.config.live_execution_crypto_broker_id,
             "allowed_strategies": list(self.config.live_execution_allowed_strategies),
             "blockers": blockers,
+            "equity_entry_blockers": equity_entry_blockers,
+            "pdt_basis_equity_usd": pdt_basis_equity,
+            "pdt_min_equity_usd": pdt_min_equity_usd,
             "note": note,
         }
 
@@ -2163,6 +2197,9 @@ class StatusReporter:
         asset_scope = "equities only" if overview.get("equity_only") else "equities + crypto"
         strategies = ", ".join(overview.get("allowed_strategies", []) or []) or "none"
         blockers = ", ".join(overview.get("blockers", []) or []) or "none"
+        equity_entry_blockers = (
+            ", ".join(overview.get("equity_entry_blockers", []) or []) or "none"
+        )
         return [
             (
                 f"Status={status} | broker={self._broker_label(str(overview.get('broker_id', 'alpaca_live')))} | "
@@ -2184,6 +2221,11 @@ class StatusReporter:
                 f"/crypto {self._fmt_number(overview.get('crypto_limit_buffer_bps'), decimals=1)}bps"
             ),
             f"Blockers={blockers}",
+            (
+                f"Equity entry guards={equity_entry_blockers} | "
+                f"PDT basis=${self._fmt_number(overview.get('pdt_basis_equity_usd'), decimals=2)}"
+                f"/${self._fmt_number(overview.get('pdt_min_equity_usd'), decimals=2)}"
+            ),
             str(overview.get("note", "") or "").strip(),
         ]
 
@@ -2813,6 +2855,7 @@ class StatusReporter:
             "alpaca_paper": "Alpaca Paper",
             "alpaca_live": "Alpaca Live",
             "ig_spreadbet": "IG Spread Betting",
+            "trading212_paper": "Trading 212 Paper",
         }.get(normalized, normalized or "unknown broker")
 
     def _order_status_is_open(self, value: str) -> bool:

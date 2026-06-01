@@ -1,0 +1,148 @@
+Momentum Strategy Review
+
+Overall verdict:
+This is decent as a shadow/research strategy, but I would not let it anywhere near live or paper execution yet without extra context filters. The code is clean and readable, but the trading logic is still quite blunt.
+
+What is good
+
+The separation is good. The docstring makes it clear this is research-only, not execution-approved, and that risk gates decide later. That is exactly the right boundary.
+
+The profile split also makes sense:
+
+momentum.balanced -> equity + crypto, 1h window
+momentum.strong   -> equity only, 1d window
+
+That gives a useful way to compare short-term generic momentum against stronger daily equity momentum.
+
+The early exits are sensible:
+
+if asset_class not in profile.asset_classes:
+    return None
+
+if movement_pct is None or movement_pct < ...
+    return None
+
+if entry_price is None or entry_price <= 0:
+    return None
+
+No obvious runtime-danger issue there.
+
+Main issue: the scoring may be too generous
+
+This is the biggest concern:
+
+signal_score = round(
+    min(
+        100.0,
+        (movement_pct * 120.0) + (discovery_score * 7.5) + (score_liquidity * 8.0),
+    ),
+    6,
+)
+
+Because movement_pct is already a percent value, 0.2 means 0.2%, not 20%. That gives:
+
+0.2 * 120 = 24
+
+So a tiny 0.2% move can contribute 24 points. Add discovery and liquidity and this can pass quite easily.
+
+That might be okay for “surface candidates”, but bluntly: this is more of an attention/ranking detector than a strategy edge detector.
+
+I would rename/comment this more clearly as:
+
+# This score ranks observation priority only. It is not evidence of trade edge.
+
+Strong momentum is not that strong
+
+This profile:
+
+"min_movement_pct": 0.2,
+"min_discovery_score": 5.2,
+"min_trade_count": 75,
+
+For a 1-day equity profile, 0.2% is weak. Many normal stocks move that much just breathing.
+
+If this is meant to find actual strong momentum, I would expect something closer to:
+
+"min_movement_pct": 1.0,
+
+or maybe:
+
+"min_movement_pct": 0.75,
+
+depending on how noisy the candidate universe is.
+
+The current name:
+
+Momentum Strong
+
+does not fully match the threshold. I would either make it stricter or rename it to something like:
+
+Momentum Daily Confirmed
+
+Missing market context usage
+
+The method accepts:
+
+market_context: dict[str, Any]
+
+but never uses it.
+
+That is not wrong, but it is a missed opportunity. For momentum, market context matters a lot. A 0.5% move when the whole market is ripping is less interesting than a 0.5% move while the market is flat or down.
+
+At minimum, later this probably wants:
+
+market_regime
+index_movement_pct
+sector_movement_pct
+volatility_state
+
+Then the strategy can detect relative strength instead of generic movement.
+
+Missing duplicate/noise protection
+
+This strategy could repeatedly flag the same thing every tick if the candidate remains above threshold.
+
+That may be okay if the downstream engine deduplicates signals, but if not, it needs something like:
+
+cooldown_minutes
+last_signal_seen
+same_asset_same_profile suppression
+
+Otherwise the research dataset gets polluted with the same idea repeated many times.
+
+Small code quality note
+
+This line is okay:
+
+asset_class = str(candidate.get("asset_class", "equity"))
+
+But it means missing asset class defaults to equity. That could hide bad candidate data.
+
+For research data, I would rather fail missing asset class:
+
+asset_class = candidate.get("asset_class")
+if not asset_class:
+    return None
+asset_class = str(asset_class)
+
+Because if a crypto candidate accidentally lacks asset_class, it gets treated as equity and could pass the wrong profile.
+
+Blunt verdict
+
+Good research module. Not yet a trading strategy.
+
+It is clean, understandable, and safe enough for shadow observation, but it currently detects:
+
+“something moved up a bit, has some discovery score, and has enough trades”
+
+It does not yet detect true quality momentum.
+
+Recommended changes
+
+1. Make momentum.strong stricter or rename it.
+2. Add a comment that signal_score is observation priority, not evidence of edge.
+3. Do not default missing asset_class to equity.
+4. Use market_context later for relative strength.
+5. Make sure downstream deduplication/cooldown exists.
+
+The architecture is fine. The thresholds are the bit that need tightening.

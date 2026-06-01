@@ -1,15 +1,14 @@
-"""Mean reversion snapback strategy.
+"""Generic momentum research strategy.
 
 Trading idea:
-    Look for an equity that has pulled back sharply on the latest scan, but
-    still has enough discovery/liquidity evidence to make a bounce worth
-    watching. This strategy is long-only; it never suggests shorting a falling
-    name.
+    Find assets with positive movement and enough discovery/liquidity evidence
+    to warrant shadow/research observation.
 
 Execution boundary:
-    This file only creates an auditable StrategySignal. Paper/live eligibility,
-    notional, market-hours checks, kill switches, duplicate-position checks,
-    and broker routing are enforced later by the pipeline risk/execution gates.
+    These profiles are not part of the current paper allowlist. Keeping the
+    logic in its own file makes that distinction visible: this module can
+    produce research signals, but later risk gates decide whether a signal is
+    eligible for paper/live execution.
 """
 
 from __future__ import annotations
@@ -31,36 +30,53 @@ from .common import (
 )
 
 
-class MeanReversionStrategy(StrategyDefinition):
-    """Detect equity pullbacks that may snap back over a short holding window."""
+class MomentumStrategy(StrategyDefinition):
+    """General positive-momentum profiles used for shadow evidence."""
 
-    family = "mean_reversion"
+    family = "momentum"
 
     def build_profiles(self, config: RuntimeConfig) -> list[StrategyProfile]:
-        """Build the single approved snapback profile from runtime risk settings."""
+        """Build balanced and strong momentum profiles from shared shadow settings."""
+        base_stop = max(config.shadow_stop_loss_pct, 0.01)
         return [
             StrategyProfile(
-                strategy_id="mean_reversion.snapback",
+                strategy_id="momentum.balanced",
                 family=self.family,
-                profile_id="snapback",
-                label="Mean Reversion Snapback",
-                asset_classes=("equity",),
+                profile_id="balanced",
+                label="Momentum Balanced",
+                asset_classes=("equity", "crypto"),
                 holding_window_code="1h",
                 holding_window_minutes=window_code_to_minutes("1h"),
-                # Snapback uses a slightly tighter stop/target profile than the
-                # shared shadow default, but never below a 1% stop or 1.5R target.
-                stop_loss_pct=max(config.shadow_stop_loss_pct * 0.9, 0.01),
-                target_multiple=max(config.shadow_target_multiple - 0.25, 1.5),
+                stop_loss_pct=base_stop,
+                target_multiple=max(config.shadow_target_multiple, 1.5),
                 max_signals_per_tick=2,
-                min_signal_score=max(52.0, config.shadow_min_opportunity_score - 3.0),
+                min_signal_score=max(55.0, config.shadow_min_opportunity_score),
                 parameters={
-                    # movement_pct is a percent value, not a decimal ratio:
-                    # -0.18 means down 0.18% from the previous comparable bar.
-                    "max_movement_pct": -0.18,
-                    "min_discovery_score": 4.0,
+                    # movement_pct is a percent value, so 0.08 means up 0.08%.
+                    "min_movement_pct": 0.08,
+                    "min_discovery_score": 4.5,
                     "min_trade_count": 40,
                 },
-            )
+            ),
+            StrategyProfile(
+                strategy_id="momentum.strong",
+                family=self.family,
+                profile_id="strong",
+                label="Momentum Strong",
+                asset_classes=("equity",),
+                holding_window_code="1d",
+                holding_window_minutes=window_code_to_minutes("1d"),
+                stop_loss_pct=base_stop,
+                target_multiple=max(config.shadow_target_multiple + 0.5, 2.0),
+                max_signals_per_tick=1,
+                min_signal_score=max(65.0, config.shadow_min_opportunity_score),
+                parameters={
+                    # Strong momentum is more selective and equity-only.
+                    "min_movement_pct": 0.2,
+                    "min_discovery_score": 5.2,
+                    "min_trade_count": 75,
+                },
+            ),
         ]
 
     def evaluate_candidate(
@@ -70,7 +86,7 @@ class MeanReversionStrategy(StrategyDefinition):
         candidate: dict[str, Any],
         market_context: dict[str, Any],
     ) -> StrategySignal | None:
-        """Return a signal only when the candidate passes every snapback gate."""
+        """Return a generic momentum signal when the profile-specific gates pass."""
         def reject(reason: str, **metrics: Any) -> None:
             record_rejection(
                 market_context=market_context,
@@ -84,29 +100,24 @@ class MeanReversionStrategy(StrategyDefinition):
             reject("missing_instrument_identity")
             return None
 
-        # Snapback is equity-only. Crypto has its own momentum profile and risk
-        # tuning, so a crypto candidate must fail closed here.
+        # The profile controls asset-class scope. Balanced can observe equity
+        # and crypto; strong is equity-only.
         asset_class = normalized_asset_class(candidate)
         if asset_class not in profile.asset_classes:
             reject("asset_class_not_allowed", asset_class=asset_class)
             return None
 
-        # The first gate is the actual pullback: the move must be negative and
-        # at least as deep as max_movement_pct. Shallow dips are ignored.
+        # Require positive movement plus basic discovery/liquidity support.
         movement_pct = to_float(candidate.get("movement_pct"))
         discovery_score = to_float(candidate.get("discovery_score")) or 0.0
         trade_count = to_int(candidate.get("trade_count")) or 0
-        if movement_pct is None or movement_pct > float(profile.parameters["max_movement_pct"]):
+        if movement_pct is None or movement_pct < float(profile.parameters["min_movement_pct"]):
             reject(
-                "movement_above_snapback_max",
+                "movement_below_min",
                 movement_pct=movement_pct,
-                max_movement_pct=profile.parameters["max_movement_pct"],
+                min_movement_pct=profile.parameters["min_movement_pct"],
             )
             return None
-
-        # Discovery score and trade count are lightweight quality/liquidity
-        # checks. They reduce the chance of buying a move that is just a stale
-        # or thinly traded print.
         if discovery_score < float(profile.parameters["min_discovery_score"]):
             reject(
                 "discovery_below_min",
@@ -122,8 +133,8 @@ class MeanReversionStrategy(StrategyDefinition):
             )
             return None
 
-        # The close is used as the planned entry anchor. Invalid prices cannot
-        # produce stops/targets, so they fail before scoring.
+        # Invalid prices fail before scoring because stops and targets derive
+        # from the latest close.
         entry_price = to_float(candidate.get("close_price"))
         if entry_price is None or entry_price <= 0:
             reject("missing_entry_price", entry_price=entry_price)
@@ -134,15 +145,12 @@ class MeanReversionStrategy(StrategyDefinition):
             volume=to_int(candidate.get("volume")),
             trade_count=trade_count,
         )
-        drawdown_strength = abs(movement_pct)
-        # Score rewards a deeper pullback, stronger discovery, and healthier
-        # liquidity. The 100 cap keeps this comparable with other strategies.
+        # Score combines trend strength, discovery quality, and liquidity. The
+        # cap keeps ranking comparable with every other deterministic strategy.
         signal_score = round(
             min(
                 100.0,
-                (drawdown_strength * 100.0)
-                + (discovery_score * 7.0)
-                + (score_liquidity * 6.0),
+                (movement_pct * 120.0) + (discovery_score * 7.5) + (score_liquidity * 8.0),
             ),
             6,
         )
@@ -154,14 +162,13 @@ class MeanReversionStrategy(StrategyDefinition):
             )
             return None
 
-        # Confidence is intentionally capped below 1.0. It is a ranking hint for
-        # the allocator, not permission to bypass downstream capital gates.
+        # Confidence is a bounded ranking hint, not execution permission.
         confidence = round(
-            min(0.9, 0.3 + (drawdown_strength * 0.35) + min(discovery_score / 22.0, 0.25)),
+            min(0.95, 0.35 + (movement_pct * 0.35) + min(discovery_score / 20.0, 0.3)),
             6,
         )
-        # build_signal applies the profile stop and target multiple, preserves
-        # instrument metadata, and creates the final long-only signal object.
+        # Shared builder keeps stop/target math consistent with the other
+        # profile-based strategies.
         return build_signal(
             profile=profile,
             candidate=candidate,
@@ -172,8 +179,8 @@ class MeanReversionStrategy(StrategyDefinition):
             movement_pct=movement_pct,
             discovery_score=discovery_score,
             rationale=(
-                f"{profile.label} sees a pullback of {movement_pct:.3f}% "
-                f"with enough liquidity to test a bounce."
+                f"{profile.label} likes positive movement of {movement_pct:.3f}% "
+                f"with discovery score {discovery_score:.3f} and trade count {trade_count}."
             ),
-            note="rule_based_mean_reversion",
+            note="rule_based_momentum",
         )

@@ -2,7 +2,53 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-05-31
+Last updated: 2026-06-01
+
+## 2026-06-01
+
+### Use most protective stop for aggregated managed positions
+Decision:
+- when Alpaca aggregates multiple same-symbol managed lots into one long position, choose the highest stop-loss among still-open managed entry lots for the full-position managed exit
+- keep FIFO matching in the plan selector so closed older lots do not keep controlling new positions
+- preserve unmanaged/manual holdings as `missing_entry_plan` rather than inventing a stop
+
+Why:
+- today's LINK/USD paper loss showed that using the latest same-symbol entry plan can let an older open lot drift below its own persisted stop
+- Centaur cannot sell a broker-sub-position by lot through Alpaca fractional position state, so the capital-preserving behavior is to exit the whole aggregated position on the most protective still-open stop
+- this tightens managed exits without changing notional, slots, broker scope, strategy allowlist, live independence, or entry gates
+
+Implementation notes:
+- paper and live managed exit lookup now FIFO-matches recent same-symbol fills and selects the most protective still-open managed entry plan
+- tests cover multiple open LINK lots, closed older lots, and unmanaged AMZN/XEL-style holdings
+
+### Split crypto momentum tuning by paper/live lane
+Decision:
+- replace operator-facing global `CRYPTO_MOMENTUM_*` settings with `PAPER_CRYPTO_MOMENTUM_*` and `LIVE_CRYPTO_MOMENTUM_*`
+- keep legacy `CRYPTO_MOMENTUM_*` names as fallback inputs only, so older environments continue to load
+- default live crypto momentum values to paper values and include them in the same-as-paper validator; armed live rejects unnamed differences unless they are listed in `LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES`
+
+Why:
+- paper needs to test alternate crypto momentum approaches without making live changes look accidental or global
+- live remains a real-money follower lane, so live-vs-paper drift still needs explicit review and audit labeling
+
+Implementation notes:
+- `.env`, `.env.example`, README, glossary, compact context, and constraints now document lane-scoped crypto momentum keys
+- active runtime strategy values are selected from paper settings in paper/shadow environments and live settings in live/live_dry environments
+
+### Reduce crypto momentum stop to one percent
+Decision:
+- by explicit operator override, keep `crypto_momentum.trend` enabled but reduce `CRYPTO_MOMENTUM_STOP_LOSS_PCT` from `0.03` to `0.01`
+- lower the strategy-level minimum crypto stop floor from `2.0%` to `1.0%` so the runtime config is actually honored
+- keep `$10` notional, one order per tick, slot caps, projected-gain floors, broker routing, live same-as-paper following, and profit capture unchanged
+
+Why:
+- the LINK/USD stop showed that a `3.0%` loss on a `$10` trade is roughly `$0.30`, too large relative to an overall daily micro-profit target around `$0.50`
+- recent crypto evidence did not support needing a `70%+` win rate implied by `+1.25%` profit capture against a `-3.0%` stop
+- the operator explicitly asked not to stop crypto, only to reduce the loss number
+
+Implementation notes:
+- `.env`, `.env.example`, runtime defaults, and the crypto strategy profile floor now use `1.0%`
+- existing open positions retain their persisted entry plans; the new stop applies to future crypto momentum proposals
 
 ## 2026-05-31
 

@@ -16,6 +16,7 @@ from app.adapters.brokers import BrokerAdapterError, get_broker_adapter
 from app.core.fx import EcbReferenceRateClient, rate_is_stale
 from app.reporting.threshold_advisor import ThresholdAdvisor
 from app.runtime.models import TickContext
+from app.runtime.slack import SlackNotificationError, SlackWebhookClient
 from app.strategies.registry import evaluate_strategies
 
 from .candidate_engine import rank_candidates
@@ -30,6 +31,7 @@ from .technicals import (
 
 PipelineResult = dict[str, Any]
 PipelineRunner = Callable[[TickContext], PipelineResult]
+ALPACA_PDT_MIN_EQUITY_USD = 25_000.0
 
 
 def _paper_min_projected_gain_pct(config: Any, asset_class: str) -> float:
@@ -86,6 +88,18 @@ def _live_runtime_allows_order_mutation(context: TickContext) -> bool:
     return mode_context_from_config(context.config).can_mutate_live_broker
 
 
+def _symbol_from_broker_payload(payload: dict[str, Any]) -> str:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    if symbol:
+        return symbol
+    ticker = str(payload.get("ticker") or "").strip().upper()
+    if "_US_EQ" in ticker:
+        return ticker.split("_US_EQ", 1)[0]
+    if "_" in ticker:
+        return ticker.split("_", 1)[0]
+    return ticker
+
+
 def _empty_live_broker_state(context: TickContext, *, reason: str) -> dict[str, Any]:
     result = {
         "broker_id": "alpaca_live",
@@ -104,6 +118,35 @@ def _empty_live_broker_state(context: TickContext, *, reason: str) -> dict[str, 
     }
     context.state["alpaca_live_orders"] = {
         "broker_id": "alpaca_live",
+        "summary": {"open_orders": 0, "open_order_symbols": []},
+        "raw": [],
+    }
+    return result
+
+
+def _empty_trading212_paper_state(
+    context: TickContext,
+    *,
+    reason: str,
+    mode: str = "skipped",
+) -> dict[str, Any]:
+    result = {
+        "broker_id": "trading212_paper",
+        "mode": mode,
+        "reason": reason,
+    }
+    context.state["trading212_paper_account"] = {
+        "broker_id": "trading212_paper",
+        "summary": {},
+        "raw": {},
+    }
+    context.state["trading212_paper_positions"] = {
+        "broker_id": "trading212_paper",
+        "summary": {"open_positions": 0, "symbols": []},
+        "raw": [],
+    }
+    context.state["trading212_paper_orders"] = {
+        "broker_id": "trading212_paper",
         "summary": {"open_orders": 0, "open_order_symbols": []},
         "raw": [],
     }
@@ -431,6 +474,105 @@ def alpaca_live_sync(context: TickContext) -> PipelineResult:
     }
 
 
+def trading212_paper_sync(context: TickContext) -> PipelineResult:
+    """Sync the separate Trading 212 demo account without enabling execution.
+
+    This optional paper lane is isolated from Alpaca execution. API/read
+    failures are reported in tick state but do not halt the active paper/live
+    control path, because Trading 212 order mutation is still fail-closed.
+    """
+    if not getattr(context.config, "trading212_paper_api_configured", False):
+        return _empty_trading212_paper_state(
+            context,
+            reason="trading212_paper_credentials_missing",
+        )
+
+    try:
+        adapter = get_broker_adapter(context, "trading212_paper")
+        raw_account = {
+            **adapter.get_account(context),
+            "broker_id": adapter.broker_id,
+        }
+        account_summary = adapter.summarize_account(raw_account)
+        raw_positions = [
+            {
+                **position,
+                "broker_id": adapter.broker_id,
+                "symbol": _symbol_from_broker_payload(position),
+            }
+            for position in adapter.get_positions(context)
+        ]
+        positions_summary = adapter.summarize_positions(raw_positions)
+        raw_orders = [
+            {
+                **order,
+                "broker_id": adapter.broker_id,
+                "symbol": _symbol_from_broker_payload(order),
+            }
+            for order in adapter.get_orders(
+                context,
+                status="all",
+                after=context.started_at - timedelta(days=7),
+                limit=100,
+                nested=True,
+            )
+        ]
+        orders_saved = context.usage_ledger.record_paper_trade_orders(
+            tick_id=context.tick_id,
+            captured_at=context.started_at,
+            orders=raw_orders,
+            broker_id=adapter.broker_id,
+        )
+        orders_summary = adapter.summarize_orders(raw_orders)
+        context.usage_ledger.record_broker_account_snapshot(
+            tick_id=context.tick_id,
+            captured_at=context.started_at,
+            broker_id=adapter.broker_id,
+            summary=account_summary,
+            raw_account=raw_account,
+            positions=raw_positions,
+        )
+    except BrokerAdapterError as exc:
+        result = _empty_trading212_paper_state(
+            context,
+            reason=str(exc),
+            mode="sync_error",
+        )
+        result["error_type"] = type(exc).__name__
+        return result
+
+    account_payload = {
+        "broker_id": adapter.broker_id,
+        "summary": account_summary,
+        "raw": raw_account,
+    }
+    context.state["trading212_paper_account"] = account_payload
+    broker_accounts = context.state.setdefault("broker_accounts", {})
+    if isinstance(broker_accounts, dict):
+        broker_accounts[adapter.broker_id] = account_payload
+    context.state["trading212_paper_positions"] = {
+        "broker_id": adapter.broker_id,
+        "summary": positions_summary,
+        "raw": raw_positions,
+    }
+    context.state["trading212_paper_orders"] = {
+        "broker_id": adapter.broker_id,
+        "summary": orders_summary,
+        "raw": raw_orders,
+    }
+    return {
+        "broker_id": adapter.broker_id,
+        "mode": "synced",
+        "account_snapshot_saved": 1,
+        "orders_saved": orders_saved,
+        "open_positions": positions_summary.get("open_positions", 0),
+        "open_orders": orders_summary.get("open_orders", 0),
+        "equity": account_summary.get("equity"),
+        "cash": account_summary.get("cash"),
+        "currency": account_summary.get("currency"),
+    }
+
+
 def daily_protection(context: TickContext) -> PipelineResult:
     """Persist the paper daily drawdown latch before any new entry decision.
 
@@ -574,6 +716,89 @@ def live_daily_protection(context: TickContext) -> PipelineResult:
     if row.get("protection_triggered_at") is not None:
         result["protection_triggered_at"] = row.get("protection_triggered_at")
     context.state["live_daily_protection"] = {**result, "raw": row}
+    return result
+
+
+def trading212_paper_daily_protection(context: TickContext) -> PipelineResult:
+    """Latch the Trading 212 paper daily protector in USD-equivalent terms."""
+    if not _paper_trading212_enabled(context):
+        result = {
+            "system_status": "skipped",
+            "entries_blocked": True,
+            "reason": "trading212_paper_execution_disabled",
+            "max_daily_drawdown_usd": float(context.config.paper_execution_max_daily_drawdown_usd),
+        }
+        context.state["trading212_paper_daily_protection"] = result
+        return result
+
+    account_state = context.state.get("trading212_paper_account", {})
+    summary = account_state.get("summary", {}) if isinstance(account_state, dict) else {}
+    equity_native = _as_float(summary.get("equity"))
+    usd_to_gbp = _as_float(context.state.get("fx_gbp_reference", {}).get("usd_to_gbp"))
+    current_equity_usd = _native_equity_to_usd(
+        equity_native,
+        currency=str(summary.get("currency", "GBP")),
+        usd_to_gbp=usd_to_gbp,
+    )
+    max_drawdown = float(context.config.paper_execution_max_daily_drawdown_usd)
+    if current_equity_usd is None or current_equity_usd <= 0:
+        result = {
+            "system_status": "unknown",
+            "entries_blocked": True,
+            "reason": "trading212_paper_equity_unavailable",
+            "max_daily_drawdown_usd": max_drawdown,
+        }
+        context.state["trading212_paper_daily_protection"] = result
+        return result
+
+    session_date, market_open_at = _current_market_session(
+        started_at=context.started_at,
+        market_timezone=context.config.market_timezone,
+    )
+    broker_id = "trading212_paper"
+    existing = context.usage_ledger.get_broker_daily_protection_state(
+        session_date=session_date,
+        broker_id=broker_id,
+    )
+    baseline_equity = _as_float(existing.get("baseline_equity")) if existing else None
+    if baseline_equity is None or baseline_equity <= 0:
+        baseline_equity = current_equity_usd
+    equity_drawdown_usd = max(0.0, baseline_equity - current_equity_usd)
+    protection_already_active = (
+        str(existing.get("system_status", "")).lower() == "protected"
+        if existing
+        else False
+    )
+    protected = protection_already_active or equity_drawdown_usd >= max_drawdown
+    notes = "daily_drawdown_limit_reached" if protected else ""
+    row = context.usage_ledger.upsert_broker_daily_protection_state(
+        session_date=session_date,
+        broker_id=broker_id,
+        market_open_at=market_open_at,
+        tick_id=context.tick_id,
+        checked_at=context.started_at,
+        current_equity=current_equity_usd,
+        max_daily_drawdown_usd=max_drawdown,
+        system_status="protected" if protected else "active",
+        notes=notes,
+    )
+    result = {
+        "session_date": row.get("session_date"),
+        "market_open_at": row.get("market_open_at"),
+        "baseline_equity": _as_float(row.get("baseline_equity")),
+        "current_equity": _as_float(row.get("latest_equity")),
+        "equity_drawdown_usd": _as_float(row.get("equity_drawdown_usd")) or 0.0,
+        "max_daily_drawdown_usd": _as_float(row.get("max_daily_drawdown_usd")) or max_drawdown,
+        "system_status": str(row.get("system_status", "active")).lower(),
+        "entries_blocked": str(row.get("system_status", "active")).lower() == "protected",
+        "baseline_created": existing is None,
+        "native_equity": equity_native,
+        "native_currency": str(summary.get("currency", "GBP")),
+        "reason": "daily_drawdown_limit_reached" if protected else "active",
+    }
+    if row.get("protection_triggered_at") is not None:
+        result["protection_triggered_at"] = row.get("protection_triggered_at")
+    context.state["trading212_paper_daily_protection"] = {**result, "raw": row}
     return result
 
 
@@ -1261,7 +1486,11 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
     stale/non-marketable open exits, and writes every submitted exit back to the
     broker-separated order audit trail.
     """
-    positions = list(context.state.get("alpaca_positions", {}).get("raw", []))
+    positions = []
+    for broker_id in _active_paper_broker_ids(context):
+        positions.extend(
+            list(context.state.get(_positions_state_key_for_broker(broker_id), {}).get("raw", []))
+        )
     if not positions:
         result = {
             "broker": "alpaca_paper",
@@ -1278,7 +1507,11 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
         return result
 
     recent_orders = context.usage_ledger.list_recent_execution_lane_trade_orders(limit=100)
-    raw_open_orders = list(context.state.get("alpaca_orders", {}).get("raw", []))
+    raw_open_orders = []
+    for broker_id in _active_paper_broker_ids(context):
+        raw_open_orders.extend(
+            list(context.state.get(_orders_state_key_for_broker(broker_id), {}).get("raw", []))
+        )
     latest_bars = _latest_bars_by_symbol(context)
     open_exit_by_symbol = {
         _normalized_symbol_key(str(order.get("symbol", "")).upper()): order
@@ -1299,7 +1532,7 @@ def paper_exit_management(context: TickContext) -> PipelineResult:
         if not symbol:
             continue
 
-        entry_order = _find_latest_managed_entry_order(
+        entry_order = _find_most_protective_managed_entry_order(
             symbol=symbol,
             orders=recent_orders,
             broker_id=broker_id,
@@ -1615,7 +1848,7 @@ def live_exit_management(context: TickContext) -> PipelineResult:
             continue
         symbol_key = _normalized_symbol_key(symbol)
 
-        entry_order = _find_latest_managed_entry_order(
+        entry_order = _find_most_protective_managed_entry_order(
             symbol=symbol,
             orders=recent_orders,
             broker_id=broker_id,
@@ -2089,6 +2322,7 @@ def strategy_signals(context: TickContext) -> PipelineResult:
         "signals_suppressed": allocation_stats["suppressed"],
         "signals_high_score_overridden": allocation_stats["high_score_overrides"],
         "signals_favored": allocation_stats["favored"],
+        "rejection_summary": batch.rejection_summary,
         "allocation_min_checkpoints": context.config.strategy_allocation_min_checkpoints,
         "allocation_suppress_threshold": suppress_threshold,
         "allocation_suppress_thresholds": suppress_thresholds,
@@ -2308,20 +2542,11 @@ def risk_cfo_gate(context: TickContext) -> PipelineResult:
     gate = context.state["market_gate"]
     protection = context.state.get("daily_protection", {})
     proposals = list(context.state.get("shadow_trade_proposals", {}).get("proposals", []))
-    positions_summary = context.state.get("alpaca_positions", {}).get("summary", {})
-    orders_summary = context.state.get("alpaca_orders", {}).get("summary", {})
-    open_positions = int(positions_summary.get("open_positions", 0) or 0)
-    open_orders = int(orders_summary.get("open_orders", 0) or 0)
-    occupied_slots = open_positions + open_orders
-    slot_policy = _earned_slot_policy(
-        context=context,
-        broker_id="alpaca_paper",
-        account_state_key="alpaca_account",
-        base_max_positions=int(config.paper_execution_max_open_positions),
-        slot_size_usd=float(config.paper_execution_default_notional_usd),
-    )
-    effective_max_positions = int(slot_policy["effective_max_open_positions"])
-    available_slots = max(0, effective_max_positions - occupied_slots)
+    paper_brokers = _active_paper_broker_ids(context)
+    lane_results: dict[str, dict[str, Any]] = {}
+    total_open_positions = 0
+    total_open_orders = 0
+    total_available_slots = 0
     decision = "hold"
     reason = "paper_execution_disabled"
     rejected: list[dict[str, Any]] = []
@@ -2337,53 +2562,128 @@ def risk_cfo_gate(context: TickContext) -> PipelineResult:
         reason = gate["reason"]
     elif not proposals:
         reason = "no_shadow_proposals"
-    elif available_slots <= 0:
-        reason = "max_open_positions_reached"
     else:
-        position_symbols = {
-            str(symbol).upper()
-            for symbol in positions_summary.get("symbols", [])
-            if symbol
-        }
-        open_order_symbols = {
-            str(symbol).upper()
-            for symbol in orders_summary.get("open_order_symbols", [])
-            if symbol
-        }
         allowed_strategies = {
             strategy_id.lower()
             for strategy_id in config.paper_execution_allowed_strategies
             if strategy_id
         }
-        for proposal in proposals:
-            approval, rejection = _build_paper_trade_approval(
+        for broker_id in paper_brokers:
+            positions_summary = context.state.get(
+                _positions_state_key_for_broker(broker_id),
+                {},
+            ).get("summary", {})
+            orders_summary = context.state.get(
+                _orders_state_key_for_broker(broker_id),
+                {},
+            ).get("summary", {})
+            open_positions = int(positions_summary.get("open_positions", 0) or 0)
+            open_orders = int(orders_summary.get("open_orders", 0) or 0)
+            total_open_positions += open_positions
+            total_open_orders += open_orders
+            occupied_slots = open_positions + open_orders
+            slot_policy = _earned_slot_policy(
                 context=context,
-                proposal=proposal,
-                tick_id=context.tick_id,
-                config=config,
-                market_gate=gate,
-                position_symbols=position_symbols,
-                open_order_symbols=open_order_symbols,
+                broker_id=broker_id,
+                account_state_key=_account_state_key_for_broker(broker_id),
+                base_max_positions=int(config.paper_execution_max_open_positions),
+                slot_size_usd=_slot_size_native_for_broker(context, broker_id),
             )
-            if rejection is not None:
-                rejected.append(rejection)
-                continue
-            if approval is None:
-                continue
-            strategy_id = str(approval.get("strategy_id", "")).lower()
-            if allowed_strategies and strategy_id not in allowed_strategies:
+            effective_max_positions = int(slot_policy["effective_max_open_positions"])
+            available_slots = max(0, effective_max_positions - occupied_slots)
+            total_available_slots += available_slots
+            protection_state = context.state.get(
+                _paper_protection_state_key_for_broker(broker_id),
+                {},
+            )
+            lane_results[broker_id] = {
+                "open_positions": open_positions,
+                "open_orders": open_orders,
+                "available_slots": available_slots,
+                "base_max_open_positions": int(config.paper_execution_max_open_positions),
+                "effective_max_open_positions": effective_max_positions,
+                "earned_slots": int(slot_policy["earned_slots"]),
+                "earned_slot_pnl": slot_policy["total_pnl_usd"],
+                "approved_trades": 0,
+                "rejected_trades": 0,
+                "reason": "pending",
+            }
+            if str(protection_state.get("system_status", "active")).lower() == "protected":
+                lane_results[broker_id]["reason"] = "daily_drawdown_limit_reached"
                 rejected.append(
                     {
-                        "symbol": approval["symbol"],
-                        "broker_id": approval["broker_id"],
-                        "strategy_id": approval["strategy_id"],
-                        "reason": "strategy_not_allowed",
+                        "symbol": "",
+                        "broker_id": broker_id,
+                        "strategy_id": "",
+                        "reason": "daily_drawdown_limit_reached",
                     }
                 )
                 continue
-            approved.append(approval)
-            if len(approved) >= min(config.paper_execution_max_orders_per_tick, available_slots):
-                break
+            if available_slots <= 0:
+                lane_results[broker_id]["reason"] = "max_open_positions_reached"
+                rejected.append(
+                    {
+                        "symbol": "",
+                        "broker_id": broker_id,
+                        "strategy_id": "",
+                        "reason": "max_open_positions_reached",
+                    }
+                )
+                continue
+            position_symbols = {
+                str(symbol).upper()
+                for symbol in positions_summary.get("symbols", [])
+                if symbol
+            }
+            open_order_symbols = {
+                str(symbol).upper()
+                for symbol in orders_summary.get("open_order_symbols", [])
+                if symbol
+            }
+            for proposal in proposals:
+                if broker_id == "trading212_paper" and str(proposal.get("asset_class", "")).lower() != "equity":
+                    continue
+                approval, rejection = _build_paper_trade_approval(
+                    context=context,
+                    proposal=proposal,
+                    tick_id=context.tick_id,
+                    config=config,
+                    market_gate=gate,
+                    position_symbols=position_symbols,
+                    open_order_symbols=open_order_symbols,
+                    broker_id=broker_id,
+                )
+                if rejection is not None:
+                    rejected.append(rejection)
+                    lane_results[broker_id]["rejected_trades"] += 1
+                    continue
+                if approval is None:
+                    continue
+                strategy_id = str(approval.get("strategy_id", "")).lower()
+                if allowed_strategies and strategy_id not in allowed_strategies:
+                    rejected.append(
+                        {
+                            "symbol": approval["symbol"],
+                            "broker_id": approval["broker_id"],
+                            "strategy_id": approval["strategy_id"],
+                            "reason": "strategy_not_allowed",
+                        }
+                    )
+                    lane_results[broker_id]["rejected_trades"] += 1
+                    continue
+                approved.append(approval)
+                lane_results[broker_id]["approved_trades"] += 1
+                if lane_results[broker_id]["approved_trades"] >= min(
+                    config.paper_execution_max_orders_per_tick,
+                    available_slots,
+                ):
+                    break
+            if lane_results[broker_id]["approved_trades"]:
+                lane_results[broker_id]["reason"] = "paper_trade_approved"
+            elif lane_results[broker_id]["rejected_trades"]:
+                lane_results[broker_id]["reason"] = "no_paper_eligible_proposals"
+            else:
+                lane_results[broker_id]["reason"] = "no_paper_eligible_proposals"
 
         if approved:
             decision = "submit_paper"
@@ -2393,19 +2693,62 @@ def risk_cfo_gate(context: TickContext) -> PipelineResult:
         else:
             reason = "no_paper_eligible_proposals"
 
+    if not lane_results:
+        for broker_id in paper_brokers:
+            positions_summary = context.state.get(
+                _positions_state_key_for_broker(broker_id),
+                {},
+            ).get("summary", {})
+            orders_summary = context.state.get(
+                _orders_state_key_for_broker(broker_id),
+                {},
+            ).get("summary", {})
+            open_positions = int(positions_summary.get("open_positions", 0) or 0)
+            open_orders = int(orders_summary.get("open_orders", 0) or 0)
+            total_open_positions += open_positions
+            total_open_orders += open_orders
+            slot_policy = _earned_slot_policy(
+                context=context,
+                broker_id=broker_id,
+                account_state_key=_account_state_key_for_broker(broker_id),
+                base_max_positions=int(config.paper_execution_max_open_positions),
+                slot_size_usd=_slot_size_native_for_broker(context, broker_id),
+            )
+            effective_max_positions = int(slot_policy["effective_max_open_positions"])
+            available_slots = max(0, effective_max_positions - open_positions - open_orders)
+            total_available_slots += available_slots
+            lane_results[broker_id] = {
+                "open_positions": open_positions,
+                "open_orders": open_orders,
+                "available_slots": available_slots,
+                "base_max_open_positions": int(config.paper_execution_max_open_positions),
+                "effective_max_open_positions": effective_max_positions,
+                "earned_slots": int(slot_policy["earned_slots"]),
+                "earned_slot_pnl": slot_policy["total_pnl_usd"],
+                "approved_trades": 0,
+                "rejected_trades": 0,
+                "reason": reason,
+            }
+
     result = {
         "approved_trades": len(approved),
         "rejected_trades": len(rejected),
         "decision": decision,
         "reason": reason,
         "watch_candidates": len(proposals),
-        "open_positions": open_positions,
-        "open_orders": open_orders,
-        "available_slots": available_slots,
+        "open_positions": total_open_positions,
+        "open_orders": total_open_orders,
+        "available_slots": total_available_slots,
         "base_max_open_positions": int(config.paper_execution_max_open_positions),
-        "effective_max_open_positions": effective_max_positions,
-        "earned_slots": int(slot_policy["earned_slots"]),
-        "earned_slot_pnl_usd": slot_policy["total_pnl_usd"],
+        "effective_max_open_positions": sum(
+            int(lane.get("effective_max_open_positions", 0) or 0)
+            for lane in lane_results.values()
+        ),
+        "earned_slots": sum(
+            int(lane.get("earned_slots", 0) or 0) for lane in lane_results.values()
+        ),
+        "earned_slot_pnl_usd": 0.0,
+        "broker_lanes": lane_results,
     }
     if approved:
         result["approved_symbols"] = [item["symbol"] for item in approved]
@@ -2433,7 +2776,15 @@ def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
     gate = context.state["market_gate"]
     protection = context.state.get("live_daily_protection", {})
     paper_approvals = list(context.state.get("risk_cfo", {}).get("approved_order_requests", []))
-    paper_submitted_orders = list(context.state.get("execution", {}).get("orders", []))
+    primary_paper_brokers = {
+        str(config.paper_execution_equity_broker_id or "alpaca_paper").strip().lower(),
+        str(config.paper_execution_crypto_broker_id or "alpaca_paper").strip().lower(),
+    }
+    paper_submitted_orders = [
+        order
+        for order in list(context.state.get("execution", {}).get("orders", []))
+        if str(order.get("broker_id", "")).strip().lower() in primary_paper_brokers
+    ]
     submitted_paper_proposal_ids = {
         str(order.get("proposal_id", "")).strip()
         for order in paper_submitted_orders
@@ -2443,6 +2794,7 @@ def live_risk_cfo_gate(context: TickContext) -> PipelineResult:
         approval
         for approval in paper_approvals
         if str(approval.get("proposal_id", "")).strip() in submitted_paper_proposal_ids
+        and str(approval.get("broker_id", "")).strip().lower() in primary_paper_brokers
     ]
     proposals = list(context.state.get("shadow_trade_proposals", {}).get("proposals", []))
     proposal_by_id = {
@@ -2932,6 +3284,251 @@ def post_trade_evaluation(context: TickContext) -> PipelineResult:
     return result
 
 
+def slack_notifications(context: TickContext) -> PipelineResult:
+    """Send one-way operator alerts to Slack with persisted dedupe.
+
+    Slack is intentionally notification-only. This step reports broker/risk
+    conditions but never accepts commands or mutates trading state.
+    """
+    if not bool(getattr(context.config, "slack_alerts_enabled", False)):
+        result = {"channel": "slack", "mode": "disabled", "alerts_built": 0}
+        context.state["slack_notifications"] = result
+        return result
+    webhook_url = str(getattr(context.config, "slack_webhook_url", "") or "").strip()
+    if not webhook_url:
+        result = {
+            "channel": "slack",
+            "mode": "not_configured",
+            "alerts_built": 0,
+            "reason": "slack_webhook_url_missing",
+        }
+        context.state["slack_notifications"] = result
+        return result
+
+    alerts = _build_slack_alerts(context)
+    if not alerts:
+        result = {"channel": "slack", "mode": "idle", "alerts_built": 0}
+        context.state["slack_notifications"] = result
+        return result
+
+    sender = context.metadata.get("slack_post_message")
+    client = None
+    if not callable(sender):
+        client = SlackWebhookClient(
+            webhook_url=webhook_url,
+            timeout_seconds=int(
+                getattr(context.config, "slack_request_timeout_seconds", 5) or 5
+            ),
+        )
+
+    sent: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for alert in alerts:
+        event_key = str(alert.get("event_key", "")).strip()
+        dedupe_minutes = max(
+            1,
+            int(
+                alert.get("dedupe_minutes")
+                or getattr(context.config, "slack_alert_dedupe_minutes", 360)
+                or 360
+            ),
+        )
+        dedupe_since = context.started_at - timedelta(minutes=dedupe_minutes)
+        if context.usage_ledger.notification_recently_sent(
+            channel="slack",
+            event_key=event_key,
+            since=dedupe_since,
+        ):
+            skipped.append(
+                {
+                    "event_key": event_key,
+                    "reason": "deduped",
+                    "dedupe_minutes": dedupe_minutes,
+                }
+            )
+            continue
+        text = _format_slack_alert(alert)
+        try:
+            if callable(sender):
+                sender(webhook_url, text)
+            elif client is not None:
+                client.post_message(text)
+            context.usage_ledger.record_notification_event(
+                tick_id=context.tick_id,
+                channel="slack",
+                event_key=event_key,
+                level=str(alert.get("level", "info")),
+                summary=str(alert.get("summary", "")),
+                detail=str(alert.get("detail", "")),
+                status="sent",
+                metadata={"dedupe_minutes": dedupe_minutes},
+                sent_at=context.started_at,
+            )
+            context.record_api_usage(
+                source="slack",
+                endpoint="incoming_webhook",
+                success=True,
+                metadata={"event_key": event_key},
+            )
+            sent.append({"event_key": event_key})
+        except (SlackNotificationError, Exception) as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            context.usage_ledger.record_notification_event(
+                tick_id=context.tick_id,
+                channel="slack",
+                event_key=event_key,
+                level=str(alert.get("level", "info")),
+                summary=str(alert.get("summary", "")),
+                detail=str(alert.get("detail", "")),
+                status="error",
+                error=error_text,
+                metadata={"dedupe_minutes": dedupe_minutes},
+                sent_at=context.started_at,
+            )
+            context.record_api_usage(
+                source="slack",
+                endpoint="incoming_webhook",
+                success=False,
+                metadata={"event_key": event_key, "error": error_text},
+            )
+            errors.append({"event_key": event_key, "error": error_text})
+
+    result = {
+        "channel": "slack",
+        "mode": "alerts",
+        "alerts_built": len(alerts),
+        "alerts_sent": len(sent),
+        "alerts_deduped": len(skipped),
+        "errors": len(errors),
+    }
+    if sent:
+        result["sent"] = sent
+    if skipped:
+        result["skipped"] = skipped
+    if errors:
+        result["first_error"] = errors[0]["error"]
+    context.state["slack_notifications"] = result
+    return result
+
+
+def _build_slack_alerts(context: TickContext) -> list[dict[str, Any]]:
+    alerts: list[dict[str, Any]] = []
+    live_exit = context.state.get("live_exit_management", {})
+    if isinstance(live_exit, dict):
+        for item in live_exit.get("errors", []) or []:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "-").upper()
+            reason = str(item.get("error") or "live exit error").strip()
+            alerts.append(
+                {
+                    "level": "critical",
+                    "event_key": f"live_exit_error:{symbol}:{_alert_key(reason)}",
+                    "summary": f"Live exit error for {symbol}",
+                    "detail": reason,
+                }
+            )
+
+    pdt_basis = _live_alpaca_pdt_basis_equity(context)
+    if pdt_basis is not None and pdt_basis < ALPACA_PDT_MIN_EQUITY_USD:
+        alerts.append(
+            {
+                "level": "warning",
+                "event_key": "alpaca_live_equity_pdt_guard_active",
+                "summary": "Alpaca Live equity entries are blocked by PDT guard",
+                "detail": (
+                    f"PDT basis ${pdt_basis:.2f} is below "
+                    f"${ALPACA_PDT_MIN_EQUITY_USD:.2f}; crypto is unaffected."
+                ),
+            }
+        )
+        review_start_date = _parse_iso_date(
+            getattr(
+                context.config,
+                "live_equity_pdt_review_reminder_start_date",
+                "2026-06-04",
+            )
+        )
+        review_reminders_enabled = bool(
+            getattr(context.config, "live_equity_pdt_review_reminders_enabled", True)
+        )
+        review_interval_minutes = max(
+            1,
+            int(
+                getattr(
+                    context.config,
+                    "live_equity_pdt_review_reminder_interval_minutes",
+                    30,
+                )
+                or 30
+            ),
+        )
+        if (
+            review_reminders_enabled
+            and review_start_date is not None
+            and context.started_at.date() >= review_start_date
+        ):
+            alerts.append(
+                {
+                    "level": "warning",
+                    "event_key": "alpaca_intraday_margin_review_due_20260604",
+                    "summary": "Action required: review live equity PDT unblock",
+                    "detail": (
+                        "Alpaca announced the new intraday margin framework for "
+                        f"{review_start_date.isoformat()}, but Centaur must observe "
+                        "live API/account behavior before explicitly unblocking "
+                        "equities. This reminder repeats until "
+                        "LIVE_EQUITY_PDT_REVIEW_REMINDERS_ENABLED is turned off "
+                        "or the guard is explicitly reviewed."
+                    ),
+                    "dedupe_minutes": review_interval_minutes,
+                }
+            )
+    return alerts
+
+
+def _format_slack_alert(alert: dict[str, Any]) -> str:
+    level = str(alert.get("level", "info")).upper()
+    summary = str(alert.get("summary", "")).strip() or "Centaur alert"
+    detail = str(alert.get("detail", "")).strip()
+    if detail:
+        return f"[Project Centaur] {level}: {summary}\n{detail}"
+    return f"[Project Centaur] {level}: {summary}"
+
+
+def _live_alpaca_pdt_basis_equity(context: TickContext) -> float | None:
+    account_state = context.state.get("alpaca_live_account", {})
+    if not isinstance(account_state, dict):
+        return None
+    raw_account = account_state.get("raw", {})
+    summary = account_state.get("summary", {})
+    if not isinstance(raw_account, dict):
+        raw_account = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    return (
+        _as_float(raw_account.get("last_equity"))
+        or _as_float(summary.get("last_equity"))
+        or _as_float(raw_account.get("equity"))
+        or _as_float(summary.get("equity"))
+    )
+
+
+def _alert_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")[:80] or "alert"
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def build_default_pipeline() -> list[StepDefinition]:
     return [
         StepDefinition(name="control.heartbeat", runner=control_heartbeat),
@@ -2940,6 +3537,7 @@ def build_default_pipeline() -> list[StepDefinition]:
         StepDefinition(name="alpaca.positions", runner=alpaca_positions),
         StepDefinition(name="alpaca.orders", runner=alpaca_orders),
         StepDefinition(name="alpaca_live.sync", runner=alpaca_live_sync),
+        StepDefinition(name="trading212_paper.sync", runner=trading212_paper_sync),
         StepDefinition(name="risk.daily_protection", runner=daily_protection),
         StepDefinition(name="risk.live_daily_protection", runner=live_daily_protection),
         StepDefinition(name="risk.trailing_drawdown_observer", runner=trailing_drawdown_observer),
@@ -2947,6 +3545,7 @@ def build_default_pipeline() -> list[StepDefinition]:
         StepDefinition(name="maintenance.live_stale_orders", runner=live_stale_order_reaper),
         StepDefinition(name="market.gate", runner=market_gate),
         StepDefinition(name="fx.gbp_reference", runner=fx_gbp_reference),
+        StepDefinition(name="risk.trading212_paper_daily_protection", runner=trading212_paper_daily_protection),
         StepDefinition(name="market.latest_bars", runner=market_latest_bars),
         StepDefinition(name="crypto.latest_bars", runner=crypto_latest_bars),
         StepDefinition(name="execution.paper_exits", runner=paper_exit_management),
@@ -2963,6 +3562,7 @@ def build_default_pipeline() -> list[StepDefinition]:
         StepDefinition(name="risk.live_cfo", runner=live_risk_cfo_gate),
         StepDefinition(name="execution.live", runner=execution_live),
         StepDefinition(name="evaluation.post_trade", runner=post_trade_evaluation),
+        StepDefinition(name="notifications.slack", runner=slack_notifications),
     ]
 
 
@@ -2975,6 +3575,7 @@ def _build_paper_trade_approval(
     market_gate: dict[str, Any],
     position_symbols: set[str],
     open_order_symbols: set[str],
+    broker_id: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Convert one shadow proposal into an auditable paper approval or veto.
 
@@ -3035,13 +3636,16 @@ def _build_paper_trade_approval(
             "reason": "projected_gain_too_thin",
         }
 
-    notional_usd = round(float(config.paper_execution_default_notional_usd), 2)
+    notional_usd = _notional_usd_for_broker(context, broker_id)
     if notional_usd <= 0:
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "qty_too_small"}
 
-    broker_id = _paper_execution_broker_id_for_asset_class(
-        config=config,
-        asset_class=asset_class,
+    broker_id = (
+        str(broker_id or "").strip().lower()
+        or _paper_execution_broker_id_for_asset_class(
+            config=config,
+            asset_class=asset_class,
+        )
     )
     try:
         adapter = get_execution_adapter(context, broker_id)
@@ -3071,6 +3675,7 @@ def _build_paper_trade_approval(
         tick_id=tick_id,
         symbol=symbol,
         strategy_id=strategy_id,
+        lane=broker_id,
     )
     try:
         order_request = adapter.build_entry_order_request(
@@ -3155,6 +3760,10 @@ def _build_live_trade_approval(
         return None, {"symbol": "", "strategy_id": strategy_id, "reason": "missing_symbol"}
     if asset_class not in {"equity", "crypto"}:
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "unsupported_asset_class"}
+    broker_id = _live_execution_broker_id_for_asset_class(
+        config=config,
+        asset_class=asset_class,
+    )
     if config.live_execution_equity_only and asset_class != "equity":
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "non_equity_blocked_live"}
     if (
@@ -3163,6 +3772,18 @@ def _build_live_trade_approval(
         and not bool(market_gate.get("market_open"))
     ):
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "market_closed"}
+    pdt_rejection = _live_equity_pdt_entry_rejection(
+        context=context,
+        broker_id=broker_id,
+        asset_class=asset_class,
+    )
+    if pdt_rejection is not None:
+        return None, {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "broker_id": broker_id,
+            "reason": pdt_rejection,
+        }
     if asset_class == "equity" and _equity_friday_entry_cutoff_active(
         config,
         context.started_at,
@@ -3200,10 +3821,6 @@ def _build_live_trade_approval(
     if notional_usd <= 0:
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "qty_too_small"}
 
-    broker_id = _live_execution_broker_id_for_asset_class(
-        config=config,
-        asset_class=asset_class,
-    )
     try:
         adapter = get_execution_adapter(context, broker_id)
     except ExecutionAdapterError:
@@ -3311,11 +3928,93 @@ def _build_client_order_id(
     return f"centaur-{lane_part}-{tick_id[-6:]}-{symbol_part}-{strategy_part}"[:48]
 
 
+def _live_equity_pdt_entry_rejection(
+    *,
+    context: TickContext,
+    broker_id: str,
+    asset_class: str,
+) -> str | None:
+    """Fail closed before live equity entries that may become broker-blocked exits.
+
+    Alpaca Live can reject same-day equity exits under pattern-day-trading
+    protection when prior closing equity is below the regulatory threshold.
+    Centaur's live follower must not enter an equity position unless it can
+    prove the account is above that threshold; existing exits still route so the
+    operator can reduce exposure whenever the broker permits it.
+    """
+    if str(asset_class).strip().lower() != "equity":
+        return None
+    if str(broker_id).strip().lower() != "alpaca_live":
+        return None
+
+    account_state = context.state.get("alpaca_live_account", {})
+    if not isinstance(account_state, dict):
+        return "pdt_equity_status_unknown_live"
+    raw_account = account_state.get("raw", {})
+    summary = account_state.get("summary", {})
+    if not isinstance(raw_account, dict):
+        raw_account = {}
+    if not isinstance(summary, dict):
+        summary = {}
+
+    pdt_basis_equity = (
+        _as_float(raw_account.get("last_equity"))
+        or _as_float(summary.get("last_equity"))
+        or _as_float(raw_account.get("equity"))
+        or _as_float(summary.get("equity"))
+    )
+    if pdt_basis_equity is None:
+        return "pdt_equity_status_unknown_live"
+    if pdt_basis_equity < ALPACA_PDT_MIN_EQUITY_USD:
+        return "pdt_equity_entry_blocked_live"
+    return None
+
+
 def _paper_execution_broker_id_for_asset_class(*, config: Any, asset_class: str) -> str:
     normalized = str(asset_class or "").strip().lower()
     if normalized == "crypto":
         return str(config.paper_execution_crypto_broker_id or "alpaca_paper").strip().lower()
     return str(config.paper_execution_equity_broker_id or "alpaca_paper").strip().lower()
+
+
+def _paper_execution_broker_ids_for_asset_class(
+    *,
+    context: TickContext,
+    asset_class: str,
+) -> list[str]:
+    config = context.config
+    normalized = str(asset_class or "").strip().lower()
+    primary = _paper_execution_broker_id_for_asset_class(
+        config=config,
+        asset_class=asset_class,
+    )
+    broker_ids = [primary] if primary else []
+    if normalized == "equity" and _paper_trading212_enabled(context):
+        broker_ids.append("trading212_paper")
+    deduped: list[str] = []
+    for broker_id in broker_ids:
+        if broker_id and broker_id not in deduped:
+            deduped.append(broker_id)
+    return deduped
+
+
+def _active_paper_broker_ids(context: TickContext) -> list[str]:
+    broker_ids: list[str] = []
+    for asset_class in ("equity", "crypto"):
+        for broker_id in _paper_execution_broker_ids_for_asset_class(
+            context=context,
+            asset_class=asset_class,
+        ):
+            if broker_id not in broker_ids:
+                broker_ids.append(broker_id)
+    return broker_ids
+
+
+def _paper_trading212_enabled(context: TickContext) -> bool:
+    return bool(
+        getattr(context.config, "trading212_paper_execution_enabled", True)
+        and getattr(context.config, "trading212_paper_api_configured", False)
+    )
 
 
 def _live_execution_broker_id_for_asset_class(*, config: Any, asset_class: str) -> str:
@@ -3398,7 +4097,78 @@ def _account_state_key_for_broker(broker_id: str) -> str:
         return "alpaca_live_account"
     if normalized == "alpaca_paper":
         return "alpaca_account"
+    if normalized == "trading212_paper":
+        return "trading212_paper_account"
     return f"{normalized}_account"
+
+
+def _positions_state_key_for_broker(broker_id: str) -> str:
+    normalized = str(broker_id or "").strip().lower()
+    if normalized == "alpaca_live":
+        return "alpaca_live_positions"
+    if normalized == "alpaca_paper":
+        return "alpaca_positions"
+    return f"{normalized}_positions"
+
+
+def _orders_state_key_for_broker(broker_id: str) -> str:
+    normalized = str(broker_id or "").strip().lower()
+    if normalized == "alpaca_live":
+        return "alpaca_live_orders"
+    if normalized == "alpaca_paper":
+        return "alpaca_orders"
+    return f"{normalized}_orders"
+
+
+def _paper_protection_state_key_for_broker(broker_id: str) -> str:
+    normalized = str(broker_id or "").strip().lower()
+    if normalized == "alpaca_paper":
+        return "daily_protection"
+    return f"{normalized}_daily_protection"
+
+
+def _slot_size_native_for_broker(context: TickContext, broker_id: str) -> float:
+    slot_size_usd = float(context.config.paper_execution_default_notional_usd)
+    if str(broker_id or "").strip().lower() == "trading212_paper":
+        return float(
+            getattr(
+                context.config,
+                "trading212_paper_default_notional_native",
+                10.0,
+            )
+        )
+    return slot_size_usd
+
+
+def _notional_usd_for_broker(context: TickContext, broker_id: str) -> float:
+    if str(broker_id or "").strip().lower() == "trading212_paper":
+        native_notional = float(
+            getattr(
+                context.config,
+                "trading212_paper_default_notional_native",
+                10.0,
+            )
+        )
+        usd_to_gbp = _as_float(context.state.get("fx_gbp_reference", {}).get("usd_to_gbp"))
+        if usd_to_gbp is not None and usd_to_gbp > 0:
+            return round(native_notional / usd_to_gbp, 2)
+    return round(float(context.config.paper_execution_default_notional_usd), 2)
+
+
+def _native_equity_to_usd(
+    value: float | None,
+    *,
+    currency: str,
+    usd_to_gbp: float | None,
+) -> float | None:
+    if value is None:
+        return None
+    if str(currency or "").strip().upper() == "GBP":
+        rate = float(usd_to_gbp or 0.0)
+        if rate <= 0:
+            return None
+        return round(float(value) / rate, 6)
+    return float(value)
 
 
 def _build_trailing_drawdown_observation(
@@ -3561,43 +4331,154 @@ def _enrich_candidates_with_technicals(
     return enriched
 
 
+def _find_most_protective_managed_entry_order(
+    *,
+    symbol: str,
+    orders: list[dict[str, Any]],
+    broker_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the safest still-open managed entry plan for an aggregated position.
+
+    Alpaca aggregates same-symbol buys into one long position, but Centaur can
+    enter that symbol more than once with different persisted stops. The exit
+    manager sells the whole broker position, so it must use the highest
+    still-open stop for capital preservation instead of simply using the latest
+    entry plan and letting an older lot drift past its own stop.
+    """
+    symbol_upper = symbol.upper()
+    symbol_key = _normalized_symbol_key(symbol_upper)
+    broker_filter = str(broker_id or "").strip().lower()
+    open_lots: list[dict[str, Any]] = []
+
+    ordered = sorted(
+        orders,
+        key=lambda order: (
+            _order_activity_timestamp(order),
+            str(order.get("order_id") or order.get("id") or ""),
+        ),
+    )
+    for order in ordered:
+        order_symbol = str(order.get("symbol", "")).upper()
+        if order_symbol != symbol_upper and _normalized_symbol_key(order_symbol) != symbol_key:
+            continue
+        if broker_filter and str(order.get("broker_id", "")).strip().lower() != broker_filter:
+            continue
+        side = str(order.get("side", "")).lower()
+        if side not in {"buy", "sell"}:
+            continue
+        qty = _order_filled_qty(order)
+        if qty <= 0:
+            continue
+
+        if side == "buy":
+            open_lots.append(
+                {
+                    "qty": qty,
+                    "order": order,
+                    "managed": _order_has_managed_exit_plan(order),
+                }
+            )
+            continue
+
+        remaining = qty
+        while remaining > 0 and open_lots:
+            lot = open_lots[0]
+            lot_qty = _as_float(lot.get("qty")) or 0.0
+            if lot_qty <= 0:
+                open_lots.pop(0)
+                continue
+            matched = min(lot_qty, remaining)
+            lot["qty"] = lot_qty - matched
+            remaining -= matched
+            if (_as_float(lot.get("qty")) or 0.0) <= 0.000000001:
+                open_lots.pop(0)
+
+    managed_lots = [
+        lot
+        for lot in open_lots
+        if lot.get("managed") and (_as_float(lot.get("qty")) or 0.0) > 0
+    ]
+    if not managed_lots:
+        return None
+
+    selected = max(
+        managed_lots,
+        key=lambda lot: (
+            _managed_entry_stop_loss_price(lot.get("order", {})) or 0.0,
+            _order_activity_timestamp(lot.get("order", {})),
+        ),
+    )
+    selected_order = dict(selected.get("order", {}))
+    if len(managed_lots) > 1:
+        raw = selected_order.get("raw_json", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        raw = dict(raw)
+        raw["managed_entry_selection"] = "most_protective_open_lot"
+        raw["managed_open_lots_considered"] = len(managed_lots)
+        raw["managed_selected_stop_loss_price"] = _managed_entry_stop_loss_price(
+            selected_order
+        )
+        selected_order["raw_json"] = raw
+    return selected_order
+
+
 def _find_latest_managed_entry_order(
     *,
     symbol: str,
     orders: list[dict[str, Any]],
     broker_id: str | None = None,
 ) -> dict[str, Any] | None:
-    symbol_upper = symbol.upper()
-    symbol_key = _normalized_symbol_key(symbol_upper)
-    broker_filter = str(broker_id or "").strip().lower()
-    for order in orders:
-        order_symbol = str(order.get("symbol", "")).upper()
-        if order_symbol != symbol_upper and _normalized_symbol_key(order_symbol) != symbol_key:
-            continue
-        if broker_filter and str(order.get("broker_id", "")).strip().lower() != broker_filter:
-            continue
-        if str(order.get("side", "")).lower() != "buy":
-            continue
-        raw = order.get("raw_json", {})
-        if not isinstance(raw, dict):
-            raw = {}
-        has_planned_raw = any(
-            value not in (None, "", 0, 0.0)
-            for key in (
-                "planned_stop_loss_price",
-                "planned_take_profit_price",
-                "planned_holding_window_minutes",
-            )
-            for value in (raw.get(key),)
+    return _find_most_protective_managed_entry_order(
+        symbol=symbol,
+        orders=orders,
+        broker_id=broker_id,
+    )
+
+
+def _order_has_managed_exit_plan(order: dict[str, Any]) -> bool:
+    raw = order.get("raw_json", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    has_planned_raw = any(
+        value not in (None, "", 0, 0.0)
+        for key in (
+            "planned_stop_loss_price",
+            "planned_take_profit_price",
+            "planned_holding_window_minutes",
         )
-        has_persisted_plan = (
-            order.get("stop_loss_price") not in (None, "", 0, 0.0)
-            or order.get("take_profit_price") not in (None, "", 0, 0.0)
-        )
-        if not has_planned_raw and not has_persisted_plan:
-            continue
-        return order
-    return None
+        for value in (raw.get(key),)
+    )
+    has_persisted_plan = (
+        order.get("stop_loss_price") not in (None, "", 0, 0.0)
+        or order.get("take_profit_price") not in (None, "", 0, 0.0)
+    )
+    return has_planned_raw or has_persisted_plan
+
+
+def _managed_entry_stop_loss_price(order: dict[str, Any]) -> float | None:
+    raw = order.get("raw_json", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    return _as_float(
+        raw.get("planned_stop_loss_price", order.get("stop_loss_price"))
+    )
+
+
+def _order_filled_qty(order: dict[str, Any]) -> float:
+    return _as_float(order.get("filled_qty")) or _as_float(order.get("qty")) or 0.0
+
+
+def _order_activity_timestamp(order: dict[str, Any]) -> float:
+    activity_at = _coerce_datetime(
+        order.get("submitted_at") or order.get("captured_at") or order.get("updated_at")
+    )
+    if activity_at is None:
+        return 0.0
+    try:
+        return activity_at.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return 0.0
 
 
 def _build_exit_order_request(

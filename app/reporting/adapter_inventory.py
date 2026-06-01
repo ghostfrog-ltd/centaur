@@ -123,12 +123,28 @@ def _adapter_records() -> list[AdapterRecord]:
             activation_rule="not approved for execution",
         ),
         AdapterRecord(
+            adapter_type="broker_account",
+            provider_id="trading212_paper",
+            status="active_paper",
+            implementation="Trading212PaperBrokerAdapter",
+            behavior="demo account, positions, orders, and paper equity order mutation",
+            activation_rule="paper master gates plus broker-specific 10-slot lane",
+        ),
+        AdapterRecord(
             adapter_type="execution",
             provider_id="ig_spreadbet",
             status="not_implemented",
             implementation="-",
             behavior="not available through execution adapter registry",
             activation_rule="requires concrete adapter, evidence surfaces, tests, and approval",
+        ),
+        AdapterRecord(
+            adapter_type="execution",
+            provider_id="trading212_paper",
+            status="active_bridge",
+            implementation="BrokerExecutionAdapter -> Trading212PaperBrokerAdapter",
+            behavior="paper equity limit order planning, submit, cancel",
+            activation_rule="paper risk gates plus duplicate client-order-id guard",
         ),
         AdapterRecord(
             adapter_type="market_data",

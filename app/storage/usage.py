@@ -614,6 +614,26 @@ class UsageLedger:
             self._record_paper_trade_orders_sqlite(rows=rows)
         return len(rows)
 
+    def paper_order_client_id_exists(
+        self,
+        *,
+        broker_id: str,
+        client_order_id: str,
+    ) -> bool:
+        normalized_broker_id = str(broker_id or "").strip().lower()
+        normalized_client_order_id = str(client_order_id or "").strip()
+        if not normalized_broker_id or not normalized_client_order_id:
+            return False
+        if self.backend == "postgres":
+            return self._paper_order_client_id_exists_postgres(
+                broker_id=normalized_broker_id,
+                client_order_id=normalized_client_order_id,
+            )
+        return self._paper_order_client_id_exists_sqlite(
+            broker_id=normalized_broker_id,
+            client_order_id=normalized_client_order_id,
+        )
+
     def record_broker_account_snapshot(
         self,
         *,
@@ -1224,6 +1244,60 @@ class UsageLedger:
                 )
             normalized_rows.append(normalized)
         return normalized_rows
+
+    def notification_recently_sent(
+        self,
+        *,
+        channel: str,
+        event_key: str,
+        since: datetime,
+    ) -> bool:
+        normalized_channel = str(channel or "").strip().lower()
+        normalized_key = str(event_key or "").strip()
+        if not normalized_channel or not normalized_key:
+            return False
+        if self.backend == "postgres":
+            return self._notification_recently_sent_postgres(
+                channel=normalized_channel,
+                event_key=normalized_key,
+                since=since,
+            )
+        return self._notification_recently_sent_sqlite(
+            channel=normalized_channel,
+            event_key=normalized_key,
+            since=since,
+        )
+
+    def record_notification_event(
+        self,
+        *,
+        tick_id: str,
+        channel: str,
+        event_key: str,
+        level: str,
+        summary: str,
+        detail: str,
+        status: str,
+        error: str = "",
+        metadata: dict[str, Any] | None = None,
+        sent_at: datetime | None = None,
+    ) -> None:
+        row = {
+            "tick_id": str(tick_id),
+            "sent_at": (sent_at or datetime.now().astimezone()).isoformat(),
+            "channel": str(channel or "").strip().lower(),
+            "event_key": str(event_key or "").strip(),
+            "level": str(level or "info").strip().lower(),
+            "summary": str(summary or "").strip(),
+            "detail": str(detail or "").strip(),
+            "status": str(status or "unknown").strip().lower(),
+            "error": str(error or "").strip(),
+            "metadata_json": self._to_json(metadata or {}),
+        }
+        if self.backend == "postgres":
+            self._record_notification_event_postgres(row=row)
+        else:
+            self._record_notification_event_sqlite(row=row)
 
     def get_broker_account_high_water(
         self,
@@ -1948,6 +2022,35 @@ class UsageLedger:
                 """
                 CREATE INDEX IF NOT EXISTS idx_execution_router_intents_tick
                 ON execution_router_intents (tick_id, recorded_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notification_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tick_id TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    level TEXT NOT NULL DEFAULT 'info',
+                    summary TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    error TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notification_events_key_sent
+                ON notification_events (channel, event_key, status, sent_at DESC)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notification_events_sent
+                ON notification_events (sent_at DESC, id DESC)
                 """
             )
             connection.execute(
@@ -2776,6 +2879,35 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_execution_router_intents_tick
                     ON execution_router_intents (tick_id, recorded_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS notification_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        tick_id TEXT NOT NULL,
+                        sent_at TIMESTAMPTZ NOT NULL,
+                        channel TEXT NOT NULL,
+                        event_key TEXT NOT NULL,
+                        level TEXT NOT NULL DEFAULT 'info',
+                        summary TEXT NOT NULL DEFAULT '',
+                        detail TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT 'unknown',
+                        error TEXT NOT NULL DEFAULT '',
+                        metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_notification_events_key_sent
+                    ON notification_events (channel, event_key, status, sent_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_notification_events_sent
+                    ON notification_events (sent_at DESC, id DESC)
                     """
                 )
                 cursor.execute(
@@ -4068,6 +4200,53 @@ class UsageLedger:
                         row["venue"],
                         row["venue_symbol"],
                         row["intended_order_json"],
+                    ),
+                )
+
+    def _record_notification_event_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                INSERT INTO notification_events (
+                    tick_id, sent_at, channel, event_key, level, summary,
+                    detail, status, error, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["tick_id"],
+                    row["sent_at"],
+                    row["channel"],
+                    row["event_key"],
+                    row["level"],
+                    row["summary"],
+                    row["detail"],
+                    row["status"],
+                    row["error"],
+                    row["metadata_json"],
+                ),
+            )
+
+    def _record_notification_event_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO notification_events (
+                        tick_id, sent_at, channel, event_key, level, summary,
+                        detail, status, error, metadata_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        row["tick_id"],
+                        row["sent_at"],
+                        row["channel"],
+                        row["event_key"],
+                        row["level"],
+                        row["summary"],
+                        row["detail"],
+                        row["status"],
+                        row["error"],
+                        row["metadata_json"],
                     ),
                 )
 
@@ -7466,6 +7645,44 @@ class UsageLedger:
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def _paper_order_client_id_exists_sqlite(
+        self,
+        *,
+        broker_id: str,
+        client_order_id: str,
+    ) -> bool:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM paper_trade_orders
+                WHERE broker_id = ? AND client_order_id = ?
+                LIMIT 1
+                """,
+                (broker_id, client_order_id),
+            ).fetchone()
+        return row is not None
+
+    def _paper_order_client_id_exists_postgres(
+        self,
+        *,
+        broker_id: str,
+        client_order_id: str,
+    ) -> bool:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM paper_trade_orders
+                    WHERE broker_id = %s AND client_order_id = %s
+                    LIMIT 1
+                    """,
+                    (broker_id, client_order_id),
+                )
+                row = cursor.fetchone()
+        return row is not None
+
     def _get_first_paper_trade_order_sqlite(
         self,
         *,
@@ -7589,6 +7806,54 @@ class UsageLedger:
                 )
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
+
+    def _notification_recently_sent_sqlite(
+        self,
+        *,
+        channel: str,
+        event_key: str,
+        since: datetime,
+    ) -> bool:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM notification_events
+                WHERE channel = ?
+                  AND event_key = ?
+                  AND status = 'sent'
+                  AND sent_at >= ?
+                ORDER BY sent_at DESC
+                LIMIT 1
+                """,
+                (channel, event_key, since.isoformat()),
+            ).fetchone()
+        return row is not None
+
+    def _notification_recently_sent_postgres(
+        self,
+        *,
+        channel: str,
+        event_key: str,
+        since: datetime,
+    ) -> bool:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM notification_events
+                    WHERE channel = %s
+                      AND event_key = %s
+                      AND status = 'sent'
+                      AND sent_at >= %s
+                    ORDER BY sent_at DESC
+                    LIMIT 1
+                    """,
+                    (channel, event_key, since),
+                )
+                row = cursor.fetchone()
+        return row is not None
 
     def _get_broker_account_high_water_sqlite(
         self,
@@ -7865,12 +8130,23 @@ class UsageLedger:
             else self._to_float(order.get("planned_stop_loss_price"))
         )
         status = str(order.get("status", "")).strip().lower()
+        submitted_at = order.get("submitted_at") or order.get("createdAt")
+        updated_at = order.get("updated_at") or order.get("updatedAt")
+        side = str(order.get("side", "")).strip().lower()
+        if side == "buy":
+            side = "buy"
+        elif side == "sell":
+            side = "sell"
+        order_type = str(order.get("type") or "").strip().lower()
+        time_in_force = str(
+            order.get("time_in_force") or order.get("timeInForce") or ""
+        ).strip().lower()
         return {
             "order_id": str(order.get("id", "")).strip(),
             "tick_id": tick_id,
             "captured_at": captured_at.isoformat(),
-            "submitted_at": order.get("submitted_at"),
-            "updated_at": order.get("updated_at"),
+            "submitted_at": submitted_at,
+            "updated_at": updated_at,
             "environment": metadata["environment"],
             "mode": metadata["mode"],
             "source_environment": metadata["source_environment"],
@@ -7888,17 +8164,17 @@ class UsageLedger:
             "source": str(order.get("source", "")).strip(),
             "symbol": symbol,
             "asset_class": asset_class,
-            "side": str(order.get("side", "")).strip().lower(),
-            "order_type": str(order.get("type", "")).strip().lower(),
-            "time_in_force": str(order.get("time_in_force", "")).strip().lower(),
+            "side": side,
+            "order_type": order_type,
+            "time_in_force": time_in_force,
             "order_class": str(order.get("order_class", "")).strip().lower(),
             "status": status,
             "is_open": self._order_status_is_open(status),
-            "qty": self._to_float(order.get("qty")),
-            "filled_qty": self._to_float(order.get("filled_qty")),
+            "qty": self._to_float(order.get("qty") or order.get("quantity")),
+            "filled_qty": self._to_float(order.get("filled_qty") or order.get("filledQuantity")),
             "notional_usd": self._to_float(order.get("notional")),
             "filled_avg_price": self._to_float(order.get("filled_avg_price")),
-            "limit_price": self._to_float(order.get("limit_price")),
+            "limit_price": self._to_float(order.get("limit_price") or order.get("limitPrice")),
             "stop_price": self._to_float(order.get("stop_price")),
             "take_profit_price": take_profit_price,
             "stop_loss_price": stop_loss_price,
@@ -7921,6 +8197,8 @@ class UsageLedger:
             combined = f"{source_text} {broker_text}"
             if "alpaca" in combined:
                 venue = "alpaca"
+            elif "trading212" in combined:
+                venue = "trading212"
             elif "binance" in combined:
                 venue = "binance"
             elif "coinbase" in combined:

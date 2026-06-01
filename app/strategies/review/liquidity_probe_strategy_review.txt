@@ -1,0 +1,155 @@
+Liquidity Probe Strategy Review
+
+Overall verdict:
+This is a sensible, clean, and intentionally safe research strategy. The strongest part is that it is clearly marked as a shadow/research profile rather than something that should affect paper or live execution yet.
+
+The trading idea is valid:
+It is not trying to predict direction. It is trying to detect equity candidates with unusually steady flow so the system can collect evidence about whether that flow has any later predictive value.
+
+What is good:
+- The execution boundary is clear and safe.
+- The strategy is explicitly equity-only.
+- Flow gates happen before scoring.
+- Weak candidates are rejected early instead of being rescued by score maths.
+- A valid close price is required before building a signal.
+- Confidence is kept conservative, which is appropriate because flow alone is weaker evidence than price plus flow.
+- The shared build_signal() path keeps the research output auditable and consistent with the rest of the system.
+
+Main concern:
+The scoring may still be too dependent on discovery_score.
+
+Current scoring:
+
+signal_score = round(
+    min(100.0, (discovery_score * 9.0) + (score_liquidity * 9.0)),
+    6,
+)
+
+If discovery_score already contains movement, volatility, price-change, or momentum bias, then this is not a clean liquidity probe. It becomes more like:
+
+"high discovery score plus decent liquidity"
+
+rather than:
+
+"unusual flow worth studying"
+
+Before trusting the output, confirm exactly what discovery_score contains.
+
+Suggested scoring adjustment:
+Make liquidity the dominant driver and cap the influence of discovery_score.
+
+Example:
+
+signal_score = round(
+    min(
+        100.0,
+        (score_liquidity * 12.0)
+        + min(discovery_score * 4.0, 30.0)
+    ),
+    6,
+)
+
+This keeps discovery_score useful as a quality filter, but stops it dominating the strategy.
+
+Potential data-quality issue:
+This line defaults missing asset_class to equity:
+
+asset_class = str(candidate.get("asset_class", "equity"))
+
+That means incomplete candidate data can sneak through as equity.
+
+Recommended stricter version:
+
+asset_class = str(candidate.get("asset_class") or "").lower()
+if asset_class not in profile.asset_classes:
+    return None
+
+For a research strategy, missing asset_class should be rejected, not assumed.
+
+Volume threshold concern:
+The current minimum volume is low:
+
+"min_volume": 1500
+
+For equities, 1,500 shares can be tiny, depending on the stock price. It may be acceptable for early observation, but longer term this strategy should prefer notional traded value instead of raw share volume.
+
+Better future metric:
+
+notional_volume = volume * entry_price
+
+Then gate on something like minimum notional volume.
+
+Example future parameter:
+
+"min_notional_volume": 50000
+
+Why this matters:
+1,500 shares at £0.20 is very different from 1,500 shares at £80. Raw share count alone does not tell you the quality of the flow.
+
+Confidence improvement:
+Current confidence uses discovery_score but does not directly include score_liquidity, which is odd for a liquidity-focused strategy.
+
+Current:
+
+confidence = round(min(0.82, 0.28 + min(discovery_score / 18.0, 0.24)), 6)
+
+Suggested direction:
+
+confidence = round(
+    min(
+        0.82,
+        0.25
+        + min(score_liquidity / 20.0, 0.30)
+        + min(discovery_score / 30.0, 0.18)
+    ),
+    6,
+)
+
+This makes confidence better reflect the actual thing being tested: liquidity/flow.
+
+Audit recommendation:
+The rationale is useful, but the strategy should ideally record more scoring detail if build_signal() supports metadata.
+
+Useful research metadata:
+- score_liquidity
+- discovery_score
+- liquidity_weight
+- discovery_weight
+- min_trade_count
+- min_volume
+- notional_volume if added later
+
+This will make later review much easier. When reviewing shadow results, we need to know not just that the strategy fired, but why it fired and whether that reason had any real value.
+
+Recommended changes before merge:
+1. Reject missing asset_class instead of defaulting to equity.
+
+Use:
+
+asset_class = str(candidate.get("asset_class") or "").lower()
+if asset_class not in profile.asset_classes:
+    return None
+
+2. Make liquidity dominate the score.
+
+Use something like:
+
+signal_score = round(
+    min(100.0, (score_liquidity * 12.0) + min(discovery_score * 4.0, 30.0)),
+    6,
+)
+
+3. Add notional volume later.
+
+Use:
+
+notional_volume = volume * entry_price
+
+Then create a minimum notional value gate when the data is available.
+
+Final assessment:
+Good architecture, safe boundary, sensible gates. The strategy is valid as a shadow evidence collector.
+
+Do not allow it near paper or live execution yet because it has no directional thesis.
+
+The main thing to fix is scoring purity. Right now it risks being a disguised discovery-score strategy unless discovery_score is capped or reduced and liquidity is made clearly dominant.

@@ -2,6 +2,7 @@ import unittest
 
 from app.adapters.execution.alpaca_live import AlpacaLiveExecutionAdapter
 from app.adapters.execution.alpaca_paper import AlpacaPaperExecutionAdapter
+from app.adapters.brokers.trading212 import Trading212PaperBrokerAdapter
 from app.adapters.market_data.alpaca_data import AlpacaMarketDataAdapter
 from app.core.instruments import default_instrument_registry
 from app.engine.execution_planner import ExecutionRouter
@@ -24,6 +25,26 @@ class AppArchitectureImportTests(unittest.TestCase):
         self.assertIsNotNone(ExecutionRouter)
         self.assertEqual(AlpacaPaperExecutionAdapter().broker_id, "alpaca_paper")
         self.assertEqual(AlpacaLiveExecutionAdapter().broker_id, "alpaca_live")
+        self.assertEqual(
+            Trading212PaperBrokerAdapter.from_config(
+                type(
+                    "Trading212Config",
+                    (),
+                    {
+                        "trading212_paper_api_key": "",
+                        "trading212_paper_api_secret": "",
+                        "trading212_paper_base_url": "https://demo.trading212.com/api/v0",
+                        "trading212_paper_request_timeout_seconds": 10,
+                        "trading212_paper_primary_currency": "GBP",
+                        "trading212_paper_ticker_overrides": {},
+                        "trading212_paper_api_configured": False,
+                        "trading212_paper_execution_enabled": True,
+                        "trading212_paper_default_notional_native": 10.0,
+                    },
+                )()
+            ).broker_id,
+            "trading212_paper",
+        )
         self.assertEqual(AlpacaMarketDataAdapter.provider_id, "alpaca")
 
         registry = default_instrument_registry()
