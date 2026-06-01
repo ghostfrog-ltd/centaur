@@ -20,22 +20,26 @@ the runtime is migrated.
 - `TICK_DECISION_FLOW.md`
   - Plain-English guide with inline Mermaid diagrams and code references.
 
-## Regenerate The Pipeline Graph
+## Update Mermaid Visuals
 
 Run:
 
 ```bash
-.venv-mac/bin/python scripts/export_pipeline_mermaid.py
+.venv-mac/bin/python scripts/update_mermaid_visuals.py
 ```
 
-That rewrites:
+That rewrites generated Mermaid files such as:
 
 ```text
 docs/visuals/current_pipeline.mmd
 ```
 
 Use this after changing `build_default_pipeline()` so the visual pipeline does
-not drift from the code.
+not drift from the code. Use the check mode in CI or before commits:
+
+```bash
+.venv-mac/bin/python scripts/update_mermaid_visuals.py --check
+```
 
 ## Required LangGraph/Pydantic Migration Work
 
@@ -51,5 +55,5 @@ graph rendering/export from the runtime graph
 tests that compare graph order to the old pipeline order during migration
 ```
 
-Until then, the exporter script is the lightweight source-of-truth bridge from
-the running pipeline to visual docs.
+Until then, `scripts/update_mermaid_visuals.py` is the lightweight
+source-of-truth bridge from the running pipeline to visual docs.

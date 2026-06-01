@@ -151,7 +151,7 @@ The generated source file is:
 Regenerate it with:
 
 ```bash
-.venv-mac/bin/python scripts/export_pipeline_mermaid.py
+.venv-mac/bin/python scripts/update_mermaid_visuals.py
 ```
 
 ```mermaid

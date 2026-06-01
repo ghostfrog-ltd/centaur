@@ -34,8 +34,10 @@ Do not load full historical logs for ordinary code edits.
 - No vibes around constraints.
 - No silent broker/risk/live behaviour changes.
 - New orchestration work should either add typed LangGraph/Pydantic structure or clearly document why it is a temporary migration bridge.
+- When orchestration/pipeline nodes or edges change, run `.venv-mac/bin/python scripts/update_mermaid_visuals.py` and keep the rendered flow docs current.
 - No new paper strategy execution without explicit approval.
 - Prefer deterministic logic over opaque AI behaviour for risk, execution, fitness, and replay.
+- Use tokens deliberately: prefer concise answers, targeted file reads, durable docs, and generated visuals over repeated long explanations or broad context dumps.
 - Keep dashboards/status honest: recent activity, all-time evidence, paper, live, shadow, and observe-only data must be labelled separately.
 - When adding persistence, consider indexes, retention, bounded queries, and control-loop load.
 - When changing runtime behaviour, update the compact context and relevant canonical docs.

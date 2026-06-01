@@ -556,6 +556,7 @@ function initialSnapshotJson(): string
         <button id="preset-fast" class="button" type="button">Faster Test</button>
         <button id="reset" class="button" type="button">Reset</button>
         <a class="button" href="/reports/50-dollar-day-plan.md" download>Download Plan</a>
+        <a class="button" href="/flow.php">Flow Map</a>
         <a class="button" href="/glossary.php">Glossary</a>
         <a class="button" href="/dashboard.php">Dashboard</a>
       </div>

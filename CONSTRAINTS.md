@@ -19,8 +19,13 @@
 - The current `ControlPipelineRunner`/`StepDefinition` pipeline is legacy-compatible scaffolding until migrated; do not deepen it with new opaque dict-only control flow when a typed graph node/model is practical.
 - New workflow surfaces should define explicit Pydantic models for state they own or mutate, especially for market data, candidates, signals, fitness allocation, risk approvals, order intents, execution results, and evidence summaries.
 - LangGraph node boundaries must preserve capital gates: market readiness, fitness allocation, CFO risk, execution router, live follower guard, and notification/reporting must remain auditable named nodes.
-- Graph visualization/export is required for orchestration changes. Update `docs/visuals/`, `docs/VISUALIZATION.md`, or an equivalent generated graph surface when nodes/edges change.
+- Graph visualization/export is required for orchestration changes. Run `.venv-mac/bin/python scripts/update_mermaid_visuals.py` and update `docs/visuals/`, `docs/VISUALIZATION.md`, or an equivalent generated graph surface when nodes/edges change.
 - Migration to LangGraph/Pydantic must be behaviour-preserving unless a separate explicit trading-policy change is reviewed and approved. Refactoring orchestration is not permission to alter thresholds, notional, broker routing, live behaviour, strategy allowlists, or risk gates.
+
+## Context And Token Discipline
+- Prefer concise, high-signal explanations, file links, generated docs, and targeted excerpts over repeated long dumps of code, logs, or historical context.
+- Load only the context needed for the current task. Do not read full historical logs or broad files when compact context, search results, or specific source slices are enough.
+- When a durable explanation is useful, put it in a project doc or generated visual so future turns can link to it instead of re-explaining from scratch.
 
 ## Active Paper Envelope
 - Broker: `alpaca_paper`.
