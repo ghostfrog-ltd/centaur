@@ -16,11 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from app.engine.control_graph import build_control_graph_mermaid
 from scripts.export_pipeline_mermaid import build_mermaid
 
 
 GENERATED_FILES = {
     PROJECT_ROOT / "docs/visuals/current_pipeline.mmd": build_mermaid,
+    PROJECT_ROOT / "docs/visuals/current_langgraph_bridge.mmd": build_control_graph_mermaid,
 }
 
 HAND_AUTHORED_FILES = [

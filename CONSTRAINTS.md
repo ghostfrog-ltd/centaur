@@ -20,6 +20,7 @@
 - New workflow surfaces should define explicit Pydantic models for state they own or mutate, especially for market data, candidates, signals, fitness allocation, risk approvals, order intents, execution results, and evidence summaries.
 - LangGraph node boundaries must preserve capital gates: market readiness, fitness allocation, CFO risk, execution router, live follower guard, and notification/reporting must remain auditable named nodes.
 - Graph visualization/export is required for orchestration changes. Run `.venv-mac/bin/python scripts/update_mermaid_visuals.py` and update `docs/visuals/`, `docs/VISUALIZATION.md`, or an equivalent generated graph surface when nodes/edges change.
+- Generated orchestration visuals must marry runtime flow to code ownership. Pipeline/graph nodes must expose their owning source module/function or typed graph owner, and grouping should reflect the relevant `app/` folder/domain boundary rather than becoming a detached label-only chart.
 - Migration to LangGraph/Pydantic must be behaviour-preserving unless a separate explicit trading-policy change is reviewed and approved. Refactoring orchestration is not permission to alter thresholds, notional, broker routing, live behaviour, strategy allowlists, or risk gates.
 
 ## Context And Token Discipline

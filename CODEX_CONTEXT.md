@@ -107,8 +107,8 @@ Useful reports:
 - `.venv-mac/bin/python main.py --storage-separation-report`
 
 ## Current Architecture Progress
-- Visualization docs now exist in `TICK_DECISION_FLOW.md`, `docs/VISUALIZATION.md`, and `docs/visuals/`. They are documentation/export scaffolding, not a LangGraph runtime yet.
-- Next orchestration work should introduce Pydantic models for graph state/node contracts and migrate the control flow toward LangGraph while preserving existing capital gates and paper/live behaviour.
+- Visualization docs now exist in `TICK_DECISION_FLOW.md`, `docs/VISUALIZATION.md`, and `docs/visuals/`. Generated orchestration visuals must show code ownership, such as source module/function or typed graph owner, and group nodes by the relevant runtime/domain boundary so diagrams stay married to the `app/` structure.
+- The first LangGraph/Pydantic control bridge exists in `app/engine/control_graph.py`. It wraps each current `StepDefinition` as a typed graph node, preserves the existing control order and safety-gate names, halts after node errors, and has parity tests against `build_default_pipeline()`. The scheduled production tick runner still uses `ControlPipelineRunner`; next orchestration work should either promote the bridge carefully or migrate narrow `TickContext` slices into typed domain models while preserving capital gates and paper/live behaviour.
 - `ModeContext` centralises mode/environment permission checks.
 - `ExecutionRouter` is the choke point before broker submit/cancel/mutation.
 - `LiveRiskGuard` re-checks activation, kill switch, broker, readiness, capacity, latest-bar/instrument availability, same-paper validation, and notional.

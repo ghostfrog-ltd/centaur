@@ -6,6 +6,7 @@ This is the short rolling decision head. Keep the full canonical history in `doc
 - Architecture constraint tightened from "pipeline-first, LangGraph-compatible" to LangGraph-first with Pydantic-backed state and node contracts.
 - Current `ControlPipelineRunner` remains the behaviour-preserving migration scaffold, but new orchestration work should not deepen untyped dict-only pipeline control flow when a typed graph node/model is practical.
 - Graph visualization/export is now part of orchestration discipline: update generated/visual docs when nodes or edges change.
+- Generated orchestration visuals must remain code-aware: runtime nodes should expose source module/function or typed graph ownership and be grouped by the relevant `app/` domain boundary so diagrams do not drift away from code/folder structure.
 - This is an architecture/documentation constraint only; it does not approve any change to notional, thresholds, broker routing, paper/live behaviour, strategy allowlists, or risk gates.
 
 ## 2026-05-31

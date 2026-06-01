@@ -33,6 +33,7 @@ The visual docs live here:
 
 - `docs/VISUALIZATION.md`
 - `docs/visuals/current_pipeline.mmd`
+- `docs/visuals/current_langgraph_bridge.mmd`
 - `docs/visuals/entry_decision_funnel.mmd`
 
 ## Entry Decision Funnel
@@ -119,8 +120,9 @@ The important thing: exits and evidence updates happen before new entries.
 ## LangGraph Status
 
 The architecture target is LangGraph-first orchestration with Pydantic-backed
-state and node contracts. The current runtime is not there yet: it is still an
-ordered Python pipeline.
+state and node contracts. The first migration bridge now exists in
+`app/engine/control_graph.py`, but the production tick runner is still the
+ordered `ControlPipelineRunner`.
 
 That means:
 
@@ -129,16 +131,19 @@ what exists today:
   explicit ordered pipeline steps in app/engine/pipelines.py
   shared TickContext state passed from step to step
   named gates for market, strategy, fitness, risk, execution, and notifications
+  LangGraph StateGraph bridge with Pydantic graph state/node input/node output
+  graph-order parity tests against build_default_pipeline()
+  generated LangGraph bridge Mermaid export
 
 what does not exist yet:
-  a langgraph StateGraph runtime
-  LangGraph node/edge definitions
-  automatic LangGraph graph rendering/export
+  default production execution through LangGraph
+  narrow Pydantic models for each domain state slice inside TickContext
+  decomposed typed domain nodes for the largest legacy step bodies
 ```
 
-So the actual tick runner today is `ControlPipelineRunner`, not LangGraph. New
-orchestration work should move the system toward typed LangGraph nodes rather
-than adding more opaque dict-only pipeline surface.
+So the actual scheduled tick runner today remains `ControlPipelineRunner`, not
+LangGraph. New orchestration work should continue moving the system toward typed
+LangGraph nodes rather than adding more opaque dict-only pipeline surface.
 
 ## Visual Pipeline
 
@@ -147,6 +152,11 @@ This is the current pipeline shape as a Mermaid graph:
 The generated source file is:
 
 - `docs/visuals/current_pipeline.mmd`
+
+The generated graph is intentionally code-aware: each runtime node is grouped by
+an ownership lane and labelled with the source runner reference that backs it.
+That keeps the visual tied to `app/` ownership instead of becoming a detached
+diagram.
 
 Regenerate it with:
 

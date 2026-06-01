@@ -1,68 +1,101 @@
 flowchart TD
   start(["scheduled tick"])
-  n01["control.heartbeat"]
+  subgraph lane_runtime["Runtime control / app.runtime + app.engine"]
+    n01["control.heartbeat<br/>app/engine/pipelines.py::control_heartbeat"]
+    n23["context.enrichment<br/>app/engine/pipelines.py::context_enrichment"]
+  end
+  subgraph lane_broker["Broker adapters / app.adapters"]
+    n02["alpaca.account<br/>app/engine/pipelines.py::alpaca_account"]
+    n03["alpaca.clock<br/>app/engine/pipelines.py::alpaca_clock"]
+    n04["alpaca.positions<br/>app/engine/pipelines.py::alpaca_positions"]
+    n05["alpaca.orders<br/>app/engine/pipelines.py::alpaca_orders"]
+    n06["alpaca_live.sync<br/>app/engine/pipelines.py::alpaca_live_sync"]
+    n07["trading212_paper.sync<br/>app/engine/pipelines.py::trading212_paper_sync"]
+  end
+  subgraph lane_risk["Risk gates / app.runtime + app.engine"]
+    n08["risk.daily_protection<br/>app/engine/pipelines.py::daily_protection"]
+    n09["risk.live_daily_protection<br/>app/engine/pipelines.py::live_daily_protection"]
+    n10["risk.trailing_drawdown_observer<br/>app/engine/pipelines.py::trailing_drawdown_observer"]
+    n15["risk.trading212_paper_daily_protection<br/>app/engine/pipelines.py::trading212_paper_daily_protection"]
+    n27["risk.cfo<br/>app/engine/pipelines.py::risk_cfo_gate"]
+    n29["risk.live_cfo<br/>app/engine/pipelines.py::live_risk_cfo_gate"]
+  end
+  subgraph lane_maintenance["Maintenance / order lifecycle"]
+    n11["maintenance.stale_orders<br/>app/engine/pipelines.py::stale_order_reaper"]
+    n12["maintenance.live_stale_orders<br/>app/engine/pipelines.py::live_stale_order_reaper"]
+  end
+  subgraph lane_market["Market data + FX / app.adapters + app.core"]
+    n13["market.gate<br/>app/engine/pipelines.py::market_gate"]
+    n14["fx.gbp_reference<br/>app/engine/pipelines.py::fx_gbp_reference"]
+    n16["market.latest_bars<br/>app/engine/pipelines.py::market_latest_bars"]
+    n17["crypto.latest_bars<br/>app/engine/pipelines.py::crypto_latest_bars"]
+    n22["market.scan<br/>app/engine/pipelines.py::market_scan"]
+  end
+  subgraph lane_execution["Execution routing / app.runtime"]
+    n18["execution.paper_exits<br/>app/engine/pipelines.py::paper_exit_management"]
+    n19["execution.live_exits<br/>app/engine/pipelines.py::live_exit_management"]
+    n28["execution.paper<br/>app/engine/pipelines.py::execution_paper"]
+    n30["execution.live<br/>app/engine/pipelines.py::execution_live"]
+  end
+  subgraph lane_research["Research, evidence, and analysis / app.engine + app.strategies"]
+    n20["shadow.outcomes<br/>app/engine/pipelines.py::shadow_trade_outcomes"]
+    n21["strategy.fitness<br/>app/engine/pipelines.py::strategy_fitness"]
+    n24["strategy.signals<br/>app/engine/pipelines.py::strategy_signals"]
+    n25["analysis.gemini<br/>app/engine/pipelines.py::gemini_analysis"]
+    n26["shadow.proposals<br/>app/engine/pipelines.py::shadow_trade_proposals"]
+    n31["evaluation.post_trade<br/>app/engine/pipelines.py::post_trade_evaluation"]
+  end
+  subgraph lane_notifications["Operator notifications / app.runtime"]
+    n32["notifications.slack<br/>app/engine/pipelines.py::slack_notifications"]
+  end
   start --> n01
-  n02["alpaca.account"]
   n01 --> n02
-  n03["alpaca.clock"]
   n02 --> n03
-  n04["alpaca.positions"]
   n03 --> n04
-  n05["alpaca.orders"]
   n04 --> n05
-  n06["alpaca_live.sync"]
   n05 --> n06
-  n07["trading212_paper.sync"]
   n06 --> n07
-  n08["risk.daily_protection"]
   n07 --> n08
-  n09["risk.live_daily_protection"]
   n08 --> n09
-  n10["risk.trailing_drawdown_observer"]
   n09 --> n10
-  n11["maintenance.stale_orders"]
   n10 --> n11
-  n12["maintenance.live_stale_orders"]
   n11 --> n12
-  n13["market.gate"]
   n12 --> n13
-  n14["fx.gbp_reference"]
   n13 --> n14
-  n15["risk.trading212_paper_daily_protection"]
   n14 --> n15
-  n16["market.latest_bars"]
   n15 --> n16
-  n17["crypto.latest_bars"]
   n16 --> n17
-  n18["execution.paper_exits"]
   n17 --> n18
-  n19["execution.live_exits"]
   n18 --> n19
-  n20["shadow.outcomes"]
   n19 --> n20
-  n21["strategy.fitness"]
   n20 --> n21
-  n22["market.scan"]
   n21 --> n22
-  n23["context.enrichment"]
   n22 --> n23
-  n24["strategy.signals"]
   n23 --> n24
-  n25["analysis.gemini"]
   n24 --> n25
-  n26["shadow.proposals"]
   n25 --> n26
-  n27["risk.cfo"]
   n26 --> n27
-  n28["execution.paper"]
   n27 --> n28
-  n29["risk.live_cfo"]
   n28 --> n29
-  n30["execution.live"]
   n29 --> n30
-  n31["evaluation.post_trade"]
   n30 --> n31
-  n32["notifications.slack"]
   n31 --> n32
   done(["tick complete"])
   n32 --> done
+  classDef runtime fill:#eef7f4,stroke:#28705f,color:#10231f
+  classDef broker fill:#f7fbff,stroke:#2f6f9f,color:#13283a
+  classDef risk fill:#fff1f0,stroke:#b0413e,color:#3d1716
+  classDef maintenance fill:#f5f1ff,stroke:#7756b3,color:#261a3d
+  classDef market fill:#fff8e6,stroke:#b78313,color:#3d2a09
+  classDef execution fill:#edf7ff,stroke:#1f6feb,color:#10233f
+  classDef research fill:#f2f5f7,stroke:#657174,color:#172022
+  classDef notifications fill:#eef5f1,stroke:#0f8b8d,color:#10231f
+  classDef other fill:#ffffff,stroke:#657174,color:#172022
+  class n01,n23 runtime
+  class n02,n03,n04,n05,n06,n07 broker
+  class n08,n09,n10,n15,n27,n29 risk
+  class n11,n12 maintenance
+  class n13,n14,n16,n17,n22 market
+  class n18,n19,n28,n30 execution
+  class n20,n21,n24,n25,n26,n31 research
+  class n32 notifications

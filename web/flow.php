@@ -21,7 +21,7 @@ function flowEscape(string $value): string
 $diagrams = [
     [
         'title' => 'Current Control Pipeline',
-        'description' => 'Generated from app.engine.pipelines.build_default_pipeline().',
+        'description' => 'Generated from app.engine.pipelines.build_default_pipeline(); nodes show ownership lanes and runner code references.',
         'path' => 'docs/visuals/current_pipeline.mmd',
         'mermaid' => flowReadMermaid('docs/visuals/current_pipeline.mmd'),
     ],
@@ -251,7 +251,7 @@ $diagrams = [
       <div>
         <p class="eyebrow">Project Centaur</p>
         <h1>Flow Map</h1>
-        <p class="lede">Rendered Mermaid views of the current control pipeline and the entry decision funnel.</p>
+        <p class="lede">Rendered Mermaid views of the current control pipeline and the entry decision funnel, with generated runtime nodes tied back to code ownership.</p>
       </div>
       <nav class="toolbar" aria-label="Primary navigation">
         <a class="button primary" href="/flow.php">Flow Map</a>
@@ -261,7 +261,7 @@ $diagrams = [
       </nav>
     </header>
 
-    <p class="note">Update generated Mermaid files with <code>.venv-mac/bin/python scripts/update_mermaid_visuals.py</code> after changing orchestration, graph nodes, or pipeline order.</p>
+    <p class="note">Update generated Mermaid files with <code>.venv-mac/bin/python scripts/update_mermaid_visuals.py</code> after changing orchestration, graph nodes, or pipeline order. Generated flow diagrams must show source ownership so the visual stays married to the code and <code>app/</code> folder structure.</p>
 
     <section class="grid" aria-label="Centaur flow diagrams">
       <?php foreach ($diagrams as $diagram): ?>
