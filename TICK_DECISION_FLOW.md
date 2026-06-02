@@ -80,18 +80,24 @@ runner.run_tick()
 
 The runner is:
 
-- `app/runtime/control.py`
+- `app/framework/runtime/control.py`
 
 `ControlPipelineRunner.run_tick()` creates a `TickContext`, gives the tick a
-timestamp id, and runs each pipeline step in order. If a step errors, the tick
-stops and records the error.
+timestamp id, and runs the heartbeat LangGraph. If a graph node errors, the tick
+routes to `END`, stops before later gates, and records the error.
 
 ## The Default Pipeline
 
-The step order lives in:
+The human-readable start point is:
 
-- `app/engine/pipelines.py`
-- function: `build_default_pipeline`
+- `app/heartbeat/pipeline.py`
+- `app/heartbeat/graph.py`
+- `app/heartbeat/steps/NN_name/pipeline.py`
+
+`app/heartbeat/steps/NN_name/implementation/main.py` contains the implementation
+body for each heartbeat step. `app/framework/engine/pipelines.py` is now only a
+compatibility facade for older imports; the heartbeat cron master pipeline owns
+the runtime order so the folder tree, LangGraph, and Mermaid order stay aligned.
 
 The entry-relevant section of the pipeline is:
 
@@ -119,31 +125,29 @@ The important thing: exits and evidence updates happen before new entries.
 
 ## LangGraph Status
 
-The architecture target is LangGraph-first orchestration with Pydantic-backed
-state and node contracts. The first migration bridge now exists in
-`app/engine/control_graph.py`, but the production tick runner is still the
-ordered `ControlPipelineRunner`.
+The scheduled heartbeat cron now runs through the LangGraph/Pydantic graph in
+`app/heartbeat/graph.py`. `app/framework/engine/control_graph.py` is a
+compatibility facade for older imports.
 
 That means:
 
 ```text
 what exists today:
-  explicit ordered pipeline steps in app/engine/pipelines.py
+  explicit ordered heartbeat step pipeline folders in app/heartbeat/steps
   shared TickContext state passed from step to step
   named gates for market, strategy, fitness, risk, execution, and notifications
-  LangGraph StateGraph bridge with Pydantic graph state/node input/node output
-  graph-order parity tests against build_default_pipeline()
-  generated LangGraph bridge Mermaid export
+  LangGraph StateGraph with Pydantic graph state/node input/node output
+  ControlPipelineRunner execution through run_heartbeat_cron_graph()
+  graph-order parity tests against the heartbeat pipeline
+  generated heartbeat LangGraph Mermaid export
 
 what does not exist yet:
-  default production execution through LangGraph
   narrow Pydantic models for each domain state slice inside TickContext
-  decomposed typed domain nodes for the largest legacy step bodies
+  decomposed typed domain nodes for the largest step bodies
 ```
 
-So the actual scheduled tick runner today remains `ControlPipelineRunner`, not
-LangGraph. New orchestration work should continue moving the system toward typed
-LangGraph nodes rather than adding more opaque dict-only pipeline surface.
+New orchestration work should keep extending this typed heartbeat graph instead
+of adding opaque dict-only pipeline surface.
 
 ## Visual Pipeline
 
@@ -217,7 +221,7 @@ DISCOVERY_TARGET_COUNT
 
 The code that loads them is:
 
-- `app/runtime/settings.py`
+- `app/framework/runtime/settings.py`
 
 If those environment variables are not set, Centaur falls back to built-in
 defaults:
@@ -281,10 +285,10 @@ tick 2:
 
 The relevant code is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `market_latest_bars`
 - function: `crypto_latest_bars`
-- `app/adapters/alpaca.py`
+- `app/framework/adapters/alpaca.py`
 - function: `get_latest_bars`
 - function: `get_latest_crypto_bars`
 
@@ -406,7 +410,7 @@ canonical_instrument_id = Centaur's normalized identity for the instrument
 
 The instrument identity code is:
 
-- `app/core/instruments.py`
+- `app/framework/core/instruments.py`
 - classes: `CanonicalInstrument`, `VenueSymbolMapping`, `InstrumentRef`
 
 In normal reading:
@@ -431,7 +435,7 @@ our strategies."
 
 The candidate model is:
 
-- `app/engine/candidate_engine.py`
+- `app/framework/engine/candidate_engine.py`
 - class: `RankedCandidate`
 
 Important fields include:
@@ -456,7 +460,7 @@ venue_symbol
 
 The ranking function is:
 
-- `app/engine/candidate_engine.py`
+- `app/framework/engine/candidate_engine.py`
 - function: `rank_candidates`
 
 It calculates:
@@ -488,7 +492,7 @@ the main shortlist for later enrichment and strategy evaluation.
 
 The scan step is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `market_scan`
 
 If there are no current bars or no ranked candidates, entry generation has
@@ -534,7 +538,7 @@ signal is a strategy's structured opinion about that data
 
 The signal model is:
 
-- `app/strategies/base.py`
+- `app/framework/strategies/base.py`
 - class: `StrategySignal`
 
 Important fields include:
@@ -561,7 +565,7 @@ rationale
 
 The strategy registry is:
 
-- `app/strategies/registry.py`
+- `app/framework/strategies/registry.py`
 - function: `evaluate_strategies`
 
 That function runs each strategy profile over the enriched candidates, collects
@@ -589,7 +593,7 @@ candidate comes in
 
 The shared signal builder is:
 
-- `app/strategies/common.py`
+- `app/framework/strategies/common.py`
 - function: `build_signal`
 
 `build_signal` takes the strategy's chosen entry price and profile settings,
@@ -641,7 +645,7 @@ Candidates are ranked by movement and liquidity.
 
 The code is:
 
-- `app/engine/candidate_engine.py`
+- `app/framework/engine/candidate_engine.py`
 - function: `rank_candidates`
 
 Each symbol gets a `discovery_score`:
@@ -688,9 +692,9 @@ Then all strategy signals are combined and sorted by:
 
 The code is:
 
-- `app/strategies/base.py`
+- `app/framework/strategies/base.py`
 - method: `StrategyDefinition.evaluate_profile`
-- `app/strategies/registry.py`
+- `app/framework/strategies/registry.py`
 - function: `evaluate_strategies`
 
 ### 3. Fitness-Adjusted Signal Ranking
@@ -709,7 +713,7 @@ After fitness allocation, surviving signals are sorted again by:
 
 The code is:
 
-- `app/engine/fitness_engine.py`
+- `app/framework/engine/fitness_engine.py`
 - function: `allocate_strategy_signals`
 
 This is where a signal can become:
@@ -739,7 +743,7 @@ Proposal creation sorts by:
 
 The code is:
 
-- `app/engine/shadow.py`
+- `app/framework/engine/shadow.py`
 - function: `build_shadow_proposals`
 
 Then the CFO gate walks those proposals and approves only what still passes the
@@ -761,7 +765,7 @@ direction/notional/risk envelope valid
 
 The code is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `risk_cfo_gate`
 
 So the short version is:
@@ -789,12 +793,12 @@ high_score_override
 
 The fitness code is:
 
-- `app/engine/fitness_engine.py`
+- `app/framework/engine/fitness_engine.py`
 - function: `allocate_strategy_signals`
 
 The pipeline step is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `strategy_signals`
 
 The signal step does two fitness passes:
@@ -817,9 +821,9 @@ would have happened."
 
 The code is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `shadow_trade_proposals`
-- `app/engine/shadow.py`
+- `app/framework/engine/shadow.py`
 - function: `build_shadow_proposals`
 
 Proposal creation checks things like:
@@ -842,7 +846,7 @@ The paper CFO gate is the main new-entry choke point.
 
 The code is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `risk_cfo_gate`
 
 It starts from shadow proposals and decides whether any of them may become a
@@ -884,7 +888,7 @@ Execution does not pick trades. It only submits CFO-approved order requests.
 
 The code is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `execution_paper`
 
 If there are no CFO approvals, execution is idle.
@@ -898,7 +902,7 @@ Live is downstream of paper.
 
 The live CFO gate is:
 
-- `app/engine/pipelines.py`
+- `app/framework/engine/pipelines.py`
 - function: `live_risk_cfo_gate`
 
 Live only considers trades that paper both approved and actually submitted.
@@ -952,25 +956,25 @@ scripts/run_control_tick.sh
 main.py
   CLI entry point. With no special flags, runs one control tick.
 
-app/runtime/control.py
+app/framework/runtime/control.py
   Creates TickContext and runs pipeline steps.
 
-app/engine/pipelines.py
+app/framework/engine/pipelines.py
   Main control-flow steps and risk/execution gates.
 
-app/strategies/base.py
+app/framework/strategies/base.py
   StrategyProfile and StrategySignal data models.
 
-app/strategies/registry.py
+app/framework/strategies/registry.py
   Runs strategy profiles over candidates and returns signals.
 
-app/engine/fitness_engine.py
+app/framework/engine/fitness_engine.py
   Computes fitness summaries and applies fitness allocation to signals.
 
-app/engine/shadow.py
+app/framework/engine/shadow.py
   Creates shadow proposals and scores later shadow outcomes.
 
-app/storage/usage.py
+app/framework/storage/usage.py
   Persists and aggregates evidence, proposals, outcomes, fitness rows, and tick
   state.
 ```

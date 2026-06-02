@@ -10,7 +10,7 @@ $initialSnapshotJson = initialSnapshotJson();
 
 function initialSnapshotJson(): string
 {
-    $result = centaurResolveSnapshotPayload();
+    $result = centaurResolveSnapshotPayload(preferCached: true);
     if (($result['ok'] ?? false) !== true) {
         return 'null';
     }

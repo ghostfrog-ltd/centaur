@@ -3,9 +3,10 @@
 
 This is documentation tooling only. It imports `build_default_pipeline()` and
 turns the ordered StepDefinition list into a flowchart so the visual docs do not
-drift from the actual tick runner. Each node includes its runner reference and
-is grouped by the runtime ownership lane it belongs to, so the graph stays tied
-to the code and folder structure instead of becoming a detached step list.
+drift from the actual tick runner. Each node includes its heartbeat step
+pipeline reference and is grouped by the runtime ownership lane it belongs to,
+so the graph stays tied to the code and folder structure instead of becoming a
+detached step list.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.engine.pipelines import build_default_pipeline
+from app.framework.engine.pipelines import build_default_pipeline
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,49 +45,49 @@ class PipelineNode:
 PIPELINE_LANES: tuple[PipelineLane, ...] = (
     PipelineLane(
         key="runtime",
-        title="Runtime control / app.runtime + app.engine",
+        title="Runtime control / app.heartbeat.steps + app.framework.runtime",
         class_name="runtime",
         prefixes=("control.", "context."),
     ),
     PipelineLane(
         key="broker",
-        title="Broker adapters / app.adapters",
+        title="Broker sync / app.heartbeat.steps + app.framework.adapters",
         class_name="broker",
         prefixes=("alpaca.", "alpaca_live.", "trading212_paper."),
     ),
     PipelineLane(
         key="risk",
-        title="Risk gates / app.runtime + app.engine",
+        title="Risk gates / app.heartbeat.steps + app.framework.runtime",
         class_name="risk",
         prefixes=("risk.",),
     ),
     PipelineLane(
         key="maintenance",
-        title="Maintenance / order lifecycle",
+        title="Maintenance / app.heartbeat.steps",
         class_name="maintenance",
         prefixes=("maintenance.",),
     ),
     PipelineLane(
         key="market",
-        title="Market data + FX / app.adapters + app.core",
+        title="Market data + FX / app.heartbeat.steps + app.framework.adapters",
         class_name="market",
-        prefixes=("market.", "crypto.", "fx."),
+        prefixes=("market.", "crypto.", "fx.", "trading212."),
     ),
     PipelineLane(
         key="execution",
-        title="Execution routing / app.runtime",
+        title="Execution routing / app.heartbeat.steps + app.framework.runtime",
         class_name="execution",
         prefixes=("execution.",),
     ),
     PipelineLane(
         key="research",
-        title="Research, evidence, and analysis / app.engine + app.strategies",
+        title="Research, evidence, and analysis / app.heartbeat.steps + app.framework.engine",
         class_name="research",
         prefixes=("shadow.", "strategy.", "analysis.", "evaluation."),
     ),
     PipelineLane(
         key="notifications",
-        title="Operator notifications / app.runtime",
+        title="Operator notifications / app.heartbeat.steps + app.framework.runtime",
         class_name="notifications",
         prefixes=("notifications.",),
     ),

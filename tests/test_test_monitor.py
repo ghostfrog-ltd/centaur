@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from app.runtime.test_monitor import (
+from app.framework.runtime.test_monitor import (
     TestMonitorConfig,
     TestRunResult,
     build_failure_fingerprint,

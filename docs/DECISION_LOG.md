@@ -2,7 +2,37 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-06-01
+Last updated: 2026-06-02
+
+## 2026-06-02
+
+### Replace near-miss fitness override with 90+ score-to-trade rule
+Decision:
+- by explicit operator override, make `PAPER_MIN_SIGNAL_SCORE_TO_TRADE=90.0` the main entry dial
+- keep live matched with `LIVE_MIN_SIGNAL_SCORE_TO_TRADE=90.0`; live remains same-as-paper and follows only submitted paper orders
+- for already approved strategies, raw setup score at or above this dial survives fitness suppression and proceeds to proposal/CFO/risk review
+- keep fitness as ranking/reporting evidence for these 90+ candidates rather than a hard entry blocker
+
+Why:
+- a 90+ current setup should be allowed to reach the capital gates in the micro paper lane
+- the prior near-miss fitness-cliff rule made the system too complex and could suppress high-quality current setups before CFO/risk could evaluate them
+
+Implementation notes:
+- hard safety rails remain: `$10` notional, long-only, market/session gates, daily drawdown protector, slots, one order per tick, duplicate position/order checks, approved strategies, projected-gain floor, and valid instrument/price requirements
+- this does not create independent live strategy decisions; live remains downstream of same-tick submitted paper orders
+
+### Lower paper/live daily drawdown protector to $1.00
+Decision:
+- by explicit operator override, lower `PAPER_EXECUTION_MAX_DAILY_DRAWDOWN_USD` from `$5.00` to `$1.00`
+- keep Alpaca Live same-as-paper by lowering `LIVE_EXECUTION_MAX_DAILY_DRAWDOWN_USD` from `$5.00` to `$1.00`
+
+Why:
+- the active micro lane targets small daily gains, and a `$5.00` loss allowance is too large relative to observed daily upside and `$10` entries
+- the operator wants one simple loss guard rather than layered soft/hard loss controls
+
+Implementation notes:
+- this is a stricter capital-preservation change only
+- it does not widen notional, slots, broker routing, live independence, strategy allowlists, projected-gain floors, or order frequency
 
 ## 2026-06-01
 

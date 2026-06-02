@@ -1,48 +1,29 @@
-# Project Centaur Skills — Compact
+# Project Centaur Skill
 
-## Read-First Alignment
-1. Read `CODEX_CONTEXT.md` first.
-2. Inspect the relevant code path before editing.
-3. Read `CONSTRAINTS.md` if touching risk, paper/live execution, broker routing, scheduler, storage, or persistence.
-4. Read detailed decision history only when the task depends on historical intent.
-5. Stop for human override if the request conflicts with constraints or logged decisions.
+## Read First
+1. `CODEX_CONTEXT.md`
+2. Relevant source path
+3. `CONSTRAINTS.md` when touching risk, paper/live execution, broker routing, scheduler, storage, or persistence
+4. Decision history only when historical intent matters
 
-## Adapter-First Refactor
-- Treat Alpaca as the first adapter, not the product boundary.
-- Keep strategy, fitness, risk, slots, exits, reports, and order intents in Centaur core.
-- Put vendor market data, execution, broker/account, capabilities, and symbol mapping behind adapters.
+Stop for human override if a request conflicts with constraints or logged decisions.
+
+## Design Bias
+- Adapter-first: Alpaca/Trading 212 are lanes, not product boundaries.
+- Core owns strategy, fitness, risk, slots, exits, reports, instruments, evidence, and order intents.
+- Vendors own market data, execution formatting, broker/account state, capabilities, and symbol mapping.
 - Use explicit modes: `shadow`, `paper`, `live_dry`, `live`.
 - Keep paper/live config, persistence, evidence, logs, permissions, and runtime state separated.
-- Preserve PostgreSQL-only active operation.
-- Require `ExecutionRouter` and final live guard before any live broker mutation.
+- Preserve PostgreSQL-only active operation and require `ExecutionRouter` plus final live guard before live broker mutation.
 
-## Evidence Capture
-When adding learning/evidence data:
-1. Define the question being answered.
-2. Store context: mode, environment, broker, data provider, execution provider, thresholds, and whether execution was affected.
-3. Add to `--evidence-report` or a specific report command.
-4. Clearly label observe-only/counterfactual data.
-5. Add indexes/bounded lookbacks for report queries.
-6. Document interpretation guidance.
+## Evidence
+For new evidence, define the question; store mode/env/broker/providers/thresholds/execution impact; expose `--evidence-report` or a specific report; label observe-only/counterfactual data; add bounded/indexed queries; document interpretation.
 
-## Safe Paper Execution
-Before changing paper execution:
-- Inspect `risk_cfo_gate()` and `_build_paper_trade_approval()`.
-- Preserve `$10` notional, long-only, projected-gain floors, broker routing, daily protector, stale reaper, strategy allowlist, and no-weekend/max-hold red rules unless explicitly overridden.
-- Preserve separate equity/crypto limit buffers.
-- Do not promote observe-only trailing drawdown into a blocker without approval.
+## Paper Execution
+Before changing paper execution, inspect `risk_cfo_gate()` and `_build_paper_trade_approval()`. Preserve `$10` notional, long-only, projected-gain floors, broker routing, daily protector, stale reaper, allowlist, no-weekend carry, max-hold red rules, and separate equity/crypto buffers unless explicitly approved. Do not promote observe-only trailing drawdown without approval.
 
-## First Profitability Check
-When performance is weak:
-1. Check exits before entries.
-2. Compare actual exits with `15m`, `1h`, `1d`, and `7d` shadow outcomes.
-3. Review whether small positive moves existed before final losses.
-4. Check stale/non-marketable exits and fill behaviour.
-5. Check the profit-target ladder.
-6. Only then consider thresholds, discovery knobs, or strategy allowlists.
+## Profitability Triage
+When performance is weak: check exits before entries; compare actual exits with `15m`, `1h`, `1d`, `7d` shadow outcomes; review small positive moves before losses; inspect stale/non-marketable exits and fills; check the profit ladder; only then consider thresholds, discovery knobs, or allowlists.
 
-## $50/Day Scaling
-- Treat `$50/day` as prioritisation only.
-- Improve throughput and expectancy before increasing size.
-- Expansion requires evidence, clean drawdown behaviour, clean exits, enough proposals to use capacity, explicit approval, and doc updates.
-- Preserve `$10` notional unless separately approved.
+## `$50/Day`
+Treat `$50/day` as prioritisation only. Increase throughput/expectancy before size. Expansion needs evidence, clean drawdown/exits, enough proposals to use capacity, explicit approval, and doc updates. Preserve `$10` notional unless approved.

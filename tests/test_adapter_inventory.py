@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from app.reporting.adapter_inventory import AdapterInventoryReport
+from app.framework.reporting.adapter_inventory import AdapterInventoryReport
 
 
 class AdapterInventoryReportTests(unittest.TestCase):
@@ -37,6 +37,26 @@ class AdapterInventoryReportTests(unittest.TestCase):
         self.assertEqual(
             records[("execution", "trading212_paper")]["status"],
             "active_bridge",
+        )
+        self.assertEqual(
+            records[("broker_account", "trading212_live")]["status"],
+            "disabled_live",
+        )
+        self.assertEqual(
+            records[("execution", "trading212_live")]["status"],
+            "disabled_live",
+        )
+        self.assertEqual(
+            records[("market_data", "trading212_live")]["status"],
+            "disabled_live",
+        )
+        self.assertEqual(
+            records[("market_data", "trading212_paper")]["status"],
+            "metadata_only",
+        )
+        self.assertIn(
+            "configured_price_provider=disabled",
+            records[("market_data", "trading212_paper")]["behavior"],
         )
         self.assertFalse(report["non_alpaca_active"])
 

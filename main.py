@@ -3,19 +3,21 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 
-from app.engine.backfill import HistoricalBackfillRunner
-from app.engine.replay import HistoricalReplayRunner
-from app.reporting.adapter_inventory import AdapterInventoryReport
-from app.reporting.crypto_health_report import CryptoHealthReport
-from app.reporting.evidence_report import EvidenceReport
-from app.reporting.holding_window_advisor import HoldingWindowAdvisor
-from app.reporting.paper_exit_review import PaperExitReview
-from app.reporting.status import StatusReporter
-from app.reporting.strategy_health_report import StrategyHealthReport
-from app.reporting.threshold_advisor import ThresholdAdvisor
-from app.runtime.control import ControlPipelineRunner
-from app.runtime.settings import load_runtime_config
-from app.storage.usage import UsageLedger
+from app.framework.engine.backfill import HistoricalBackfillRunner
+from app.framework.engine.replay import HistoricalReplayRunner
+from app.framework.engine.trading212_seed import Trading212PriceSeeder
+from app.framework.reporting.adapter_inventory import AdapterInventoryReport
+from app.framework.reporting.crypto_health_report import CryptoHealthReport
+from app.framework.reporting.evidence_report import EvidenceReport
+from app.framework.reporting.holding_window_advisor import HoldingWindowAdvisor
+from app.framework.reporting.paper_exit_review import PaperExitReview
+from app.framework.reporting.status import StatusReporter
+from app.framework.reporting.strategy_health_report import StrategyHealthReport
+from app.framework.reporting.threshold_advisor import ThresholdAdvisor
+from app.framework.reporting.trading212_instruments import Trading212InstrumentReport
+from app.framework.runtime.control import ControlPipelineRunner
+from app.framework.runtime.settings import load_runtime_config
+from app.framework.storage.usage import UsageLedger
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +95,27 @@ def parse_args() -> argparse.Namespace:
         "--adapter-inventory",
         action="store_true",
         help="Run a read-only inventory of market-data, execution, and broker/account adapters.",
+    )
+    parser.add_argument(
+        "--trading212-instruments",
+        action="store_true",
+        help="Fetch Trading 212 instrument metadata and report UK symbol/ticker readiness.",
+    )
+    parser.add_argument(
+        "--trading212-seed-prices",
+        action="store_true",
+        help="Create tiny Trading 212 paper holdings for positions_api price discovery.",
+    )
+    parser.add_argument(
+        "--confirm-trading212-paper-seed",
+        action="store_true",
+        help="Actually submit Trading 212 paper seed market orders. Without this, --trading212-seed-prices is a dry run.",
+    )
+    parser.add_argument(
+        "--trading212-seed-quantity",
+        type=str,
+        default="0.01",
+        help="Tiny per-symbol Trading 212 seed quantity. Capped at 0.01 for capital preservation.",
     )
     parser.add_argument(
         "--strategy-id",
@@ -237,8 +260,26 @@ def main() -> None:
         print(AdapterInventoryReport().render(), flush=True)
         return
 
+    if args.trading212_instruments:
+        print(Trading212InstrumentReport().render(), flush=True)
+        return
+
+    if args.trading212_seed_prices:
+        seeder = Trading212PriceSeeder()
+        print(
+            seeder.render(
+                result=seeder.run(
+                    confirm=bool(args.confirm_trading212_paper_seed),
+                    quantity=args.trading212_seed_quantity,
+                    symbols=_parse_csv_argument(args.equity_symbols),
+                )
+            ),
+            flush=True,
+        )
+        return
+
     if args.dashboard:
-        from app.reporting.web_dashboard import run_web_dashboard
+        from app.framework.reporting.web_dashboard import run_web_dashboard
 
         run_web_dashboard(
             host=args.host,
@@ -248,7 +289,7 @@ def main() -> None:
         return
 
     if args.dashboard_desktop:
-        from app.reporting.dashboard import run_dashboard
+        from app.framework.reporting.dashboard import run_dashboard
 
         run_dashboard()
         return

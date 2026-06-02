@@ -4,8 +4,8 @@ import unittest
 from datetime import datetime
 from types import SimpleNamespace
 
-import app.engine.pipelines as pipelines
-from app.runtime.models import TickContext
+import app.framework.engine.pipelines as pipelines
+from app.framework.runtime.models import TickContext
 
 
 class FakeLedger:

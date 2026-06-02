@@ -4,13 +4,13 @@ from datetime import datetime
 from types import SimpleNamespace
 import unittest
 
-from app.adapters.market_data import (
+from app.framework.adapters.market_data import (
     MarketDataAdapterError,
     UnsupportedMarketDataAdapterError,
     get_market_data_adapter,
 )
-from app.adapters.market_data.alpaca_data import AlpacaMarketDataAdapter
-from app.runtime.models import TickContext
+from app.framework.adapters.market_data.alpaca_data import AlpacaMarketDataAdapter
+from app.framework.runtime.models import TickContext
 
 
 class MarketDataAdapterTests(unittest.TestCase):
@@ -32,7 +32,7 @@ class MarketDataAdapterTests(unittest.TestCase):
             get_market_data_adapter(self._context(), "unknown_provider")
 
     def test_alpaca_adapter_wraps_latest_equity_bars(self) -> None:
-        from app.adapters.market_data import alpaca_data as alpaca_adapter_module
+        from app.framework.adapters.market_data import alpaca_data as alpaca_adapter_module
 
         class FakeClient:
             def get_latest_bars(self, context, *, symbols):
@@ -55,7 +55,7 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertEqual(rows["AAPL"]["venue_symbol"], "AAPL")
 
     def test_alpaca_adapter_wraps_historical_equity_bars(self) -> None:
-        from app.adapters.market_data import alpaca_data as alpaca_adapter_module
+        from app.framework.adapters.market_data import alpaca_data as alpaca_adapter_module
 
         class FakeClient:
             def get_historical_stock_bars(
@@ -90,7 +90,7 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertEqual(rows["AAPL"][0]["canonical_instrument_id"], "AAPL-US-EQUITY")
 
     def test_alpaca_adapter_wraps_historical_crypto_bars(self) -> None:
-        from app.adapters.market_data import alpaca_data as alpaca_adapter_module
+        from app.framework.adapters.market_data import alpaca_data as alpaca_adapter_module
 
         class FakeClient:
             def get_historical_crypto_bars(
@@ -130,8 +130,8 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertEqual(rows["BTC/USD"][0]["venue_symbol"], "BTC/USD")
 
     def test_alpaca_adapter_wraps_vendor_errors(self) -> None:
-        from app.adapters.alpaca import AlpacaApiError
-        from app.adapters.market_data import alpaca_data as alpaca_adapter_module
+        from app.framework.adapters.alpaca import AlpacaApiError
+        from app.framework.adapters.market_data import alpaca_data as alpaca_adapter_module
 
         class FakeClient:
             def get_latest_bars(self, context, *, symbols):

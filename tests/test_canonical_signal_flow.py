@@ -3,8 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from app.engine.candidate_engine import rank_candidates
-from app.strategies.crypto_momentum import CryptoMomentumStrategy
+from app.framework.engine.candidate_engine import rank_candidates
+from app.framework.strategies.crypto_momentum import CryptoMomentumStrategy
 
 
 class CanonicalSignalFlowTests(unittest.TestCase):

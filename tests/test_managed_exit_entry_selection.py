@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import unittest
 
-from app.engine.pipelines import _find_most_protective_managed_entry_order
+from app.framework.engine.pipelines import _find_most_protective_managed_entry_order
 
 
 class ManagedExitEntrySelectionTests(unittest.TestCase):

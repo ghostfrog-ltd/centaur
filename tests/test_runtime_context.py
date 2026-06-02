@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from app.runtime.mode_context import ModeContext, normalize_runtime_environment
+from app.framework.runtime.mode_context import ModeContext, normalize_runtime_environment
 
 
 class RuntimeContextTests(unittest.TestCase):

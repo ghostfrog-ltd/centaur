@@ -1,21 +1,24 @@
 # Centaur Visualization Index
 
-Centaur's production tick runner is currently an ordered Python pipeline. The
-first LangGraph migration bridge now exists in `app.engine.control_graph`: it
-wraps each current pipeline step as a typed Pydantic-backed LangGraph node while
-preserving the existing runtime order and safety-gate names.
+Centaur's scheduled heartbeat is a LangGraph/Pydantic orchestration graph
+owned by `app.heartbeat.graph`. It preserves the existing runtime
+order and safety-gate names while making each heartbeat step folder the visible
+node ownership surface.
 
 ## Current Visuals
 
 - `docs/visuals/current_pipeline.mmd`
-  - Generated from `app.engine.pipelines.build_default_pipeline()`.
+  - Generated from `app.framework.engine.pipelines.build_default_pipeline()`, which now
+    delegates to `app.heartbeat.pipeline`.
   - Shows every control tick step in the actual runtime order.
-  - Groups nodes by runtime ownership lane and labels each node with its source
-    runner reference, such as `app/engine/pipelines.py::market_scan`.
+  - Groups nodes by runtime ownership lane and labels each node with its
+    heartbeat step-pipeline reference, such as
+    `app/heartbeat/steps/23_market_scan/pipeline.py::run`.
 
 - `docs/visuals/current_langgraph_bridge.mmd`
-  - Generated from `app.engine.control_graph.build_control_graph_mermaid()`.
-  - Shows the current success path for the typed LangGraph bridge.
+  - Generated from
+    `app.heartbeat.graph.build_heartbeat_cron_graph_mermaid()`.
+  - Shows the current success path for the typed heartbeat LangGraph.
 
 - `docs/visuals/entry_decision_funnel.mmd`
   - Hand-authored conceptual graph.
@@ -41,9 +44,10 @@ docs/visuals/current_pipeline.mmd
 docs/visuals/current_langgraph_bridge.mmd
 ```
 
-Use this after changing `build_default_pipeline()` or the control graph bridge
-so visual orchestration docs do not drift from code. Use the check mode in CI or
-before commits:
+Use this after changing `app/heartbeat/pipeline.py`,
+`app/heartbeat/graph.py`, any heartbeat step folder, or
+`build_default_pipeline()` so visual orchestration docs do not drift from code.
+Use the check mode in CI or before commits:
 
 ```bash
 .venv-mac/bin/python scripts/update_mermaid_visuals.py --check
@@ -51,9 +55,10 @@ before commits:
 
 Generated orchestration visuals are not just pictures of labels. They must stay
 married to implementation ownership: every runtime node should identify the
-source module/function or typed graph owner that backs it, and the visual
-grouping should reflect the relevant `app/` folder/domain boundary where
-practical.
+source module/function or typed graph owner that backs it. For the scheduled
+heartbeat, the first source reference is the step pipeline under
+`app/heartbeat/steps/`, and the typed graph owner is
+`app/heartbeat/graph.py`.
 
 ## LangGraph/Pydantic Migration Status
 
@@ -63,13 +68,13 @@ Done:
 LangGraph StateGraph definitions
 Pydantic state, node input, and node output models
 graph rendering/export from the runtime graph
-tests that compare graph order to the old pipeline order during migration
+ControlPipelineRunner execution through the heartbeat LangGraph
+tests that compare graph order to the heartbeat pipeline order
 ```
 
 Still pending:
 
 ```text
-promote ControlPipelineRunner to execute the graph bridge by default
 migrate shared TickContext dict fields into narrower Pydantic state models
-split large legacy step bodies into typed domain nodes where it reduces risk
+split large step bodies into typed domain nodes where it reduces risk
 ```

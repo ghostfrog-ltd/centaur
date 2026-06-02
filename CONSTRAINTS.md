@@ -1,72 +1,63 @@
-# Project Centaur Constraints — Compact
+# Project Centaur Constraints
 
 ## Hard Nos
-- Do not use the `$50/day` target to bypass risk controls, widen notional, add slots, loosen gates, change brokers, or alter live behaviour.
-- No live-money trading outside the recorded 2026-05-29 Alpaca Live same-as-paper override.
-- No Alpaca Live entry unless live enablement, kill switch, credentials, activation acknowledgement, readiness, same-paper validation, and live guard all pass.
+- Do not use the `$50/day` target to widen risk, notional, slots, gates, brokers, or live behaviour.
+- No live-money trading outside the 2026-05-29 Alpaca Live same-as-paper override.
+- No Alpaca Live entry unless enablement, kill switch, credentials, activation ack, readiness, same-paper validation, and live guard all pass.
 - No paper trade above `$10` notional without explicit approval.
-- No silent broker switch.
-- No unsupported direction changes; current execution is long-only.
-- No paper order when kill switch is on, daily drawdown protector has triggered, market-hours rules block equities, or slots/orders are full.
+- No silent broker switch or unsupported direction change; execution is long-only.
+- No paper order when kill switch, daily drawdown, market-hours, slot, or open-order gates block it.
 - No raw chain-of-thought logging.
 - No contradiction of constraints/decision log without human override.
-- No safety-critical trading path without clear comments/docstrings.
+- No safety-critical trading path without comments/docstrings explaining gates and audit trail.
 - No evidence capture without a report/dashboard/status/query surface.
-- No high-volume persistence path without bounded queries/index discipline.
+- No high-volume persistence without bounded queries and indexes.
 
-## Architecture And Model Contracts
+## Architecture Contracts
 - Direction is LangGraph-first orchestration with Pydantic-backed state, node inputs, and node outputs.
-- The current `ControlPipelineRunner`/`StepDefinition` pipeline is legacy-compatible scaffolding until migrated; do not deepen it with new opaque dict-only control flow when a typed graph node/model is practical.
-- New workflow surfaces should define explicit Pydantic models for state they own or mutate, especially for market data, candidates, signals, fitness allocation, risk approvals, order intents, execution results, and evidence summaries.
-- LangGraph node boundaries must preserve capital gates: market readiness, fitness allocation, CFO risk, execution router, live follower guard, and notification/reporting must remain auditable named nodes.
-- Graph visualization/export is required for orchestration changes. Run `.venv-mac/bin/python scripts/update_mermaid_visuals.py` and update `docs/visuals/`, `docs/VISUALIZATION.md`, or an equivalent generated graph surface when nodes/edges change.
-- Generated orchestration visuals must marry runtime flow to code ownership. Pipeline/graph nodes must expose their owning source module/function or typed graph owner, and grouping should reflect the relevant `app/` folder/domain boundary rather than becoming a detached label-only chart.
-- Migration to LangGraph/Pydantic must be behaviour-preserving unless a separate explicit trading-policy change is reviewed and approved. Refactoring orchestration is not permission to alter thresholds, notional, broker routing, live behaviour, strategy allowlists, or risk gates.
+- `ControlPipelineRunner`/`StepDefinition` is migration scaffolding; do not deepen opaque dict-only control flow when a typed graph node/model is practical.
+- New workflow state should use explicit Pydantic models, especially for market data, candidates, signals, fitness allocation, risk approvals, order intents, execution results, and evidence summaries.
+- Named capital gates must stay auditable: market readiness, fitness allocation, CFO risk, execution router, live follower guard, notifications/reporting.
+- Orchestration node/edge changes require `.venv-mac/bin/python scripts/update_mermaid_visuals.py` and updated generated visual docs.
+- Generated visuals must show source module/function or typed graph ownership and group by relevant `app/` domain.
+- LangGraph/Pydantic migration must be behaviour-preserving unless a separate trading-policy change is approved.
 
-## Context And Token Discipline
-- Prefer concise, high-signal explanations, file links, generated docs, and targeted excerpts over repeated long dumps of code, logs, or historical context.
-- Load only the context needed for the current task. Do not read full historical logs or broad files when compact context, search results, or specific source slices are enough.
-- When a durable explanation is useful, put it in a project doc or generated visual so future turns can link to it instead of re-explaining from scratch.
+## Token Discipline
+- Load only context needed for the task; prefer compact docs, search results, and precise source slices over full logs.
+- Put durable explanations in docs or generated visuals so future turns can link instead of re-explaining.
 
 ## Active Paper Envelope
-- Broker: `alpaca_paper`.
-- Asset classes: equities and crypto.
-- Notional: `$10` exactly unless overridden.
-- Max orders per tick: `1`.
-- Base slots: `10`.
-- Earned slots: +1 per full `$10` tracked P/L above baseline; dynamic and can fall away.
-- Daily equity drawdown protector: `$5.00`.
-- Long-only.
+- Paper lanes: `alpaca_paper` plus separate `trading212_paper` equities where enabled/eligible.
+- Assets: equities and crypto.
+- Notional: `$10` unless approved; Trading 212 paper currently uses `£5` native sizing for the reset £100 demo account.
+- Max orders/tick `1`; base slots `10`; earned slots +1 per full `$10` tracked P/L above baseline and can fall away.
+- Daily equity drawdown protector `$1.00`; long-only.
 - Allowed strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`.
 - Projected-gain floors: equities `1.5%`, crypto `2.0%`.
-- Crypto momentum stop: `1.0%`; crypto remains enabled, but future `$10` crypto losses should be capped near `$0.10` before slippage/fill drift.
-- Crypto momentum candidate gates: require instrument identity, reject movement above `2.5%`, reject derived/supplied notional volume below `£50,000`, and reject spreads above `0.25%` when spread data is available.
-- Limit buffer: equities `5` bps, crypto `25` bps.
-- Equity fractional orders: `DAY` limits.
-- Crypto orders/exits: `IOC` limits.
+- Crypto momentum: `1.0%` stop; require instrument identity; reject movement > `2.5%`, notional candidate volume < `£50,000` where derivable, and spread > `0.25%` when known.
+- Buffers/orders: equity `5` bps `DAY` limits; crypto `25` bps `IOC` limits.
 - Stale unfilled equity entries: reap after `5` minutes.
-- Profit capture: `1.25%` managed exit; does not lower entry floors.
-- Aggregated same-symbol managed positions must use the most protective still-open entry stop for exits, because the broker exposes one long position even when Centaur entered multiple lots.
-- Profit-target ladder evidence: `1.25,2,3,4,6` percent.
-- Max-hold red deferral: do not sell red solely due to elapsed max-hold for `profit_after_1h_else_1d` or `profit_capture_else_1d`.
-- Equity no-weekend-carry: block new Friday equity entries in final 60 minutes; flatten managed equity positions in final 15 minutes. Crypto unchanged.
-- Alpaca Live equity PDT guard: new live equity entries fail closed unless the live account proves prior/effective equity at or above `$25,000`; this avoids entering positions whose same-day exits may be broker-rejected. Existing live exits still route when the broker permits them. Crypto is not blocked by this PDT guard. Alpaca announced a new intraday-margin framework for 2026-06-04, but do not auto-unblock on date alone; require observed API/account behavior and explicit review.
+- Managed exits: capture at `1.25%`; ladder evidence `1.25,2,3,4,6%`.
+- Same-symbol managed exits must use the most protective still-open entry stop.
+- Max-hold red deferral: do not sell red solely because elapsed max hold for `profit_after_1h_else_1d` or `profit_capture_else_1d`.
+- Friday equity no-weekend-carry: block entries in final 60 minutes; flatten managed equities in final 15 minutes. Crypto unchanged.
+- Alpaca Live equity PDT guard: new live equity entries fail closed unless prior/effective equity >= `$25,000`; exits still route when permitted. Do not auto-unblock on the 2026-06-04 framework date without observed account/API behaviour and explicit review.
 
 ## Live Lane
-Alpaca Live is approved only as a same-as-paper follower. It must not invent live-only thresholds, order limits, strategies, asset classes, broker routing, or notional. The final live guard is a real-money safety boundary, not a strategy engine.
+Alpaca Live is same-as-paper only. It must not invent live-only thresholds, order limits, strategies, assets, broker routing, or notional. The final live guard is a real-money safety boundary, not a strategy engine.
 
-Crypto momentum tuning has separate paper/live environment keys for testing and audit clarity, but armed live still defaults to paper values and must fail closed on unnamed live-vs-paper differences.
+Crypto momentum has separate paper/live env keys for audit clarity, but armed live defaults to paper values and fails closed on unnamed differences.
 
 ## Broker Routing
-- Active: Alpaca Paper.
+- Active paper: Alpaca Paper and separate Trading 212 Paper equity lane.
 - Approved live follower: Alpaca Live, same-as-paper only.
-- IG: scaffold/shadow only; no IG trade may exceed `$10` notional or imply more than `1x` leverage.
-- Trading 212 Paper: approved for paper equity execution only. It has its own 10 base slots, fixed `£10` native order sizing, broker-specific protection/evidence, and duplicate client-order-id guard. Do not route crypto, live money, short selling, or widened notional through Trading 212.
-- Other providers: not implemented; fail closed.
+- IG: scaffold/shadow only; no trade above `$10` notional or above `1x` leverage.
+- Trading 212 Paper: paper/equity-only; 10 slots; broker-specific protection/evidence; duplicate client-order-id guard. No crypto, live money, shorts, or widened notional. Entries require configured UK symbol, real venue ticker, trusted latest-price/proposal provider, and GBX-to-GBP conversion before sizing. `positions_api` price seeds are only demo holdings: the seed command may place capped tiny paper buys, but seeds must not consume strategy slots, block same-symbol entries, or be auto-sold unless a filled Centaur managed buy exists.
+- Trading 212 Live: readiness/config may exist, but real-money mutation is not approved. `TRADING212_LIVE_EXECUTION_ENABLED` must remain false unless separately approved with evidence/reporting/latest-price/final-live-guard review.
+- Other providers: fail closed.
 
-## Evidence And Storage
-- PostgreSQL is the active operations store.
-- If PostgreSQL is configured or execution is enabled, fail closed rather than silently using SQLite.
-- Paper/live/core separation is currently row-level provenance plus lane scaffolding; physical migration requires a checklist.
-- Evidence rows must carry enough provenance to separate environment, mode, source environment, broker, data provider, and execution provider.
-- Slack is notification-only. It may report broker/risk alerts and action-required reminders, but must not accept commands or mutate live trading state.
+## Evidence / Storage
+- PostgreSQL is the active operations store; fail closed rather than silently using SQLite when Postgres is configured or execution is enabled.
+- Paper/live/core separation uses row-level provenance plus lane scaffolding; physical migration requires a checklist.
+- Evidence rows must separate environment, mode, source environment, broker, data provider, and execution provider.
+- Slack is notification-only; it may report alerts/reminders but must not accept commands or mutate live state.

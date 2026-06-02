@@ -8,9 +8,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.runtime.settings import load_runtime_config
-from app.storage.layout import storage_layout_from_config
-from app.storage.usage import UsageLedger
+from app.framework.runtime.settings import load_runtime_config
+from app.framework.storage.layout import storage_layout_from_config
+from app.framework.storage.usage import UsageLedger
 
 
 def main() -> int:

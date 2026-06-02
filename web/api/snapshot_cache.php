@@ -24,7 +24,7 @@ function centaurSnapshotCachePath(): string
     return dirname(__DIR__) . '/cache/dashboard_snapshot.json';
 }
 
-function centaurResolveSnapshotPayload(): array
+function centaurResolveSnapshotPayload(bool $preferCached = false): array
 {
     $apiUrl = centaurSnapshotApiUrl();
     if (filter_var($apiUrl, FILTER_VALIDATE_URL) === false) {
@@ -40,6 +40,25 @@ function centaurResolveSnapshotPayload(): array
     $cachePath = centaurSnapshotCachePath();
     $cacheTtlSeconds = centaurSnapshotCacheTtlSeconds();
     $cachedPayload = centaurReadSnapshotCache($cachePath);
+    if ($preferCached && $cachedPayload !== null) {
+        return [
+            'ok' => true,
+            'body' => $cachedPayload['body'],
+            'decoded' => $cachedPayload['decoded'],
+            'cache_status' => 'cached',
+            'cache_path' => $cachePath,
+            'cache_age_seconds' => $cachedPayload['age_seconds'],
+        ];
+    }
+    if ($preferCached) {
+        return [
+            'ok' => false,
+            'status_code' => 503,
+            'error' => 'dashboard_snapshot_cache_unavailable',
+            'detail' => 'No compact cached dashboard snapshot is available yet.',
+            'extra' => ['cache_path' => $cachePath],
+        ];
+    }
     if ($cachedPayload !== null && $cachedPayload['age_seconds'] <= $cacheTtlSeconds) {
         return [
             'ok' => true,
@@ -129,6 +148,9 @@ function centaurReadSnapshotCache(string $cachePath): ?array
 
     $decoded = json_decode($body, true);
     if (!is_array($decoded)) {
+        return null;
+    }
+    if (isset($decoded['recent_ticks']) && is_array($decoded['recent_ticks']) && count($decoded['recent_ticks']) > 0) {
         return null;
     }
 

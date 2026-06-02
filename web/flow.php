@@ -21,7 +21,7 @@ function flowEscape(string $value): string
 $diagrams = [
     [
         'title' => 'Current Control Pipeline',
-        'description' => 'Generated from app.engine.pipelines.build_default_pipeline(); nodes show ownership lanes and runner code references.',
+        'description' => 'Generated from app.framework.engine.pipelines.build_default_pipeline(); nodes show ownership lanes and runner code references.',
         'path' => 'docs/visuals/current_pipeline.mmd',
         'mermaid' => flowReadMermaid('docs/visuals/current_pipeline.mmd'),
     ],

@@ -7,8 +7,8 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
-from app.runtime.settings import load_runtime_config
-from app.storage.usage import UsageLedger
+from app.framework.runtime.settings import load_runtime_config
+from app.framework.storage.usage import UsageLedger
 
 
 class EnvironmentMetadataTests(unittest.TestCase):
@@ -175,6 +175,39 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(row["canonical_instrument_id"], "BTC-USD-SPOT")
         self.assertEqual(row["venue"], "alpaca")
         self.assertEqual(row["venue_symbol"], "BTC/USD")
+
+    def test_latest_bars_convert_gbx_prices_to_gbp(self) -> None:
+        now = datetime.now().astimezone()
+        self.ledger.record_latest_bars(
+            tick_id="test-tick",
+            captured_at=now,
+            source="trading212_market_data",
+            quote_currency="GBX",
+            bars_by_symbol={
+                "VOD": {
+                    "t": now.isoformat(),
+                    "o": 72.0,
+                    "h": 73.0,
+                    "l": 71.0,
+                    "c": 72.5,
+                    "v": 10,
+                    "n": 2,
+                    "venue": "trading212",
+                    "venue_symbol": "VODl_EQ",
+                    "asset_class": "equity",
+                }
+            },
+        )
+
+        row = self.ledger.get_latest_bars_for_tick(
+            tick_id="test-tick",
+            sources=["trading212_market_data"],
+        )[0]
+
+        self.assertEqual(row["quote_currency"], "GBX")
+        self.assertEqual(row["close_price_gbp"], 0.725)
+        self.assertEqual(row["venue"], "trading212")
+        self.assertEqual(row["venue_symbol"], "VODl_EQ")
 
     def test_historical_bars_carry_instrument_metadata(self) -> None:
         now = datetime.now().astimezone()

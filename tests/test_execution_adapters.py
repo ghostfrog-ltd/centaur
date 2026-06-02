@@ -4,13 +4,13 @@ import unittest
 from datetime import datetime
 from types import SimpleNamespace
 
-import app.adapters.execution.broker_bridge as broker_bridge
-from app.adapters.execution import (
+import app.framework.adapters.execution.broker_bridge as broker_bridge
+from app.framework.adapters.execution import (
     UnsupportedExecutionAdapterError,
     get_execution_adapter,
 )
-from app.adapters.execution.broker_bridge import BrokerExecutionAdapter
-from app.runtime.models import TickContext
+from app.framework.adapters.execution.broker_bridge import BrokerExecutionAdapter
+from app.framework.runtime.models import TickContext
 
 
 class ExecutionAdapterTests(unittest.TestCase):
@@ -45,6 +45,12 @@ class ExecutionAdapterTests(unittest.TestCase):
 
         self.assertIsInstance(adapter, BrokerExecutionAdapter)
         self.assertEqual(adapter.broker_id, "trading212_paper")
+
+    def test_get_execution_adapter_resolves_disabled_trading212_live(self) -> None:
+        adapter = get_execution_adapter(self._context(), "trading212_live")
+
+        self.assertIsInstance(adapter, BrokerExecutionAdapter)
+        self.assertEqual(adapter.broker_id, "trading212_live")
 
     def test_broker_bridge_delegates_submit_and_cancel(self) -> None:
         calls = []

@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from app.storage.layout import storage_layout_from_config
-from app.storage.usage import UsageLedger
+from app.framework.storage.layout import storage_layout_from_config
+from app.framework.storage.usage import UsageLedger
 
 
 class StorageLayoutTests(unittest.TestCase):

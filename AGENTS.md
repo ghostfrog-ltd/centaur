@@ -1,44 +1,42 @@
-# Project Centaur AGENTS.md — Compact
+# Project Centaur AGENTS.md
 
-You are Codex working inside Project Centaur. Build, harden, test, and explain the trading research/micro execution system without bypassing capital-preservation rules.
+You are Codex inside Project Centaur. Build, harden, test, and explain the trading research/micro execution system without bypassing capital-preservation rules.
 
 ## Read Order
-Default:
 1. `CODEX_CONTEXT.md`
-2. Relevant source files for the task
-3. `CONSTRAINTS.md` only if touching execution/risk/live/storage/persistence
-4. `DECISION_LOG.md` only if a decision conflict or historical reason matters
+2. Relevant source files
+3. `CONSTRAINTS.md` only for execution, risk, live, broker routing, storage, or persistence
+4. `DECISION_LOG.md` only for conflicts or historical reasons
 
-Do not load full historical logs for ordinary code edits.
+Do not load full historical logs for ordinary edits.
 
 ## Current Truth
-- LangGraph-first architecture direction with Pydantic-backed state/contracts; the current ordered pipeline is migration scaffolding, not the desired end state.
-- Gemini API only for LLM work; keep it adapter-backed.
+- LangGraph-first, Pydantic-backed architecture; current ordered pipeline is migration scaffolding.
+- Gemini API only for LLM work, behind adapters.
 - PostgreSQL for active paper/live operations; no silent SQLite fallback when execution is enabled or Postgres is configured.
 - Adapter-first design: Alpaca is one adapter, not the product.
-- Runtime modes: `shadow`, `paper`, `live_dry`, `live`.
-- Active execution: Alpaca Paper.
+- Modes: `shadow`, `paper`, `live_dry`, `live`.
+- Active paper: Alpaca Paper plus separate Trading 212 Paper equity lane where eligible.
 - Alpaca Live: approved only as same-as-paper follower from 2026-05-29.
-- IG: scaffold/shadow only.
-- Future brokers/providers: fail closed until implemented, tested, reported, and explicitly approved.
+- IG scaffold/shadow only; future brokers/providers fail closed until implemented, tested, reported, and explicitly approved.
 
 ## Prime Directives
 1. Preserve capital first.
 2. Optimise risk-adjusted return, not raw profit.
 3. Keep decisions auditable and measurable.
-4. Never treat `$50/day` as permission to widen risk.
-5. Any new evidence stream must have a review/report surface.
+4. Never use `$50/day` to widen risk.
+5. New evidence needs a review/report/status/query surface.
 6. Safety-critical paths need comments/docstrings explaining gates and audit trails.
 
 ## Working Style
 - No vibes around constraints.
 - No silent broker/risk/live behaviour changes.
-- New orchestration work should either add typed LangGraph/Pydantic structure or clearly document why it is a temporary migration bridge.
-- When orchestration/pipeline nodes or edges change, run `.venv-mac/bin/python scripts/update_mermaid_visuals.py` and keep the rendered flow docs current.
-- Generated orchestration visuals must stay married to the code and folder structure: show node ownership via source module/function or typed graph owner, and group nodes by the relevant `app/` domain boundary where practical.
+- New orchestration should add typed LangGraph/Pydantic structure or document temporary migration bridging.
+- If orchestration nodes/edges change, run `.venv-mac/bin/python scripts/update_mermaid_visuals.py`.
+- Generated visuals must show node ownership by module/function or typed graph owner and group by relevant `app/` domain.
 - No new paper strategy execution without explicit approval.
-- Prefer deterministic logic over opaque AI behaviour for risk, execution, fitness, and replay.
-- Use tokens deliberately: prefer concise answers, targeted file reads, durable docs, and generated visuals over repeated long explanations or broad context dumps.
-- Keep dashboards/status honest: recent activity, all-time evidence, paper, live, shadow, and observe-only data must be labelled separately.
-- When adding persistence, consider indexes, retention, bounded queries, and control-loop load.
-- When changing runtime behaviour, update the compact context and relevant canonical docs.
+- Prefer deterministic logic for risk, execution, fitness, and replay.
+- Use concise context: targeted reads, durable docs, and generated visuals over repeated long dumps.
+- Keep dashboards/status honest: label recent, all-time, paper, live, shadow, and observe-only data separately.
+- For persistence, consider indexes, retention, bounded queries, and control-loop load.
+- When runtime behaviour changes, update compact context and canonical docs.

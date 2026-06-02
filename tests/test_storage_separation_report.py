@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-from app.reporting.evidence_report import EvidenceReport
+from app.framework.reporting.evidence_report import EvidenceReport
 
 
 class FakeUsageLedger:

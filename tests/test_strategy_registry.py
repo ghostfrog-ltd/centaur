@@ -3,10 +3,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
-from app.strategies.crypto_momentum import CryptoMomentumStrategy
-from app.strategies.mean_reversion import MeanReversionStrategy
-from app.strategies.momentum_breakout import MomentumVolatilityBreakoutStrategy
-from app.strategies.registry import evaluate_strategies
+from app.framework.strategies.crypto_momentum import CryptoMomentumStrategy
+from app.framework.strategies.mean_reversion import MeanReversionStrategy
+from app.framework.strategies.momentum_breakout import MomentumVolatilityBreakoutStrategy
+from app.framework.strategies.registry import evaluate_strategies
 
 
 class StrategyRegistryTests(unittest.TestCase):

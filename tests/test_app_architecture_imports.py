@@ -1,13 +1,14 @@
 import unittest
 
-from app.adapters.execution.alpaca_live import AlpacaLiveExecutionAdapter
-from app.adapters.execution.alpaca_paper import AlpacaPaperExecutionAdapter
-from app.adapters.brokers.trading212 import Trading212PaperBrokerAdapter
-from app.adapters.market_data.alpaca_data import AlpacaMarketDataAdapter
-from app.core.instruments import default_instrument_registry
-from app.engine.execution_planner import ExecutionRouter
-from app.runtime.mode_context import ModeContext
-from app.storage.layout import storage_layout_from_config
+from app.framework.adapters.execution.alpaca_live import AlpacaLiveExecutionAdapter
+from app.framework.adapters.execution.alpaca_paper import AlpacaPaperExecutionAdapter
+from app.framework.adapters.brokers.trading212 import Trading212PaperBrokerAdapter
+from app.framework.adapters.market_data.alpaca_data import AlpacaMarketDataAdapter
+from app.framework.core.instruments import default_instrument_registry
+from app.framework.engine.execution_planner import ExecutionRouter
+from app.framework.runtime.mode_context import ModeContext
+from app.heartbeat import build_heartbeat_cron_pipeline
+from app.framework.storage.layout import storage_layout_from_config
 
 
 class _Config:
@@ -59,6 +60,10 @@ class AppArchitectureImportTests(unittest.TestCase):
         self.assertEqual(layout.core.postgres_schema, "core")
         self.assertEqual(layout.paper.postgres_schema, "paper")
         self.assertEqual(layout.live.postgres_schema, "live")
+
+        heartbeat_steps = build_heartbeat_cron_pipeline()
+        self.assertEqual(heartbeat_steps[0].name, "control.heartbeat")
+        self.assertEqual(heartbeat_steps[-1].name, "notifications.slack")
 
 
 if __name__ == "__main__":

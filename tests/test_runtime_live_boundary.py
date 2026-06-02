@@ -3,9 +3,10 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
-import app.engine.pipelines as pipelines
-from app.runtime.models import TickContext
+import app.framework.engine.pipelines as pipelines
+from app.framework.runtime.models import TickContext
 
 
 class RuntimeLiveBoundaryTests(unittest.TestCase):
@@ -141,6 +142,330 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
         self.assertEqual(result["equity"], 5000.0)
         self.assertEqual(snapshots[0]["broker_id"], "trading212_paper")
         self.assertIn("trading212_paper", context.state["broker_accounts"])
+
+    def test_market_gate_tracks_trading212_london_session_separately(self) -> None:
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+            config=SimpleNamespace(
+                discovery_crypto_symbols=(),
+                market_timezone="America/New_York",
+                trading212_paper_api_configured=True,
+                trading212_paper_execution_enabled=True,
+                trading212_paper_market_timezone="Europe/London",
+                trading212_paper_market_open_time="08:00",
+                trading212_paper_market_close_time="16:30",
+            ),
+            usage_ledger=SimpleNamespace(),
+            state={
+                "alpaca_account": {
+                    "summary": {
+                        "status": "ACTIVE",
+                        "trading_blocked": False,
+                        "account_blocked": False,
+                    }
+                },
+                "alpaca_clock": {
+                    "summary": {
+                        "is_open": False,
+                        "next_open": "2026-06-02T09:30:00-04:00",
+                        "next_close": "2026-06-02T16:00:00-04:00",
+                    }
+                },
+                "trading212_paper_account": {
+                    "summary": {
+                        "status": "DEMO",
+                        "trading_blocked": False,
+                        "account_blocked": False,
+                    }
+                },
+            },
+        )
+
+        result = pipelines.market_gate(context)
+
+        self.assertFalse(result["market_open"])
+        self.assertFalse(result["equity_scan_ready"])
+        self.assertTrue(
+            result["broker_equity_markets"]["trading212_paper"]["market_open"]
+        )
+        self.assertTrue(
+            result["broker_equity_markets"]["trading212_paper"]["equity_scan_ready"]
+        )
+
+    def test_trading212_approval_uses_own_market_window(self) -> None:
+        class FakeExecutionAdapter:
+            def validate_entry_constraints(self, **_kwargs):
+                return None
+
+            def build_entry_order_request(self, **kwargs):
+                return {
+                    "ticker": "VODl_EQ",
+                    "client_order_id": kwargs["client_order_id"],
+                }
+
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+            config=SimpleNamespace(
+                paper_execution_equity_only=False,
+                paper_execution_require_market_open=True,
+                paper_execution_min_projected_gain_pct=0.01,
+                paper_execution_limit_buffer_bps=5.0,
+                paper_execution_default_notional_usd=10.0,
+                trading212_paper_default_notional_native=10.0,
+                paper_execution_equity_broker_id="alpaca_paper",
+            ),
+            usage_ledger=SimpleNamespace(),
+            state={"fx_gbp_reference": {"usd_to_gbp": 0.8}},
+        )
+        proposal = {
+            "proposal_id": "proposal-1",
+            "symbol": "VOD",
+            "asset_class": "equity",
+            "strategy_id": "mean_reversion.snapback",
+            "direction": "long",
+            "entry_price": 100.0,
+            "stop_loss_price": 95.0,
+            "target_price": 103.0,
+        }
+        market_gate = {
+            "market_open": False,
+            "equity_reason": "market_closed",
+            "next_close": "2026-06-02T16:00:00-04:00",
+            "broker_equity_markets": {
+                "trading212_paper": {
+                    "market_open": True,
+                    "reason": "market_open",
+                    "next_close": "2026-06-02T16:30:00+01:00",
+                }
+            },
+        }
+        original = pipelines.get_execution_adapter
+        pipelines.get_execution_adapter = lambda _context, _broker_id: FakeExecutionAdapter()
+        try:
+            approval, rejection = pipelines._build_paper_trade_approval(
+                context=context,
+                proposal=proposal,
+                tick_id="test",
+                config=context.config,
+                market_gate=market_gate,
+                position_symbols=set(),
+                open_order_symbols=set(),
+                broker_id="trading212_paper",
+            )
+        finally:
+            pipelines.get_execution_adapter = original
+
+        self.assertIsNone(rejection)
+        self.assertIsNotNone(approval)
+        self.assertEqual(approval["broker_id"], "trading212_paper")
+
+    def test_trading212_latest_bars_can_use_positions_api_current_price(self) -> None:
+        captured: dict[str, object] = {}
+
+        def record_latest_bars(**kwargs):
+            captured.update(kwargs)
+            return len(kwargs["bars_by_symbol"])
+
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+            config=SimpleNamespace(
+                trading212_paper_market_data_provider="positions_api",
+                trading212_paper_equity_symbols=("VOD",),
+            ),
+            usage_ledger=SimpleNamespace(record_latest_bars=record_latest_bars),
+            state={
+                "market_gate": {
+                    "broker_equity_markets": {
+                        "trading212_paper": {
+                            "equity_scan_ready": True,
+                            "reason": "market_open",
+                        }
+                    }
+                },
+                "fx_gbp_reference": {"usd_to_gbp": 0.8},
+                "trading212_paper_positions": {
+                    "raw": [
+                        {
+                            "quantity": 0.01,
+                            "currentPrice": 72.5,
+                            "instrument": {
+                                "ticker": "VODl_EQ",
+                                "currencyCode": "GBX",
+                            },
+                        }
+                    ]
+                },
+            },
+        )
+
+        result = pipelines.trading212_latest_bars(context)
+
+        self.assertEqual(result["mode"], "latest_bars")
+        self.assertEqual(result["bars_saved"], 1)
+        self.assertEqual(captured["source"], "trading212_market_data")
+        self.assertEqual(captured["bars_by_symbol"]["VOD"]["c"], 72.5)
+        self.assertEqual(captured["bars_by_symbol"]["VOD"]["venue_symbol"], "VODl_EQ")
+        self.assertEqual(captured["bars_by_symbol"]["VOD"]["quote_currency"], "GBX")
+
+    def test_trading212_positions_api_skips_without_seed_positions(self) -> None:
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+            config=SimpleNamespace(
+                trading212_paper_market_data_provider="positions_api",
+                trading212_paper_equity_symbols=("VOD",),
+            ),
+            usage_ledger=SimpleNamespace(record_latest_bars=lambda **_kwargs: 0),
+            state={
+                "market_gate": {
+                    "broker_equity_markets": {
+                        "trading212_paper": {"equity_scan_ready": True}
+                    }
+                },
+                "fx_gbp_reference": {"usd_to_gbp": 0.8},
+                "trading212_paper_positions": {"raw": []},
+            },
+        )
+
+        result = pipelines.trading212_latest_bars(context)
+
+        self.assertEqual(result["mode"], "skipped")
+        self.assertEqual(
+            result["reason"],
+            "trading212_no_held_positions_with_current_price",
+        )
+
+    def test_trading212_price_seed_positions_do_not_consume_strategy_slots(self) -> None:
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+            config=SimpleNamespace(
+                trading212_paper_price_seed_symbols=("VOD", "SHEL"),
+                trading212_paper_equity_symbols=("VOD", "SHEL"),
+            ),
+            usage_ledger=SimpleNamespace(),
+            state={
+                "trading212_paper_positions": {
+                    "summary": {"open_positions": 1, "symbols": ["VOD"]},
+                    "raw": [
+                        {
+                            "quantity": 0.01,
+                            "currentPrice": 72.5,
+                            "instrument": {"ticker": "VODl_EQ"},
+                        }
+                    ],
+                },
+            },
+        )
+
+        position_state = pipelines._paper_lane_position_state(
+            context,
+            "trading212_paper",
+            recent_orders=[],
+        )
+
+        self.assertEqual(position_state["open_positions"], 0)
+        self.assertEqual(position_state["price_seed_positions"], 1)
+        self.assertEqual(position_state["symbols"], set())
+        self.assertEqual(position_state["price_seed_symbols"], {"VOD"})
+
+    def test_trading212_managed_buy_revokes_price_seed_exemption(self) -> None:
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+            config=SimpleNamespace(
+                trading212_paper_price_seed_symbols=("VOD",),
+                trading212_paper_equity_symbols=("VOD",),
+            ),
+            usage_ledger=SimpleNamespace(),
+            state={
+                "trading212_paper_positions": {
+                    "summary": {"open_positions": 1, "symbols": ["VOD"]},
+                    "raw": [
+                        {
+                            "quantity": 13.9,
+                            "currentPrice": 72.5,
+                            "instrument": {"ticker": "VODl_EQ"},
+                        }
+                    ],
+                },
+            },
+        )
+        managed_orders = [
+            {
+                "broker_id": "trading212_paper",
+                "symbol": "VOD",
+                "side": "buy",
+                "filled_qty": "13.888888",
+                "raw_json": {"planned_stop_loss_price": 70.0},
+            }
+        ]
+
+        position_state = pipelines._paper_lane_position_state(
+            context,
+            "trading212_paper",
+            recent_orders=managed_orders,
+        )
+
+        self.assertEqual(position_state["open_positions"], 1)
+        self.assertEqual(position_state["price_seed_positions"], 0)
+        self.assertEqual(position_state["symbols"], {"VOD"})
+
+    def test_paper_exit_management_skips_trading212_price_seed_positions(self) -> None:
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
+            config=SimpleNamespace(
+                paper_execution_equity_broker_id="alpaca_paper",
+                paper_execution_crypto_broker_id="alpaca_paper",
+                trading212_paper_api_configured=True,
+                trading212_paper_execution_enabled=True,
+                trading212_paper_price_seed_symbols=("VOD",),
+                trading212_paper_equity_symbols=("VOD",),
+            ),
+            usage_ledger=SimpleNamespace(
+                list_recent_execution_lane_trade_orders=lambda **_kwargs: [],
+            ),
+            state={
+                "alpaca_positions": {"raw": []},
+                "trading212_paper_positions": {
+                    "raw": [
+                        {
+                            "broker_id": "trading212_paper",
+                            "quantity": 0.01,
+                            "instrument": {"ticker": "VODl_EQ"},
+                        }
+                    ]
+                },
+                "alpaca_orders": {"raw": []},
+                "trading212_paper_orders": {"raw": []},
+            },
+        )
+        original = pipelines.ExecutionRouter
+
+        class FailRouter:
+            def route_order_request(self, **_kwargs):
+                raise AssertionError("seed positions should not route exits")
+
+            def route_cancel_order(self, **_kwargs):
+                raise AssertionError("seed positions should not cancel exits")
+
+        pipelines.ExecutionRouter = lambda: FailRouter()
+        try:
+            result = pipelines.paper_exit_management(context)
+        finally:
+            pipelines.ExecutionRouter = original
+
+        self.assertEqual(result["mode"], "monitoring")
+        self.assertEqual(result["exit_orders_submitted"], 0)
+        self.assertEqual(result["skip_reason"], "price_seed_position")
+        self.assertEqual(
+            context.state["paper_exit_management"]["skipped"][0]["broker_id"],
+            "trading212_paper",
+        )
 
     def test_live_dry_stale_reaper_records_cancel_intent(self) -> None:
         started_at = datetime.now().astimezone()

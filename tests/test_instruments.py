@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from app.core.instruments import default_instrument_registry
-from app.core.instruments import instrument_ref_from_metadata
+from app.framework.core.instruments import default_instrument_registry
+from app.framework.core.instruments import instrument_ref_from_metadata
 
 
 class InstrumentRegistryTests(unittest.TestCase):

@@ -1,5 +1,5 @@
-# Project Centaur Current State — Compact
-Last compacted: 2026-05-31
+# Project Centaur Current State
+Last compacted: 2026-06-02
 
 ## Runtime
 - `ModeContext` centralises runtime/environment permission checks.
@@ -13,11 +13,9 @@ Last compacted: 2026-05-31
 - Live-dry intents are persisted in `execution_router_intents` and surfaced in evidence reporting.
 
 ## Adapters / Instruments
-- Active execution adapters: `alpaca_paper`, `alpaca_live`.
-- IG and future vendors fail closed until implemented and approved.
-- Alpaca market-data adapter boundary exists.
-- Canonical instrument registry exists with `InstrumentRef` and venue mappings such as `ALPACA:BTC/USD`, `BINANCE:BTCUSDT`, `COINBASE:BTC-USD` mapping to canonical IDs.
-- Broker orders, shadow proposals/outcomes, latest bars, historical bars, discovery candidates, and strategy signals carry derivable instrument metadata.
+- Execution adapter lookup resolves `alpaca_paper`, `alpaca_live`, `trading212_paper`, and disabled `trading212_live`.
+- Alpaca Live is same-as-paper only; Trading 212 Paper is paper/equity-only; Trading 212 Live and IG/future vendors fail closed for mutation until approved.
+- Canonical instrument registry persists `InstrumentRef`, canonical IDs, venue, and venue symbols across broker orders and evidence where derivable.
 
 ## Storage / Config
 - PostgreSQL row-level provenance is active.
@@ -27,9 +25,9 @@ Last compacted: 2026-05-31
 - Runtime configuration is `.env` only, grouped into core, paper, and live sections. Mirrored live execution levers match paper by default; named live differences must be listed in `LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES` or config load fails closed while live is armed.
 
 ## App Architecture
-- Target `app/` package exists for `core`, `engine`, `adapters`, `runtime`, `storage`, `reporting`, and `strategies`.
-- First implementation ownership moved into `app/` for runtime mode context, live guard, execution router, execution adapters, market-data adapters, instruments, and storage layout.
-- `app/` is now the only active package; the old `centaur/` package has been removed.
+- `app/` is the only active package; old `centaur/` has been removed.
+- Heartbeat orchestration lives in `app/heartbeat/` with a typed LangGraph/Pydantic graph and step folders that mirror generated Mermaid order.
+- Compatibility imports route through `app/framework/engine/control_graph.py`.
 
 ## Operations
 - Launchd runs on `/Volumes/Bob/www/ghostfrog-centaur` using `.venv-mac`.
