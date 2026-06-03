@@ -264,7 +264,7 @@ def load_runtime_config() -> RuntimeConfig:
     database_url, database_url_source = _resolve_database_url()
     centaur_mode = _resolve_centaur_mode()
     centaur_environment = _resolve_centaur_environment()
-    paper_crypto_momentum_stop_loss_pct = _parse_float(
+    paper_crypto_momentum_stop_loss_pct = _parse_percent_control(
         os.getenv("PAPER_CRYPTO_MOMENTUM_STOP_LOSS_PCT")
         or os.getenv("CRYPTO_MOMENTUM_STOP_LOSS_PCT"),
         default=0.01,
@@ -309,7 +309,7 @@ def load_runtime_config() -> RuntimeConfig:
         or os.getenv("CRYPTO_MOMENTUM_MAX_SPREAD_PCT"),
         default=0.25,
     )
-    live_crypto_momentum_stop_loss_pct = _parse_float(
+    live_crypto_momentum_stop_loss_pct = _parse_percent_control(
         os.getenv("LIVE_CRYPTO_MOMENTUM_STOP_LOSS_PCT"),
         default=paper_crypto_momentum_stop_loss_pct,
     )
@@ -550,7 +550,7 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("SHADOW_MIN_OPPORTUNITY_SCORE"),
             default=55.0,
         ),
-        shadow_stop_loss_pct=_parse_float(
+        shadow_stop_loss_pct=_parse_percent_control(
             os.getenv("SHADOW_STOP_LOSS_PCT"),
             default=0.02,
         ),
@@ -742,15 +742,15 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("PAPER_EXECUTION_STALE_ORDER_MINUTES"),
             default=5,
         ),
-        paper_execution_min_projected_gain_pct=_parse_float(
+        paper_execution_min_projected_gain_pct=_parse_percent_control(
             os.getenv("PAPER_EXECUTION_MIN_PROJECTED_GAIN_PCT"),
             default=0.015,
         ),
-        paper_execution_crypto_min_projected_gain_pct=_parse_float(
+        paper_execution_crypto_min_projected_gain_pct=_parse_percent_control(
             os.getenv("PAPER_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"),
             default=0.02,
         ),
-        paper_execution_profit_capture_pct=_parse_float(
+        paper_execution_profit_capture_pct=_parse_percent_control(
             os.getenv("PAPER_EXECUTION_PROFIT_CAPTURE_PCT"),
             default=0.0,
         ),
@@ -793,7 +793,7 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_USD"),
             default=2.0,
         ),
-        trailing_drawdown_observer_paper_giveback_pct=_parse_float(
+        trailing_drawdown_observer_paper_giveback_pct=_parse_percent_control(
             os.getenv("TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_PCT"),
             default=0.0,
         ),
@@ -801,7 +801,7 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_USD"),
             default=2.0,
         ),
-        trailing_drawdown_observer_live_giveback_pct=_parse_float(
+        trailing_drawdown_observer_live_giveback_pct=_parse_percent_control(
             os.getenv("TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_PCT"),
             default=0.0,
         ),
@@ -855,15 +855,15 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("LIVE_EXECUTION_STALE_ORDER_MINUTES"),
             default=5,
         ),
-        live_execution_min_projected_gain_pct=_parse_float(
+        live_execution_min_projected_gain_pct=_parse_percent_control(
             os.getenv("LIVE_EXECUTION_MIN_PROJECTED_GAIN_PCT"),
             default=0.015,
         ),
-        live_execution_crypto_min_projected_gain_pct=_parse_float(
+        live_execution_crypto_min_projected_gain_pct=_parse_percent_control(
             os.getenv("LIVE_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"),
             default=0.02,
         ),
-        live_execution_profit_capture_pct=_parse_float(
+        live_execution_profit_capture_pct=_parse_percent_control(
             os.getenv("LIVE_EXECUTION_PROFIT_CAPTURE_PCT"),
             default=0.0125,
         ),
@@ -1458,6 +1458,23 @@ def _parse_float(value: str | None, *, default: float) -> float:
     if value is None or not value.strip():
         return default
     return float(value)
+
+
+def _parse_percent_control(value: str | None, *, default: float) -> float:
+    """Parse operator percent controls.
+
+    Preferred input is human percent notation: `0.5` means 0.5%, `1` means 1%,
+    and `1.2` means 1.2%. Legacy decimal-ratio values below 0.1 are accepted so
+    existing `.env` files keep their current risk behaviour until rewritten.
+    """
+    if value is None or not value.strip():
+        return default
+    parsed = float(value)
+    if parsed < 0:
+        raise ValueError("percent controls must be non-negative")
+    if 0 < parsed < 0.1:
+        return parsed
+    return parsed / 100.0
 
 
 def _is_real_value(value: str) -> bool:

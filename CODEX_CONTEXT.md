@@ -33,7 +33,8 @@ Centaur is an auditable trading research and micro paper/live follower system. P
 - Projected-gain floors: equities `1.5%`, crypto `2.0%`.
 - Buffers: equities `5` bps `DAY` limits; crypto `25` bps `IOC` limits.
 - Crypto momentum: `1.0%` stop; require instrument identity, reject spikes above `2.5%`, notional candidate volume below `£50,000` where derivable, and spread above `0.25%` when spread evidence exists.
-- Managed exits: capture at `1.25%`; profit ladder evidence at `1.25,2,3,4,6%`.
+- Managed exits: profit capture uses the current runtime config (`PAPER_EXECUTION_PROFIT_CAPTURE_PCT` / `LIVE_EXECUTION_PROFIT_CAPTURE_PCT`) at exit-decision time, not the value stored on the entry order; profit ladder evidence remains at `1.25,2,3,4,6%` unless reconfigured.
+- Operator-facing ratio controls for profit capture, stop loss, projected-gain floors, and trailing giveback use percent notation in `.env`: `0.5` means `0.5%`, `1` means `1%`, `2` means `2%`; legacy decimal ratio values below `0.1` are still parsed as-is. Movement, spread, and ladder `PCT` fields are already percent-point values.
 - Same-symbol managed exits must use the most protective still-open entry stop.
 - Alpaca Live follower entries fail closed while any existing live position lacks a persisted managed-exit entry plan.
 - Max-hold is a hard backstop: no red deferral after the configured max hold.

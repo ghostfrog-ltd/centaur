@@ -2085,14 +2085,12 @@ def _build_exit_order_request(
             strategy_id=strategy_id,
             proposal=proposal_plan,
         )
-    profit_capture_pct = _as_float(
-        raw.get(
-            "planned_profit_capture_pct",
-            proposal_raw.get(
-                "profit_capture_pct",
-                getattr(context.config, "paper_execution_profit_capture_pct", 0.0),
-            ),
-        )
+    broker_id = str(
+        entry_order.get("broker_id") or position.get("broker_id") or "alpaca_paper"
+    ).strip().lower() or "alpaca_paper"
+    profit_capture_pct = _current_profit_capture_pct(
+        context=context,
+        broker_id=broker_id,
     )
     entry_submitted_at = _coerce_datetime(
         entry_order.get("submitted_at") or entry_order.get("captured_at")
@@ -2207,9 +2205,6 @@ def _build_exit_order_request(
         symbol=symbol,
         strategy_id=f"{strategy_id or 'paper'}exit",
     )
-    broker_id = str(
-        entry_order.get("broker_id") or position.get("broker_id") or "alpaca_paper"
-    ).strip().lower() or "alpaca_paper"
     try:
         adapter = get_execution_adapter(context, broker_id)
         order_request = adapter.build_exit_order_request(
@@ -2254,6 +2249,13 @@ def _build_exit_order_request(
         },
         None,
     )
+
+def _current_profit_capture_pct(*, context: TickContext, broker_id: str) -> float | None:
+    """Return the current config knob for profit capture, not stored order history."""
+    normalized_broker = str(broker_id or "").strip().lower()
+    if normalized_broker == "alpaca_live":
+        return _as_float(getattr(context.config, "live_execution_profit_capture_pct", None))
+    return _as_float(getattr(context.config, "paper_execution_profit_capture_pct", None))
 
 def _lookup_entry_proposal_plan(
     *,

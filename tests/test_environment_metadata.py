@@ -426,6 +426,86 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(config.centaur_mode, "live_dry")
         self.assertEqual(config.centaur_environment, "live")
 
+    def test_profit_capture_controls_accept_percent_numbers(self) -> None:
+        os.environ["PAPER_EXECUTION_PROFIT_CAPTURE_PCT"] = "0.5"
+        os.environ["LIVE_EXECUTION_PROFIT_CAPTURE_PCT"] = "1.2"
+        os.environ[
+            "LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES"
+        ] = "execution_profit_capture_pct"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_execution_profit_capture_pct, 0.005)
+        self.assertEqual(config.live_execution_profit_capture_pct, 0.012)
+
+    def test_profit_capture_controls_keep_legacy_decimal_values(self) -> None:
+        os.environ["PAPER_EXECUTION_PROFIT_CAPTURE_PCT"] = "0.005"
+        os.environ["LIVE_EXECUTION_PROFIT_CAPTURE_PCT"] = "0.005"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_execution_profit_capture_pct, 0.005)
+        self.assertEqual(config.live_execution_profit_capture_pct, 0.005)
+
+    def test_stop_loss_controls_accept_percent_numbers(self) -> None:
+        os.environ["SHADOW_STOP_LOSS_PCT"] = "2"
+        os.environ["PAPER_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "1"
+        os.environ["LIVE_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "1.5"
+        os.environ[
+            "LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES"
+        ] = "crypto_momentum_stop_loss_pct"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.shadow_stop_loss_pct, 0.02)
+        self.assertEqual(config.paper_crypto_momentum_stop_loss_pct, 0.01)
+        self.assertEqual(config.live_crypto_momentum_stop_loss_pct, 0.015)
+
+    def test_stop_loss_controls_keep_legacy_decimal_values(self) -> None:
+        os.environ["SHADOW_STOP_LOSS_PCT"] = "0.02"
+        os.environ["PAPER_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "0.01"
+        os.environ["LIVE_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "0.01"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.shadow_stop_loss_pct, 0.02)
+        self.assertEqual(config.paper_crypto_momentum_stop_loss_pct, 0.01)
+        self.assertEqual(config.live_crypto_momentum_stop_loss_pct, 0.01)
+
+    def test_execution_ratio_controls_accept_percent_numbers(self) -> None:
+        os.environ["PAPER_EXECUTION_MIN_PROJECTED_GAIN_PCT"] = "1.5"
+        os.environ["PAPER_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"] = "2"
+        os.environ["LIVE_EXECUTION_MIN_PROJECTED_GAIN_PCT"] = "1.5"
+        os.environ["LIVE_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"] = "2"
+        os.environ["TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_PCT"] = "0.75"
+        os.environ["TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_PCT"] = "0.75"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_execution_min_projected_gain_pct, 0.015)
+        self.assertEqual(config.paper_execution_crypto_min_projected_gain_pct, 0.02)
+        self.assertEqual(config.live_execution_min_projected_gain_pct, 0.015)
+        self.assertEqual(config.live_execution_crypto_min_projected_gain_pct, 0.02)
+        self.assertEqual(config.trailing_drawdown_observer_paper_giveback_pct, 0.0075)
+        self.assertEqual(config.trailing_drawdown_observer_live_giveback_pct, 0.0075)
+
+    def test_execution_ratio_controls_keep_legacy_decimal_values(self) -> None:
+        os.environ["PAPER_EXECUTION_MIN_PROJECTED_GAIN_PCT"] = "0.015"
+        os.environ["PAPER_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"] = "0.02"
+        os.environ["LIVE_EXECUTION_MIN_PROJECTED_GAIN_PCT"] = "0.015"
+        os.environ["LIVE_EXECUTION_CRYPTO_MIN_PROJECTED_GAIN_PCT"] = "0.02"
+        os.environ["TRAILING_DRAWDOWN_OBSERVER_PAPER_GIVEBACK_PCT"] = "0.0075"
+        os.environ["TRAILING_DRAWDOWN_OBSERVER_LIVE_GIVEBACK_PCT"] = "0.0075"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_execution_min_projected_gain_pct, 0.015)
+        self.assertEqual(config.paper_execution_crypto_min_projected_gain_pct, 0.02)
+        self.assertEqual(config.live_execution_min_projected_gain_pct, 0.015)
+        self.assertEqual(config.live_execution_crypto_min_projected_gain_pct, 0.02)
+        self.assertEqual(config.trailing_drawdown_observer_paper_giveback_pct, 0.0075)
+        self.assertEqual(config.trailing_drawdown_observer_live_giveback_pct, 0.0075)
+
     def test_postgres_schema_is_normalized_from_environment(self) -> None:
         os.environ["POSTGRES_SCHEMA"] = "Live Ops-2026!"
 

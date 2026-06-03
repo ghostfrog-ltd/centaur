@@ -1337,8 +1337,8 @@ class StatusReporter:
                         if raw_entry.get("planned_take_profit_price") is not None
                         else (entry_order or {}).get("take_profit_price")
                     ),
-                    "profit_capture_pct": self._to_float(
-                        raw_entry.get("planned_profit_capture_pct")
+                    "profit_capture_pct": self._current_profit_capture_pct_for_position(
+                        position=position,
                     ),
                     "holding_window_code": str(
                         raw_entry.get("planned_holding_window_code")
@@ -2901,6 +2901,16 @@ class StatusReporter:
         if numeric is None:
             return None
         return round(numeric * 100.0, 4)
+
+    def _current_profit_capture_pct_for_position(
+        self,
+        *,
+        position: dict[str, Any],
+    ) -> float | None:
+        broker_id = str(position.get("broker_id") or "alpaca_paper").strip().lower()
+        if broker_id == "alpaca_live":
+            return self._to_float(getattr(self.config, "live_execution_profit_capture_pct", None))
+        return self._to_float(getattr(self.config, "paper_execution_profit_capture_pct", None))
 
     def _fmt_number(self, value: Any, *, decimals: int) -> str:
         numeric = self._to_float(value)

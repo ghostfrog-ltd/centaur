@@ -94,24 +94,17 @@ def run_implementation(context: TickContext) -> PipelineResult:
         )
         if entry_order is None:
             latest_bar = latest_bars.get(symbol) or latest_bars.get(symbol_key)
-            if (
-                latest_bar is not None
-                and _equity_flatten_due(
-                    context.config,
-                    asset_class="equity",
-                    as_of=context.started_at,
-                    next_close=context.state.get("market_gate", {}).get("next_close"),
+            if latest_bar is not None:
+                unmanaged_entry_order = _build_unmanaged_equity_flatten_entry_order(
+                    position=position,
+                    broker_id=broker_id,
+                    symbol=symbol,
                 )
-            ):
                 exit_request, skip_reason = _build_exit_order_request(
                     context=context,
                     tick_id=context.tick_id,
                     position=position,
-                    entry_order=_build_unmanaged_equity_flatten_entry_order(
-                        position=position,
-                        broker_id=broker_id,
-                        symbol=symbol,
-                    ),
+                    entry_order=unmanaged_entry_order,
                     latest_bar=latest_bar,
                     bar_history=[],
                     as_of=context.started_at,
@@ -122,15 +115,24 @@ def run_implementation(context: TickContext) -> PipelineResult:
                 )
                 if exit_request is not None:
                     exit_request["unmanaged_flatten"] = True
+                    exit_request["missing_entry_plan"] = True
+                    if exit_request.get("exit_reason") == "profit_capture_hit":
+                        exit_request["exit_reason"] = "settings_profit_capture"
                     exit_requests.append(exit_request)
                     continue
-                skipped.append(
-                    {
-                        "symbol": symbol,
-                        "reason": skip_reason or "unmanaged_flatten_failed",
-                    }
-                )
-                continue
+                if _equity_flatten_due(
+                    context.config,
+                    asset_class="equity",
+                    as_of=context.started_at,
+                    next_close=context.state.get("market_gate", {}).get("next_close"),
+                ):
+                    skipped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": skip_reason or "unmanaged_flatten_failed",
+                        }
+                    )
+                    continue
             skipped.append({"symbol": symbol, "reason": "missing_entry_plan"})
             continue
 

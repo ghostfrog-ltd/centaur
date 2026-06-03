@@ -207,3 +207,4 @@ Queued improvements:
 - continue larger replay coverage for newer strategies, especially `momentum.volatility_breakout`, under the friction-adjusted scoring model
 - add a post-mortem path that distinguishes strategy loss from execution/friction loss on protection-trigger days
 - add broker-aware account history views and dashboard toggles before IG execution is ever activated
+- By explicit human override on 2026-06-03, profit-capture exits now use the current runtime config at exit-decision time. Changing `PAPER_EXECUTION_PROFIT_CAPTURE_PCT` or `LIVE_EXECUTION_PROFIT_CAPTURE_PCT` changes the active threshold for existing positions on the next exit check; broker positions above the setting can be sold with exit reason `settings_profit_capture`.

@@ -37,7 +37,8 @@
 - Crypto momentum: `1.0%` stop; require instrument identity; reject movement > `2.5%`, notional candidate volume < `£50,000` where derivable, and spread > `0.25%` when known.
 - Buffers/orders: equity `5` bps `DAY` limits; crypto `25` bps `IOC` limits.
 - Stale unfilled equity entries: reap after `5` minutes.
-- Managed exits: capture at `1.25%`; ladder evidence `1.25,2,3,4,6%`.
+- Managed exits: profit capture uses the current runtime config (`PAPER_EXECUTION_PROFIT_CAPTURE_PCT` / `LIVE_EXECUTION_PROFIT_CAPTURE_PCT`) at exit-decision time, not stale entry-order metadata; ladder evidence `1.25,2,3,4,6%`.
+- Operator-facing ratio controls for profit capture, stop loss, projected-gain floors, and trailing giveback use percent notation in `.env`: `0.5` means `0.5%`, `1` means `1%`, `2` means `2%`; legacy decimal ratio values below `0.1` are still parsed as-is. Movement, spread, and ladder `PCT` fields are already percent-point values.
 - Same-symbol managed exits must use the most protective still-open entry stop.
 - New Alpaca Live follower entries are blocked while any existing live position lacks a persisted managed-exit entry plan.
 - Max-hold is a hard backstop: no red deferral after the configured max hold.
