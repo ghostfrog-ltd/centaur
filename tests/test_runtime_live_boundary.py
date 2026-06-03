@@ -281,6 +281,59 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
             result["broker_equity_markets"]["trading212_paper"]["equity_scan_ready"]
         )
 
+    def test_daily_protection_uses_broker_last_equity_baseline(self) -> None:
+        class FakeUsageLedger:
+            def get_daily_protection_state(self, *, session_date):
+                return {
+                    "session_date": session_date,
+                    "baseline_equity": 100009.91,
+                    "system_status": "active",
+                }
+
+            def upsert_daily_protection_state(self, **kwargs):
+                baseline = max(
+                    float(kwargs["baseline_equity"]),
+                    float(kwargs["current_equity"]),
+                )
+                drawdown = max(0.0, baseline - float(kwargs["current_equity"]))
+                return {
+                    "session_date": kwargs["session_date"],
+                    "market_open_at": kwargs["market_open_at"],
+                    "baseline_equity": baseline,
+                    "latest_equity": kwargs["current_equity"],
+                    "equity_drawdown_usd": drawdown,
+                    "max_daily_drawdown_usd": kwargs["max_daily_drawdown_usd"],
+                    "system_status": kwargs["system_status"],
+                    "stale_orders_reaped_count": 0,
+                }
+
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 3, 15, 57, tzinfo=ZoneInfo("America/New_York")),
+            config=SimpleNamespace(
+                market_timezone="America/New_York",
+                paper_execution_max_daily_drawdown_usd=2.0,
+            ),
+            usage_ledger=FakeUsageLedger(),
+            state={
+                "alpaca_account": {
+                    "summary": {
+                        "equity": "100008.50",
+                    },
+                    "raw": {
+                        "last_equity": "100011.80",
+                    }
+                }
+            },
+        )
+
+        result = pipelines.daily_protection(context)
+
+        self.assertEqual(result["system_status"], "protected")
+        self.assertTrue(result["entries_blocked"])
+        self.assertEqual(result["baseline_equity"], 100011.80)
+        self.assertAlmostEqual(result["equity_drawdown_usd"], 3.30)
+
     def test_trading212_approval_uses_own_market_window(self) -> None:
         class FakeExecutionAdapter:
             def validate_entry_constraints(self, **_kwargs):
@@ -562,6 +615,194 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
             context.state["paper_exit_management"]["orders"][0]["unmanaged_flatten"]
         )
 
+    def test_paper_exit_management_flattens_managed_equity_without_latest_bar_near_close(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeRouter:
+            def route_order_request(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    submitted=True,
+                    order={
+                        "id": "exit-1",
+                        "symbol": kwargs["order_request"]["symbol"],
+                        "side": "sell",
+                        "status": "new",
+                    },
+                    error=None,
+                )
+
+            def route_cancel_order(self, **_kwargs):
+                raise AssertionError("no open exit should be refreshed")
+
+        started_at = datetime(2026, 6, 2, 15, 50, tzinfo=ZoneInfo("America/New_York"))
+        entry_order = {
+            "order_id": "entry-1",
+            "broker_id": "alpaca_paper",
+            "symbol": "AMZN",
+            "side": "buy",
+            "status": "filled",
+            "qty": "0.04",
+            "filled_qty": "0.04",
+            "asset_class": "equity",
+            "strategy_id": "mean_reversion.snapback",
+            "submitted_at": started_at - timedelta(hours=1),
+            "filled_avg_price": 100.0,
+            "raw_json": {
+                "planned_stop_loss_price": 95.0,
+                "planned_take_profit_price": 110.0,
+                "planned_managed_exit_policy": "profit_after_1h_else_1d",
+                "planned_profit_exit_window_minutes": 60,
+                "planned_max_hold_window_minutes": 1440,
+            },
+        }
+        context = TickContext(
+            tick_id="test",
+            started_at=started_at,
+            config=SimpleNamespace(
+                market_timezone="America/New_York",
+                paper_execution_equity_broker_id="alpaca_paper",
+                paper_execution_crypto_broker_id="alpaca_paper",
+                trading212_paper_api_configured=False,
+                trading212_paper_execution_enabled=False,
+                paper_execution_equity_no_weekend_carry_enabled=True,
+                paper_execution_equity_friday_flatten_minutes_before_close=15,
+                paper_execution_profit_capture_pct=0.0125,
+                paper_execution_limit_buffer_bps=5.0,
+            ),
+            usage_ledger=SimpleNamespace(
+                list_recent_execution_lane_trade_orders=lambda **_kwargs: [entry_order],
+                get_market_bars_for_window=lambda **_kwargs: [],
+                record_paper_trade_orders=lambda **kwargs: len(kwargs["orders"]),
+            ),
+            state={
+                "market_gate": {"next_close": "2026-06-02T16:00:00-04:00"},
+                "fx_gbp_reference": {},
+                "alpaca_positions": {
+                    "raw": [
+                        {
+                            "broker_id": "alpaca_paper",
+                            "symbol": "AMZN",
+                            "qty": "0.04",
+                            "current_price": "99.0",
+                            "avg_entry_price": "100.0",
+                        }
+                    ]
+                },
+                "alpaca_orders": {"raw": []},
+                "market_data_latest_bars": {"raw": {}},
+                "crypto_data_latest_bars": {"raw": {}},
+            },
+        )
+        original = pipelines.ExecutionRouter
+        pipelines.ExecutionRouter = lambda: FakeRouter()
+        try:
+            result = pipelines.paper_exit_management(context)
+        finally:
+            pipelines.ExecutionRouter = original
+
+        self.assertEqual(result["mode"], "managed_exits")
+        self.assertEqual(result["exit_orders_submitted"], 1)
+        self.assertEqual(captured["action"], "exit")
+        self.assertEqual(
+            context.state["paper_exit_management"]["orders"][0]["exit_reason"],
+            "equity_no_overnight_carry",
+        )
+
+    def test_paper_exit_management_keeps_flattening_after_close_when_window_was_missed(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeRouter:
+            def route_order_request(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    submitted=True,
+                    order={
+                        "id": "exit-1",
+                        "symbol": kwargs["order_request"]["symbol"],
+                        "side": "sell",
+                        "status": "new",
+                    },
+                    error=None,
+                )
+
+            def route_cancel_order(self, **_kwargs):
+                raise AssertionError("no open exit should be refreshed")
+
+        started_at = datetime(2026, 6, 2, 16, 34, tzinfo=ZoneInfo("America/New_York"))
+        entry_order = {
+            "order_id": "entry-1",
+            "broker_id": "alpaca_paper",
+            "symbol": "AMZN",
+            "side": "buy",
+            "status": "filled",
+            "qty": "0.04",
+            "filled_qty": "0.04",
+            "asset_class": "equity",
+            "strategy_id": "mean_reversion.snapback",
+            "submitted_at": started_at - timedelta(hours=2),
+            "filled_avg_price": 100.0,
+            "raw_json": {
+                "planned_stop_loss_price": 95.0,
+                "planned_take_profit_price": 110.0,
+                "planned_managed_exit_policy": "profit_after_1h_else_1d",
+                "planned_profit_exit_window_minutes": 60,
+                "planned_max_hold_window_minutes": 1440,
+            },
+        }
+        context = TickContext(
+            tick_id="test",
+            started_at=started_at,
+            config=SimpleNamespace(
+                market_timezone="America/New_York",
+                paper_execution_equity_broker_id="alpaca_paper",
+                paper_execution_crypto_broker_id="alpaca_paper",
+                trading212_paper_api_configured=False,
+                trading212_paper_execution_enabled=False,
+                paper_execution_equity_no_weekend_carry_enabled=True,
+                paper_execution_equity_friday_flatten_minutes_before_close=15,
+                paper_execution_profit_capture_pct=0.0125,
+                paper_execution_limit_buffer_bps=5.0,
+            ),
+            usage_ledger=SimpleNamespace(
+                list_recent_execution_lane_trade_orders=lambda **_kwargs: [entry_order],
+                get_market_bars_for_window=lambda **_kwargs: [],
+                record_paper_trade_orders=lambda **kwargs: len(kwargs["orders"]),
+            ),
+            state={
+                "market_gate": {"next_close": "2026-06-03T16:00:00-04:00"},
+                "fx_gbp_reference": {},
+                "alpaca_positions": {
+                    "raw": [
+                        {
+                            "broker_id": "alpaca_paper",
+                            "symbol": "AMZN",
+                            "qty": "0.04",
+                            "current_price": "99.0",
+                            "avg_entry_price": "100.0",
+                        }
+                    ]
+                },
+                "alpaca_orders": {"raw": []},
+                "market_data_latest_bars": {"raw": {}},
+                "crypto_data_latest_bars": {"raw": {}},
+            },
+        )
+        original = pipelines.ExecutionRouter
+        pipelines.ExecutionRouter = lambda: FakeRouter()
+        try:
+            result = pipelines.paper_exit_management(context)
+        finally:
+            pipelines.ExecutionRouter = original
+
+        self.assertEqual(result["mode"], "managed_exits")
+        self.assertEqual(result["exit_orders_submitted"], 1)
+        self.assertEqual(captured["action"], "exit")
+        self.assertEqual(
+            context.state["paper_exit_management"]["orders"][0]["exit_reason"],
+            "equity_no_overnight_carry",
+        )
+
     def test_missing_plan_paper_position_uses_current_profit_capture(self) -> None:
         captured: dict[str, object] = {}
 
@@ -786,6 +1027,130 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
         self.assertEqual(exit_request["exit_reason"], "profit_capture_hit")
         self.assertEqual(exit_request["planned_profit_capture_pct"], 0.005)
         self.assertEqual(exit_request["planned_profit_capture_price"], 100.5)
+
+    def test_current_profit_capture_overrides_stale_entry_target(self) -> None:
+        class FakeExecutionAdapter:
+            def build_exit_order_request(self, **_kwargs):
+                raise AssertionError("stale take-profit metadata should not build a sell")
+
+        started_at = datetime(2026, 6, 2, 12, 10, tzinfo=ZoneInfo("America/New_York"))
+        context = TickContext(
+            tick_id="test",
+            started_at=started_at,
+            config=SimpleNamespace(
+                market_timezone="America/New_York",
+                paper_execution_equity_no_weekend_carry_enabled=True,
+                paper_execution_profit_capture_pct=0.016,
+            ),
+            usage_ledger=SimpleNamespace(),
+            state={
+                "market_gate": {"next_close": "2026-06-02T16:00:00-04:00"},
+                "fx_gbp_reference": {},
+            },
+        )
+        original = heartbeat_support.get_execution_adapter
+        heartbeat_support.get_execution_adapter = lambda _context, _broker_id: FakeExecutionAdapter()
+        try:
+            exit_request, skip_reason = heartbeat_support._build_exit_order_request(
+                context=context,
+                tick_id="test",
+                position={"symbol": "MRVL", "qty": "0.1", "current_price": "101.3"},
+                entry_order={
+                    "order_id": "entry-1",
+                    "broker_id": "alpaca_paper",
+                    "symbol": "MRVL",
+                    "asset_class": "equity",
+                    "strategy_id": "mean_reversion.snapback",
+                    "submitted_at": started_at - timedelta(minutes=10),
+                    "filled_avg_price": 100.0,
+                    "raw_json": {
+                        "planned_stop_loss_price": 95.0,
+                        "planned_take_profit_price": 101.25,
+                        "planned_managed_exit_policy": "profit_after_1h_else_1d",
+                        "planned_profit_exit_window_minutes": 60,
+                        "planned_max_hold_window_minutes": 1440,
+                    },
+                },
+                latest_bar={
+                    "t": started_at.isoformat(),
+                    "l": 100.8,
+                    "h": 101.3,
+                    "c": 101.2,
+                },
+                bar_history=[],
+                as_of=started_at,
+                limit_buffer_bps=5.0,
+            )
+        finally:
+            heartbeat_support.get_execution_adapter = original
+
+        self.assertIsNone(exit_request)
+        self.assertEqual(skip_reason, "exit_not_due")
+
+    def test_entry_target_is_legacy_fallback_when_profit_capture_disabled(self) -> None:
+        class FakeExecutionAdapter:
+            def build_exit_order_request(self, **kwargs):
+                return {
+                    "symbol": kwargs["symbol"],
+                    "side": "sell",
+                    "qty": kwargs["qty"],
+                    "client_order_id": kwargs["client_order_id"],
+                }
+
+        started_at = datetime(2026, 6, 2, 12, 10, tzinfo=ZoneInfo("America/New_York"))
+        context = TickContext(
+            tick_id="test",
+            started_at=started_at,
+            config=SimpleNamespace(
+                market_timezone="America/New_York",
+                paper_execution_equity_no_weekend_carry_enabled=True,
+                paper_execution_profit_capture_pct=0.0,
+            ),
+            usage_ledger=SimpleNamespace(),
+            state={
+                "market_gate": {"next_close": "2026-06-02T16:00:00-04:00"},
+                "fx_gbp_reference": {},
+            },
+        )
+        original = heartbeat_support.get_execution_adapter
+        heartbeat_support.get_execution_adapter = lambda _context, _broker_id: FakeExecutionAdapter()
+        try:
+            exit_request, skip_reason = heartbeat_support._build_exit_order_request(
+                context=context,
+                tick_id="test",
+                position={"symbol": "MRVL", "qty": "0.1", "current_price": "101.3"},
+                entry_order={
+                    "order_id": "entry-1",
+                    "broker_id": "alpaca_paper",
+                    "symbol": "MRVL",
+                    "asset_class": "equity",
+                    "strategy_id": "mean_reversion.snapback",
+                    "submitted_at": started_at - timedelta(minutes=10),
+                    "filled_avg_price": 100.0,
+                    "raw_json": {
+                        "planned_stop_loss_price": 95.0,
+                        "planned_take_profit_price": 101.25,
+                        "planned_managed_exit_policy": "profit_after_1h_else_1d",
+                        "planned_profit_exit_window_minutes": 60,
+                        "planned_max_hold_window_minutes": 1440,
+                    },
+                },
+                latest_bar={
+                    "t": started_at.isoformat(),
+                    "l": 100.8,
+                    "h": 101.3,
+                    "c": 101.2,
+                },
+                bar_history=[],
+                as_of=started_at,
+                limit_buffer_bps=5.0,
+            )
+        finally:
+            heartbeat_support.get_execution_adapter = original
+
+        self.assertIsNone(skip_reason)
+        self.assertIsNotNone(exit_request)
+        self.assertEqual(exit_request["exit_reason"], "take_profit_hit")
 
     def test_trading212_latest_bars_can_use_positions_api_current_price(self) -> None:
         captured: dict[str, object] = {}

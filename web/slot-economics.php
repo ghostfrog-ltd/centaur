@@ -5,6 +5,7 @@ header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
 
 require __DIR__ . '/api/snapshot_cache.php';
+require __DIR__ . '/navigation.php';
 
 $initialSnapshotJson = slotNumbersInitialSnapshotJson();
 
@@ -438,11 +439,9 @@ function slotNumbersInitialSnapshotJson(): string
         <h1>Simple Slot Numbers</h1>
         <p class="lede">Pick the average winning slot. The page gives the simple sell-at-profit number and the loss number that keeps losses smaller than wins.</p>
       </div>
-      <nav class="toolbar" aria-label="Primary navigation">
-        <a class="button primary" href="/slot-economics.php">Slot Numbers</a>
-        <a class="button" href="/">Slot Compounding</a>
-        <a class="button" href="/dashboard.php">Dashboard</a>
-      </nav>
+      <div class="toolbar centaur-menu-toolbar">
+        <?php centaurRenderNavigation('/slot-economics.php'); ?>
+      </div>
     </header>
 
     <section class="grid">

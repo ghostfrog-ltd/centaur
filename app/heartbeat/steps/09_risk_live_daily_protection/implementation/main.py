@@ -32,6 +32,9 @@ def run_implementation(context: TickContext) -> PipelineResult:
 
     account_state = context.state.get("alpaca_live_account", {})
     summary = account_state.get("summary", {}) if isinstance(account_state, dict) else {}
+    raw_account = account_state.get("raw", {}) if isinstance(account_state, dict) else {}
+    if not isinstance(raw_account, dict):
+        raw_account = {}
     current_equity = _as_float(summary.get("equity"))
     max_drawdown = float(context.config.live_execution_max_daily_drawdown_usd)
     if current_equity is None or current_equity <= 0:
@@ -55,6 +58,11 @@ def run_implementation(context: TickContext) -> PipelineResult:
     baseline_equity = _as_float(existing.get("baseline_equity")) if existing else None
     if baseline_equity is None or baseline_equity <= 0:
         baseline_equity = current_equity
+    broker_day_baseline = _as_float(summary.get("last_equity"))
+    if broker_day_baseline is None:
+        broker_day_baseline = _as_float(raw_account.get("last_equity"))
+    if broker_day_baseline is not None and broker_day_baseline > baseline_equity:
+        baseline_equity = broker_day_baseline
     equity_drawdown_usd = max(0.0, baseline_equity - current_equity)
     protection_already_active = (
         str(existing.get("system_status", "")).lower() == "protected"
@@ -69,6 +77,7 @@ def run_implementation(context: TickContext) -> PipelineResult:
         market_open_at=market_open_at,
         tick_id=context.tick_id,
         checked_at=context.started_at,
+        baseline_equity=baseline_equity,
         current_equity=current_equity,
         max_daily_drawdown_usd=max_drawdown,
         system_status="protected" if protected else "active",

@@ -4,6 +4,8 @@ declare(strict_types=1);
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
 
+require __DIR__ . '/navigation.php';
+
 $templatePath = dirname(__DIR__) . '/.env.example';
 $templateEntries = loadEnvTemplateEntries($templatePath);
 $glossaryDocs = glossaryDocs();
@@ -1605,10 +1607,8 @@ function formatScopeLabel(string $scope): string
         <h1>Config Glossary</h1>
         <p class="subtitle">Developer-style notes for every setting currently defined in `.env.example`, grouped by runtime area and presented without exposing live secrets from the real `.env`.</p>
       </div>
-      <div class="toolbar">
-        <a class="button primary" href="/glossary.php">Glossary</a>
-        <a class="button" href="/dashboard.php">Dashboard</a>
-        <a class="button" href="/">Slot Compounding</a>
+      <div class="toolbar centaur-menu-toolbar">
+        <?php centaurRenderNavigation('/glossary.php'); ?>
       </div>
     </header>
 

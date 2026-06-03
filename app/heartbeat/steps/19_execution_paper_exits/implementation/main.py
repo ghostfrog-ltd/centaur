@@ -21,6 +21,7 @@ from app.heartbeat.support import (
     _orders_state_key_for_broker,
     _paper_execution_status,
     _paper_limit_buffer_bps,
+    _position_reference_latest_bar,
     _position_symbol_for_broker,
     _positions_state_key_for_broker,
     timedelta,
@@ -105,6 +106,16 @@ def run_implementation(context: TickContext) -> PipelineResult:
             latest_bar = latest_bars.get(symbol) or latest_bars.get(
                 _normalized_symbol_key(symbol)
             )
+            if latest_bar is None and _equity_flatten_due(
+                context.config,
+                asset_class="equity",
+                as_of=context.started_at,
+                next_close=context.state.get("market_gate", {}).get("next_close"),
+            ):
+                latest_bar = _position_reference_latest_bar(
+                    position=position,
+                    as_of=context.started_at,
+                )
             if latest_bar is not None:
                 unmanaged_entry_order = _build_unmanaged_equity_flatten_entry_order(
                     position=position,
@@ -149,6 +160,16 @@ def run_implementation(context: TickContext) -> PipelineResult:
 
         symbol_key = _normalized_symbol_key(symbol)
         latest_bar = latest_bars.get(symbol) or latest_bars.get(symbol_key)
+        if latest_bar is None and _equity_flatten_due(
+            context.config,
+            asset_class=str(entry_order.get("asset_class", "")),
+            as_of=context.started_at,
+            next_close=context.state.get("market_gate", {}).get("next_close"),
+        ):
+            latest_bar = _position_reference_latest_bar(
+                position=position,
+                as_of=context.started_at,
+            )
         if latest_bar is None:
             skipped.append({"symbol": symbol, "reason": "latest_bar_unavailable"})
             continue

@@ -19,6 +19,7 @@ from app.heartbeat.support import (
     _open_exit_order_refresh_reason,
     _order_status_is_open,
     _paper_execution_status,
+    _position_reference_latest_bar,
     timedelta,
 )
 
@@ -94,6 +95,16 @@ def run_implementation(context: TickContext) -> PipelineResult:
         )
         if entry_order is None:
             latest_bar = latest_bars.get(symbol) or latest_bars.get(symbol_key)
+            if latest_bar is None and _equity_flatten_due(
+                context.config,
+                asset_class="equity",
+                as_of=context.started_at,
+                next_close=context.state.get("market_gate", {}).get("next_close"),
+            ):
+                latest_bar = _position_reference_latest_bar(
+                    position=position,
+                    as_of=context.started_at,
+                )
             if latest_bar is not None:
                 unmanaged_entry_order = _build_unmanaged_equity_flatten_entry_order(
                     position=position,
@@ -137,6 +148,16 @@ def run_implementation(context: TickContext) -> PipelineResult:
             continue
 
         latest_bar = latest_bars.get(symbol) or latest_bars.get(symbol_key)
+        if latest_bar is None and _equity_flatten_due(
+            context.config,
+            asset_class=str(entry_order.get("asset_class", "")),
+            as_of=context.started_at,
+            next_close=context.state.get("market_gate", {}).get("next_close"),
+        ):
+            latest_bar = _position_reference_latest_bar(
+                position=position,
+                as_of=context.started_at,
+            )
         if latest_bar is None:
             skipped.append({"symbol": symbol, "reason": "latest_bar_unavailable"})
             continue

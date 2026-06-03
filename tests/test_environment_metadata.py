@@ -4,7 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.framework.runtime.settings import load_runtime_config
@@ -405,6 +405,158 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(executions[0]["avg_signal_score"], 91.5)
         self.assertEqual(executions[0]["avg_fitness_composite_score"], 1.25)
 
+    def test_signal_score_impact_rows_are_bounded_and_bucketed(self) -> None:
+        now = datetime.now().astimezone()
+        self.ledger.record_shadow_trade_proposals(
+            proposals=[
+                {
+                    "proposal_id": "score-impact-1",
+                    "tick_id": "score-impact-tick-1",
+                    "proposed_at": now.isoformat(),
+                    "environment": "paper",
+                    "mode": "paper",
+                    "strategy_id": "mean_reversion.snapback",
+                    "strategy_family": "mean_reversion",
+                    "profile_id": "snapback",
+                    "source": "alpaca",
+                    "symbol": "AAPL",
+                    "asset_class": "equity",
+                    "entry_price": 100.0,
+                    "stop_loss_price": 98.0,
+                    "target_price": 103.0,
+                    "base_signal_score": 90.0,
+                    "signal_score": 91.46,
+                    "allocation_status": "score_to_trade",
+                    "holding_window_code": "1h",
+                    "holding_window_minutes": 60,
+                },
+                {
+                    "proposal_id": "score-impact-2",
+                    "tick_id": "score-impact-tick-2",
+                    "proposed_at": now.isoformat(),
+                    "environment": "paper",
+                    "mode": "paper",
+                    "strategy_id": "crypto_momentum.trend",
+                    "strategy_family": "crypto_momentum",
+                    "profile_id": "trend",
+                    "source": "alpaca",
+                    "symbol": "BTC/USD",
+                    "asset_class": "crypto",
+                    "entry_price": 100.0,
+                    "stop_loss_price": 99.0,
+                    "target_price": 103.0,
+                    "base_signal_score": 85.0,
+                    "signal_score": 85.04,
+                    "allocation_status": "weighted",
+                    "holding_window_code": "2h",
+                    "holding_window_minutes": 120,
+                },
+            ]
+        )
+
+        rows = self.ledger.list_signal_score_impact_rows(days=7, recent_limit=1)
+
+        self.assertEqual(
+            rows["buckets"],
+            [
+                {"score_bucket": 91.5, "proposal_count": 1},
+                {"score_bucket": 85.0, "proposal_count": 1},
+            ],
+        )
+        self.assertEqual(
+            rows["base_buckets"],
+            [
+                {"score_bucket": 90.0, "proposal_count": 1},
+                {"score_bucket": 85.0, "proposal_count": 1},
+            ],
+        )
+        strategy_rows = {row["strategy_id"]: row for row in rows["strategies"]}
+        self.assertEqual(
+            strategy_rows["mean_reversion.snapback"]["score_to_trade_count"],
+            1,
+        )
+        strategy_buckets = {
+            row["strategy_id"]: row["score_bucket"] for row in rows["strategy_buckets"]
+        }
+        self.assertEqual(strategy_buckets["mean_reversion.snapback"], 91.5)
+        strategy_base_buckets = {
+            row["strategy_id"]: row["score_bucket"] for row in rows["strategy_base_buckets"]
+        }
+        self.assertEqual(strategy_base_buckets["mean_reversion.snapback"], 90.0)
+        self.assertEqual(rows["recent"][0]["symbol"], "AAPL")
+
+    def test_recent_daily_realized_pnl_is_bounded_by_strategy(self) -> None:
+        now = datetime.now().astimezone()
+        self.ledger.record_paper_trade_orders(
+            tick_id="daily-pnl-tick",
+            captured_at=now,
+            orders=[
+                {
+                    "id": "daily-pnl-buy",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "status": "filled",
+                    "broker_id": "alpaca_paper",
+                    "proposal_id": "daily-pnl-proposal",
+                    "strategy_id": "mean_reversion.snapback",
+                    "source": "alpaca",
+                    "submitted_at": (now - timedelta(minutes=20)).isoformat(),
+                    "filled_qty": 1,
+                    "filled_avg_price": 100.0,
+                },
+                {
+                    "id": "daily-pnl-sell",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "status": "filled",
+                    "broker_id": "alpaca_paper",
+                    "proposal_id": "daily-pnl-proposal",
+                    "strategy_id": "mean_reversion.snapback",
+                    "source": "alpaca",
+                    "submitted_at": now.isoformat(),
+                    "filled_qty": 1,
+                    "filled_avg_price": 101.5,
+                },
+                {
+                    "id": "daily-pnl-other-buy",
+                    "symbol": "MSFT",
+                    "side": "buy",
+                    "status": "filled",
+                    "broker_id": "alpaca_paper",
+                    "proposal_id": "daily-pnl-other",
+                    "strategy_id": "momentum.balanced",
+                    "source": "alpaca",
+                    "submitted_at": (now - timedelta(minutes=10)).isoformat(),
+                    "filled_qty": 1,
+                    "filled_avg_price": 200.0,
+                },
+                {
+                    "id": "daily-pnl-other-sell",
+                    "symbol": "MSFT",
+                    "side": "sell",
+                    "status": "filled",
+                    "broker_id": "alpaca_paper",
+                    "proposal_id": "daily-pnl-other",
+                    "strategy_id": "momentum.balanced",
+                    "source": "alpaca",
+                    "submitted_at": now.isoformat(),
+                    "filled_qty": 1,
+                    "filled_avg_price": 198.0,
+                },
+            ],
+        )
+
+        rows = self.ledger.list_recent_daily_realized_pnl(
+            strategy_id="mean_reversion.snapback",
+            lookback_days=7,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["closed_trades"], 1)
+        self.assertEqual(rows[0]["wins"], 1)
+        self.assertEqual(rows[0]["non_wins"], 0)
+        self.assertAlmostEqual(rows[0]["realized_pnl_usd"], 1.5)
+
     def test_legacy_live_activation_flags_make_runtime_label_live(self) -> None:
         os.environ.pop("CENTAUR_MODE", None)
         os.environ.pop("CENTAUR_ENVIRONMENT", None)
@@ -580,6 +732,15 @@ class EnvironmentMetadataTests(unittest.TestCase):
 
         self.assertEqual(config.paper_min_signal_score_to_trade, 91.0)
         self.assertEqual(config.live_min_signal_score_to_trade, 97.0)
+
+    def test_observe_only_score_floor_paper_and_live_settings_are_parsed(self) -> None:
+        os.environ["PAPER_OBSERVE_ONLY_SIGNAL_SCORE_FLOOR"] = "80.0"
+        os.environ["LIVE_OBSERVE_ONLY_SIGNAL_SCORE_FLOOR"] = "82.5"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_observe_only_signal_score_floor, 80.0)
+        self.assertEqual(config.live_observe_only_signal_score_floor, 82.5)
 
     def test_armed_live_config_fails_when_crypto_momentum_differs_from_paper(self) -> None:
         os.environ["LIVE_EXECUTION_ENABLED"] = "true"

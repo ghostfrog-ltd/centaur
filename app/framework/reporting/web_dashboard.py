@@ -68,6 +68,23 @@ def run_web_dashboard(
                 )
                 return
 
+            if parsed.path == "/api/score-impact":
+                days = _bounded_int(
+                    _first_query_value(query_params, "days"),
+                    default=90,
+                    minimum=1,
+                    maximum=366,
+                )
+                self._send_json(
+                    _json_safe(
+                        _build_score_impact_report(
+                            reporter=reporter,
+                            days=days,
+                        )
+                    )
+                )
+                return
+
             if parsed.path == "/healthz":
                 self._send_json(
                     {
@@ -160,6 +177,136 @@ def _build_proposal_counts_report(
         },
         "generated": generated,
         "proposal_linked_executions": executions,
+    }
+
+
+def _build_score_impact_report(
+    *,
+    reporter: StatusReporter,
+    days: int,
+) -> dict[str, Any]:
+    ledger = reporter.usage_ledger
+    rows = ledger.list_signal_score_impact_rows(days=days)
+    latest_tick = _as_dict(ledger.get_latest_tick_run())
+    tick_state = _as_dict(latest_tick.get("state_snapshot_json"))
+    health = _build_lightweight_score_health(
+        reporter=reporter,
+        strategy_id="mean_reversion.snapback",
+        lookback_days=min(max(days, 1), 30),
+    )
+    total_count = sum(int(row.get("proposal_count", 0) or 0) for row in rows["buckets"])
+    base_total_count = sum(
+        int(row.get("proposal_count", 0) or 0) for row in rows.get("base_buckets", [])
+    )
+    score_to_trade_count = sum(
+        int(row.get("score_to_trade_count", 0) or 0) for row in rows["strategies"]
+    )
+    scores = [
+        float(row.get("score_bucket", 0) or 0)
+        for row in rows["buckets"]
+        if row.get("score_bucket") is not None
+    ]
+    return {
+        "ok": True,
+        "checked_at": datetime.now().astimezone().isoformat(),
+        "days": days,
+        "backend": ledger.backend,
+        "backend_detail": ledger.backend_detail,
+        "runtime": {
+            "mode": reporter.config.centaur_mode,
+            "environment": reporter.config.centaur_environment,
+        },
+        "config": {
+            "paper_min_signal_score_to_trade": reporter.config.paper_min_signal_score_to_trade,
+            "live_min_signal_score_to_trade": reporter.config.live_min_signal_score_to_trade,
+            "paper_execution_enabled": reporter.config.paper_execution_enabled,
+            "paper_execution_kill_switch": reporter.config.paper_execution_kill_switch,
+            "live_execution_enabled": reporter.config.live_execution_enabled,
+            "live_execution_kill_switch": reporter.config.live_execution_kill_switch,
+            "allowed_strategies": reporter.config.paper_execution_allowed_strategies,
+            "paper_max_daily_drawdown_usd": reporter.config.paper_execution_max_daily_drawdown_usd,
+            "live_max_daily_drawdown_usd": reporter.config.live_execution_max_daily_drawdown_usd,
+            "paper_observe_only_signal_score_floor": (
+                reporter.config.paper_observe_only_signal_score_floor
+            ),
+            "live_observe_only_signal_score_floor": (
+                reporter.config.live_observe_only_signal_score_floor
+            ),
+        },
+        "protection": {
+            "paper": _compact_protection(_as_dict(tick_state.get("daily_protection"))),
+            "live": _compact_protection(_as_dict(tick_state.get("live_daily_protection"))),
+            "paper_cfo": _compact_cfo(_as_dict(tick_state.get("risk_cfo"))),
+            "live_cfo": _compact_cfo(_as_dict(tick_state.get("risk_live_cfo"))),
+        },
+        "health": health,
+        "observed": {
+            "total_count": total_count,
+            "base_total_count": base_total_count,
+            "score_to_trade_count": score_to_trade_count,
+            "min_signal_score": min(scores) if scores else None,
+            "max_signal_score": max(scores) if scores else None,
+            "buckets": rows["buckets"],
+            "base_buckets": rows.get("base_buckets", []),
+            "strategies": rows["strategies"],
+            "strategy_buckets": rows["strategy_buckets"],
+            "strategy_base_buckets": rows.get("strategy_base_buckets", []),
+            "allocations": rows["allocations"],
+            "recent": rows["recent"],
+        },
+        "scope_note": (
+            "Read-only score visualization over generated shadow proposals. "
+            "Suppressed near-miss signals are available only in bounded tick diagnostics, "
+            "so historical counts do not claim to reconstruct every suppressed signal."
+        ),
+    }
+
+
+def _build_lightweight_score_health(
+    *,
+    reporter: StatusReporter,
+    strategy_id: str,
+    lookback_days: int,
+) -> dict[str, Any]:
+    """Return only the health evidence rendered by the score simulator.
+
+    The full strategy-health report also builds exit-review and holding-window
+    advisory surfaces. Those are useful elsewhere, but they can make this API
+    slow enough to trip the PHP/DDEV proxy timeout. Keep this endpoint bounded
+    to the daily P/L and latest fitness rows that the page actually displays.
+    """
+    ledger = reporter.usage_ledger
+    return {
+        "status": "ok",
+        "checked_at": datetime.now().astimezone().isoformat(),
+        "strategy_id": strategy_id,
+        "lookback_days": lookback_days,
+        "recent_daily_realized_pnl": ledger.list_recent_daily_realized_pnl(
+            strategy_id=strategy_id,
+            lookback_days=lookback_days,
+        )[:14],
+        "latest_fitness_snapshot": ledger.list_latest_strategy_fitness_snapshots(limit=12),
+    }
+
+
+def _compact_protection(protection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "system_status": protection.get("system_status") or protection.get("status"),
+        "reason": protection.get("reason") or protection.get("notes"),
+        "entries_blocked": bool(protection.get("entries_blocked")),
+        "equity_drawdown_usd": protection.get("equity_drawdown_usd"),
+        "max_daily_drawdown_usd": protection.get("max_daily_drawdown_usd"),
+        "session_date": protection.get("session_date"),
+        "protection_triggered_at": protection.get("protection_triggered_at"),
+    }
+
+
+def _compact_cfo(cfo: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "decision": cfo.get("decision"),
+        "reason": cfo.get("reason"),
+        "orders_allowed": cfo.get("orders_allowed"),
+        "orders_requested": cfo.get("orders_requested"),
     }
 
 

@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
+
+require __DIR__ . '/navigation.php';
 ?>
 <!doctype html>
 <html lang="en">
@@ -272,13 +274,9 @@ header('Pragma: no-cache');
         <p class="eyebrow">Project Centaur</p>
         <h1>Proposal Counts</h1>
       </div>
-      <nav class="toolbar" aria-label="Primary navigation">
-        <a class="button primary" href="/proposal-counts.php">Proposal Counts</a>
-        <a class="button" href="/">Slot Compounding</a>
-        <a class="button" href="/flow.php">Flow Map</a>
-        <a class="button" href="/glossary.php">Glossary</a>
-        <a class="button" href="/dashboard.php">Dashboard</a>
-      </nav>
+      <div class="toolbar centaur-menu-toolbar">
+        <?php centaurRenderNavigation('/proposal-counts.php'); ?>
+      </div>
     </header>
 
     <section class="controls" aria-label="Proposal count controls">

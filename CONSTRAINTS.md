@@ -31,18 +31,18 @@
 - Assets: equities and crypto.
 - Notional: `$10` unless approved; Trading 212 paper currently uses `£5` native sizing for the reset £100 demo account.
 - Max orders/tick `1`; base slots `10`; earned slots +1 per full `$10` tracked P/L above baseline and can fall away.
-- Daily equity drawdown protector `$2.00`; long-only.
+- Daily equity drawdown protector `$2.00`; baseline uses the more protective of first Centaur-seen session equity and broker-reported `last_equity`/previous equity, then latches once breached. Long-only.
 - Allowed strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`.
 - Projected-gain floors: equities `1.5%`, crypto `2.0%`.
 - Crypto momentum: `1.0%` stop; require instrument identity; reject movement > `2.5%`, notional candidate volume < `£50,000` where derivable, and spread > `0.25%` when known.
 - Buffers/orders: equity `5` bps `DAY` limits; crypto `25` bps `IOC` limits.
 - Stale unfilled equity entries: reap after `5` minutes.
-- Managed exits: profit capture uses the current runtime config (`PAPER_EXECUTION_PROFIT_CAPTURE_PCT` / `LIVE_EXECUTION_PROFIT_CAPTURE_PCT`) at exit-decision time, not stale entry-order metadata; ladder evidence `1.25,2,3,4,6%`.
+- Managed exits: profit capture uses the current runtime config (`PAPER_EXECUTION_PROFIT_CAPTURE_PCT` / `LIVE_EXECUTION_PROFIT_CAPTURE_PCT`) at exit-decision time, not stale entry-order metadata or stored take-profit targets; stored targets are only a legacy fallback when current profit capture is disabled. Ladder evidence `1.25,2,3,4,6%`.
 - Operator-facing ratio controls for profit capture, stop loss, projected-gain floors, and trailing giveback use percent notation in `.env`: `0.5` means `0.5%`, `1` means `1%`, `2` means `2%`; legacy decimal ratio values below `0.1` are still parsed as-is. Movement, spread, and ladder `PCT` fields are already percent-point values.
 - Same-symbol managed exits must use the most protective still-open entry stop.
 - New Alpaca Live follower entries are blocked while any existing live position lacks a persisted managed-exit entry plan.
 - Max-hold is a hard backstop: no red deferral after the configured max hold.
-- Equity no-overnight-carry: block entries in final 60 minutes of every equity session; flatten equities in final 15 minutes, including missing-plan positions via an audited unmanaged flatten. Crypto uses the hard max-hold backstop.
+- Equity no-overnight-carry: block entries in final 60 minutes of every equity session; flatten equities in final 15 minutes, including missing-plan positions via an audited unmanaged flatten. Close-flattening must fall back to broker position price when latest bars are unavailable. Crypto uses the hard max-hold backstop.
 - Alpaca Live equity PDT guard: new live equity entries fail closed unless prior/effective equity >= `$25,000`; exits still route when permitted. Do not auto-unblock on the 2026-06-04 framework date without observed account/API behaviour and explicit review.
 
 ## Live Lane

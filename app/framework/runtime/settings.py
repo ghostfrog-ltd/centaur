@@ -172,6 +172,7 @@ class RuntimeConfig:
     paper_execution_high_score_override_min_score: float
     paper_execution_high_score_override_fitness_margin: float
     paper_min_signal_score_to_trade: float
+    paper_observe_only_signal_score_floor: float
     paper_execution_equity_no_weekend_carry_enabled: bool
     paper_execution_equity_friday_entry_cutoff_minutes_before_close: int
     paper_execution_equity_friday_flatten_minutes_before_close: int
@@ -201,6 +202,7 @@ class RuntimeConfig:
     live_execution_high_score_override_min_score: float
     live_execution_high_score_override_fitness_margin: float
     live_min_signal_score_to_trade: float
+    live_observe_only_signal_score_floor: float
     live_execution_equity_no_weekend_carry_enabled: bool
     live_execution_equity_friday_entry_cutoff_minutes_before_close: int
     live_execution_equity_friday_flatten_minutes_before_close: int
@@ -355,6 +357,14 @@ def load_runtime_config() -> RuntimeConfig:
         os.getenv("LIVE_MIN_SIGNAL_SCORE_TO_TRADE")
         or os.getenv("LIVE_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
         default=90.0,
+    )
+    paper_observe_only_signal_score_floor = _parse_float(
+        os.getenv("PAPER_OBSERVE_ONLY_SIGNAL_SCORE_FLOOR"),
+        default=80.0,
+    )
+    live_observe_only_signal_score_floor = _parse_float(
+        os.getenv("LIVE_OBSERVE_ONLY_SIGNAL_SCORE_FLOOR"),
+        default=paper_observe_only_signal_score_floor,
     )
 
     config = RuntimeConfig(
@@ -773,6 +783,7 @@ def load_runtime_config() -> RuntimeConfig:
             default=0.25,
         ),
         paper_min_signal_score_to_trade=paper_min_signal_score_to_trade,
+        paper_observe_only_signal_score_floor=paper_observe_only_signal_score_floor,
         paper_execution_equity_no_weekend_carry_enabled=_parse_bool(
             os.getenv("PAPER_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED"),
             default=True,
@@ -885,6 +896,7 @@ def load_runtime_config() -> RuntimeConfig:
             default=0.25,
         ),
         live_min_signal_score_to_trade=live_min_signal_score_to_trade,
+        live_observe_only_signal_score_floor=live_observe_only_signal_score_floor,
         live_execution_equity_no_weekend_carry_enabled=_parse_bool(
             os.getenv("LIVE_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED"),
             default=True,

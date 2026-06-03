@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
+
+require __DIR__ . '/navigation.php';
 ?>
 <!doctype html>
 <html lang="en">
@@ -20,10 +22,9 @@ header('Pragma: no-cache');
         <h1 class="text-3xl font-semibold tracking-tight">Operator Dashboard</h1>
         <p id="checked-at" class="mt-2 text-sm text-stone-500">Loading latest snapshot...</p>
       </div>
-      <div class="flex flex-wrap gap-2">
+      <div class="centaur-menu-toolbar flex flex-wrap gap-2">
         <button id="refresh-button" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Refresh</button>
-        <a href="/" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Slot Compounding</a>
-        <a href="/snapshot/" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Live JSON</a>
+        <?php centaurRenderNavigation('/dashboard.php'); ?>
       </div>
     </header>
 

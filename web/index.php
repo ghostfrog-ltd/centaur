@@ -5,6 +5,7 @@ header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
 
 require __DIR__ . '/api/snapshot_cache.php';
+require __DIR__ . '/navigation.php';
 
 $initialSnapshotJson = initialSnapshotJson();
 
@@ -551,15 +552,10 @@ function initialSnapshotJson(): string
         <p class="eyebrow">Project Centaur</p>
         <h1>Slot Compounding</h1>
       </div>
-      <div class="toolbar">
+      <div class="toolbar centaur-menu-toolbar">
         <button id="preset-current" class="button primary" type="button">Current Envelope</button>
-        <a class="button" href="/slot-economics.php">Slot Economics</a>
-        <a class="button" href="/proposal-counts.php">Proposal Counts</a>
         <button id="reset" class="button" type="button">Reset</button>
-        <a class="button" href="/reports/50-dollar-day-plan.md" download>Download Plan</a>
-        <a class="button" href="/flow.php">Flow Map</a>
-        <a class="button" href="/glossary.php">Glossary</a>
-        <a class="button" href="/dashboard.php">Dashboard</a>
+        <?php centaurRenderNavigation('/'); ?>
       </div>
     </header>
 

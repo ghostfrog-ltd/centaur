@@ -180,7 +180,7 @@ def _market_session_minutes(
         if market_close.date() == market_now.date():
             regular_close_minutes = (market_close.hour * 60) + market_close.minute
         else:
-            return None
+            regular_close_minutes = 16 * 60
     else:
         regular_close_minutes = 16 * 60
     minutes_since_midnight = (market_now.hour * 60) + market_now.minute
@@ -247,7 +247,7 @@ def _equity_flatten_due(
         ),
     )
     flatten_at = regular_close_minutes - flatten_minutes
-    return flatten_at <= minutes_since_midnight < regular_close_minutes
+    return minutes_since_midnight >= flatten_at
 
 def _build_unmanaged_equity_flatten_entry_order(
     *,
@@ -1724,6 +1724,23 @@ def _latest_bars_by_symbol(context: TickContext) -> dict[str, dict[str, Any]]:
                     bars[_normalized_symbol_key(symbol_upper)] = bar
     return bars
 
+def _position_reference_latest_bar(
+    *,
+    position: dict[str, Any],
+    as_of: datetime,
+) -> dict[str, Any] | None:
+    price = _as_float(position.get("current_price"))
+    if price is None:
+        market_value = _as_float(position.get("market_value"))
+        qty = _as_float(position.get("qty"))
+        if market_value is not None and qty is not None and qty > 0:
+            price = market_value / qty
+    if price is None:
+        price = _as_float(position.get("avg_entry_price"))
+    if price is None or price <= 0:
+        return None
+    return {"t": as_of.isoformat(), "l": price, "h": price, "c": price}
+
 def _normalized_symbol_key(symbol: str) -> str:
     return str(symbol or "").upper().replace("/", "").replace("-", "").strip()
 
@@ -1968,10 +1985,10 @@ def _build_exit_order_request(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Build one managed sell request or a skip reason for audit.
 
-    The decision order is capital-preservation first: stop, profit capture,
-    target, same-day equity flatten, and then policy-specific time exits.
-    Max-hold limits are hard backstops; they do not defer just because the
-    position is red.
+    The decision order is capital-preservation first: stop, current runtime
+    profit capture, legacy target fallback, same-day equity flatten, and then
+    policy-specific time exits.  Max-hold limits are hard backstops; they do
+    not defer just because the position is red.
     """
     symbol = str(position.get("symbol", "")).upper()
     broker_symbol = str(entry_order.get("symbol") or symbol).upper()
@@ -2147,7 +2164,12 @@ def _build_exit_order_request(
         and high_price >= profit_capture_price
     ):
         exit_reason = "profit_capture_hit"
-    elif target_price is not None and high_price is not None and high_price >= target_price:
+    elif (
+        profit_capture_price is None
+        and target_price is not None
+        and high_price is not None
+        and high_price >= target_price
+    ):
         exit_reason = "take_profit_hit"
     elif _equity_flatten_due(
         context.config,

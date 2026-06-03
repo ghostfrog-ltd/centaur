@@ -155,6 +155,7 @@ class UsageLedger:
         market_open_at: datetime,
         tick_id: str,
         checked_at: datetime,
+        baseline_equity: float | None = None,
         current_equity: float,
         max_daily_drawdown_usd: float,
         system_status: str,
@@ -166,6 +167,7 @@ class UsageLedger:
                 market_open_at=market_open_at,
                 tick_id=tick_id,
                 checked_at=checked_at,
+                baseline_equity=baseline_equity,
                 current_equity=current_equity,
                 max_daily_drawdown_usd=max_daily_drawdown_usd,
                 system_status=system_status,
@@ -177,6 +179,7 @@ class UsageLedger:
                 market_open_at=market_open_at,
                 tick_id=tick_id,
                 checked_at=checked_at,
+                baseline_equity=baseline_equity,
                 current_equity=current_equity,
                 max_daily_drawdown_usd=max_daily_drawdown_usd,
                 system_status=system_status,
@@ -229,6 +232,7 @@ class UsageLedger:
         market_open_at: datetime,
         tick_id: str,
         checked_at: datetime,
+        baseline_equity: float | None = None,
         current_equity: float,
         max_daily_drawdown_usd: float,
         system_status: str,
@@ -247,6 +251,7 @@ class UsageLedger:
                 market_open_at=market_open_at,
                 tick_id=tick_id,
                 checked_at=checked_at,
+                baseline_equity=baseline_equity,
                 current_equity=current_equity,
                 max_daily_drawdown_usd=max_daily_drawdown_usd,
                 system_status=system_status,
@@ -259,6 +264,7 @@ class UsageLedger:
                 market_open_at=market_open_at,
                 tick_id=tick_id,
                 checked_at=checked_at,
+                baseline_equity=baseline_equity,
                 current_equity=current_equity,
                 max_daily_drawdown_usd=max_daily_drawdown_usd,
                 system_status=system_status,
@@ -1400,6 +1406,45 @@ class UsageLedger:
         if self.backend == "postgres":
             return self._list_daily_proposal_execution_counts_postgres(since=since)
         return self._list_daily_proposal_execution_counts_sqlite(since=since)
+
+    def list_signal_score_impact_rows(
+        self,
+        *,
+        days: int = 90,
+        recent_limit: int = 12,
+    ) -> dict[str, list[dict[str, Any]]]:
+        bounded_days = max(1, min(int(days), 366))
+        bounded_limit = max(1, min(int(recent_limit), 50))
+        since = datetime.now().astimezone() - timedelta(days=bounded_days)
+        if self.backend == "postgres":
+            return self._list_signal_score_impact_rows_postgres(
+                since=since,
+                recent_limit=bounded_limit,
+            )
+        return self._list_signal_score_impact_rows_sqlite(
+            since=since,
+            recent_limit=bounded_limit,
+        )
+
+    def list_recent_daily_realized_pnl(
+        self,
+        *,
+        strategy_id: str,
+        lookback_days: int = 30,
+    ) -> list[dict[str, Any]]:
+        bounded_days = max(1, min(int(lookback_days), 366))
+        cutoff = datetime.now().astimezone() - timedelta(days=bounded_days)
+        if self.backend == "postgres":
+            rows = self._list_recent_daily_realized_pnl_postgres(
+                strategy_id=strategy_id,
+                cutoff=cutoff,
+            )
+        else:
+            rows = self._list_recent_daily_realized_pnl_sqlite(
+                strategy_id=strategy_id,
+                cutoff=cutoff,
+            )
+        return [dict(row) for row in rows]
 
     def get_shadow_trade_proposal(self, *, proposal_id: str) -> dict[str, Any] | None:
         normalized_proposal_id = str(proposal_id).strip()
@@ -2628,6 +2673,18 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_score_window
+                ON shadow_trade_proposals (proposed_at DESC, signal_score DESC, strategy_id, asset_class)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_base_score_window
+                ON shadow_trade_proposals (proposed_at DESC, base_signal_score DESC, strategy_id, asset_class)
+                """
+            )
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_strategy_training
                 ON shadow_trade_proposals (strategy_id, proposed_at)
                 WHERE strategy_id <> ''
@@ -3688,6 +3745,18 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_proposed_at
                     ON shadow_trade_proposals (proposed_at DESC, proposal_id DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_score_window
+                    ON shadow_trade_proposals (proposed_at DESC, signal_score DESC, strategy_id, asset_class)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_shadow_trade_proposals_base_score_window
+                    ON shadow_trade_proposals (proposed_at DESC, base_signal_score DESC, strategy_id, asset_class)
                     """
                 )
                 cursor.execute(
@@ -6756,6 +6825,324 @@ class UsageLedger:
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def _list_signal_score_impact_rows_sqlite(
+        self,
+        *,
+        since: datetime,
+        recent_limit: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        with self._connect_sqlite() as connection:
+            bucket_rows = connection.execute(
+                """
+                SELECT ROUND(signal_score, 1) AS score_bucket,
+                       COUNT(*) AS proposal_count
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                GROUP BY 1
+                ORDER BY score_bucket DESC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+            base_bucket_rows = connection.execute(
+                """
+                SELECT ROUND(base_signal_score, 1) AS score_bucket,
+                       COUNT(*) AS proposal_count
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                  AND base_signal_score IS NOT NULL
+                GROUP BY 1
+                ORDER BY score_bucket DESC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+            strategy_rows = connection.execute(
+                """
+                SELECT COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                       COALESCE(NULLIF(asset_class, ''), 'unknown') AS asset_class,
+                       COUNT(*) AS proposal_count,
+                       AVG(base_signal_score) AS avg_base_signal_score,
+                       AVG(signal_score) AS avg_signal_score,
+                       MIN(signal_score) AS min_signal_score,
+                       MAX(signal_score) AS max_signal_score,
+                       SUM(CASE WHEN allocation_status = 'score_to_trade' THEN 1 ELSE 0 END) AS score_to_trade_count
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                GROUP BY 1, 2
+                ORDER BY proposal_count DESC, strategy_id ASC, asset_class ASC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+            strategy_bucket_rows = connection.execute(
+                """
+                SELECT COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                       COALESCE(NULLIF(asset_class, ''), 'unknown') AS asset_class,
+                       ROUND(signal_score, 1) AS score_bucket,
+                       COUNT(*) AS proposal_count
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                GROUP BY 1, 2, 3
+                ORDER BY proposal_count DESC, strategy_id ASC, asset_class ASC, score_bucket DESC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+            strategy_base_bucket_rows = connection.execute(
+                """
+                SELECT COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                       COALESCE(NULLIF(asset_class, ''), 'unknown') AS asset_class,
+                       ROUND(base_signal_score, 1) AS score_bucket,
+                       COUNT(*) AS proposal_count
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                  AND base_signal_score IS NOT NULL
+                GROUP BY 1, 2, 3
+                ORDER BY proposal_count DESC, strategy_id ASC, asset_class ASC, score_bucket DESC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+            allocation_rows = connection.execute(
+                """
+                SELECT COALESCE(NULLIF(allocation_status, ''), 'untracked') AS allocation_status,
+                       COUNT(*) AS proposal_count,
+                       AVG(signal_score) AS avg_signal_score,
+                       MIN(signal_score) AS min_signal_score,
+                       MAX(signal_score) AS max_signal_score
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                GROUP BY 1
+                ORDER BY proposal_count DESC, allocation_status ASC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+            recent_rows = connection.execute(
+                """
+                SELECT proposed_at, environment, mode, source_environment,
+                       COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                       symbol, asset_class, allocation_status,
+                       base_signal_score, signal_score, fitness_composite_score,
+                       target_return_pct
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                ORDER BY signal_score DESC, proposed_at DESC
+                LIMIT ?
+                """,
+                (since.isoformat(), recent_limit),
+            ).fetchall()
+        return {
+            "buckets": [dict(row) for row in bucket_rows],
+            "base_buckets": [dict(row) for row in base_bucket_rows],
+            "strategies": [dict(row) for row in strategy_rows],
+            "strategy_buckets": [dict(row) for row in strategy_bucket_rows],
+            "strategy_base_buckets": [dict(row) for row in strategy_base_bucket_rows],
+            "allocations": [dict(row) for row in allocation_rows],
+            "recent": [dict(row) for row in recent_rows],
+        }
+
+    def _list_signal_score_impact_rows_postgres(
+        self,
+        *,
+        since: datetime,
+        recent_limit: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        with self._connect_postgres(scope="core") as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT ROUND(signal_score::numeric, 1)::double precision AS score_bucket,
+                           COUNT(*) AS proposal_count
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                    GROUP BY 1
+                    ORDER BY score_bucket DESC
+                    """,
+                    (since,),
+                )
+                bucket_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT ROUND(base_signal_score::numeric, 1)::double precision AS score_bucket,
+                           COUNT(*) AS proposal_count
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                      AND base_signal_score IS NOT NULL
+                    GROUP BY 1
+                    ORDER BY score_bucket DESC
+                    """,
+                    (since,),
+                )
+                base_bucket_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                           COALESCE(NULLIF(asset_class, ''), 'unknown') AS asset_class,
+                           COUNT(*) AS proposal_count,
+                           AVG(base_signal_score) AS avg_base_signal_score,
+                           AVG(signal_score) AS avg_signal_score,
+                           MIN(signal_score) AS min_signal_score,
+                           MAX(signal_score) AS max_signal_score,
+                           SUM(CASE WHEN allocation_status = 'score_to_trade' THEN 1 ELSE 0 END) AS score_to_trade_count
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                    GROUP BY 1, 2
+                    ORDER BY proposal_count DESC, strategy_id ASC, asset_class ASC
+                    """,
+                    (since,),
+                )
+                strategy_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                           COALESCE(NULLIF(asset_class, ''), 'unknown') AS asset_class,
+                           ROUND(signal_score::numeric, 1)::double precision AS score_bucket,
+                           COUNT(*) AS proposal_count
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                    GROUP BY 1, 2, 3
+                    ORDER BY proposal_count DESC, strategy_id ASC, asset_class ASC, score_bucket DESC
+                    """,
+                    (since,),
+                )
+                strategy_bucket_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                           COALESCE(NULLIF(asset_class, ''), 'unknown') AS asset_class,
+                           ROUND(base_signal_score::numeric, 1)::double precision AS score_bucket,
+                           COUNT(*) AS proposal_count
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                      AND base_signal_score IS NOT NULL
+                    GROUP BY 1, 2, 3
+                    ORDER BY proposal_count DESC, strategy_id ASC, asset_class ASC, score_bucket DESC
+                    """,
+                    (since,),
+                )
+                strategy_base_bucket_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT COALESCE(NULLIF(allocation_status, ''), 'untracked') AS allocation_status,
+                           COUNT(*) AS proposal_count,
+                           AVG(signal_score) AS avg_signal_score,
+                           MIN(signal_score) AS min_signal_score,
+                           MAX(signal_score) AS max_signal_score
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                    GROUP BY 1
+                    ORDER BY proposal_count DESC, allocation_status ASC
+                    """,
+                    (since,),
+                )
+                allocation_rows = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT proposed_at, environment, mode, source_environment,
+                           COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                           symbol, asset_class, allocation_status,
+                           base_signal_score, signal_score, fitness_composite_score,
+                           target_return_pct
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                    ORDER BY signal_score DESC, proposed_at DESC
+                    LIMIT %s
+                    """,
+                    (since, recent_limit),
+                )
+                recent_rows = cursor.fetchall()
+        return {
+            "buckets": [dict(row) for row in bucket_rows],
+            "base_buckets": [dict(row) for row in base_bucket_rows],
+            "strategies": [dict(row) for row in strategy_rows],
+            "strategy_buckets": [dict(row) for row in strategy_bucket_rows],
+            "strategy_base_buckets": [dict(row) for row in strategy_base_bucket_rows],
+            "allocations": [dict(row) for row in allocation_rows],
+            "recent": [dict(row) for row in recent_rows],
+        }
+
+    def _list_recent_daily_realized_pnl_sqlite(
+        self,
+        *,
+        strategy_id: str,
+        cutoff: datetime,
+    ) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                WITH fills AS (
+                    SELECT proposal_id, strategy_id, symbol, side, submitted_at,
+                           COALESCE(filled_qty, 0) AS filled_qty,
+                           COALESCE(filled_avg_price, 0) AS filled_avg_price
+                    FROM paper_trade_orders
+                    WHERE status = 'filled'
+                      AND proposal_id <> ''
+                      AND strategy_id = ?
+                ),
+                round_trips AS (
+                    SELECT proposal_id, symbol,
+                           MAX(submitted_at) FILTER (WHERE side = 'sell') AS exit_at,
+                           SUM(filled_qty * filled_avg_price) FILTER (WHERE side = 'buy') AS buy_value,
+                           SUM(filled_qty * filled_avg_price) FILTER (WHERE side = 'sell') AS sell_value
+                    FROM fills
+                    GROUP BY proposal_id, symbol
+                    HAVING COUNT(*) FILTER (WHERE side = 'buy') > 0
+                       AND COUNT(*) FILTER (WHERE side = 'sell') > 0
+                )
+                SELECT DATE(exit_at) AS exit_date,
+                       SUM(sell_value - buy_value) AS realized_pnl_usd,
+                       COUNT(*) AS closed_trades,
+                       SUM(CASE WHEN sell_value - buy_value > 0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN sell_value - buy_value <= 0 THEN 1 ELSE 0 END) AS non_wins
+                FROM round_trips
+                WHERE exit_at >= ?
+                GROUP BY DATE(exit_at)
+                ORDER BY DATE(exit_at) DESC
+                """,
+                (strategy_id, cutoff.isoformat()),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_recent_daily_realized_pnl_postgres(
+        self,
+        *,
+        strategy_id: str,
+        cutoff: datetime,
+    ) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    WITH fills AS (
+                        SELECT proposal_id, strategy_id, symbol, side, submitted_at,
+                               COALESCE(filled_qty, 0) AS filled_qty,
+                               COALESCE(filled_avg_price, 0) AS filled_avg_price
+                        FROM paper_trade_orders
+                        WHERE status = 'filled'
+                          AND proposal_id <> ''
+                          AND strategy_id = %s
+                    ),
+                    round_trips AS (
+                        SELECT proposal_id, symbol,
+                               MAX(submitted_at) FILTER (WHERE side = 'sell') AS exit_at,
+                               SUM(filled_qty * filled_avg_price) FILTER (WHERE side = 'buy') AS buy_value,
+                               SUM(filled_qty * filled_avg_price) FILTER (WHERE side = 'sell') AS sell_value
+                        FROM fills
+                        GROUP BY proposal_id, symbol
+                        HAVING COUNT(*) FILTER (WHERE side = 'buy') > 0
+                           AND COUNT(*) FILTER (WHERE side = 'sell') > 0
+                    )
+                    SELECT DATE(exit_at) AS exit_date,
+                           SUM(sell_value - buy_value) AS realized_pnl_usd,
+                           COUNT(*) AS closed_trades,
+                           SUM(CASE WHEN sell_value - buy_value > 0 THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN sell_value - buy_value <= 0 THEN 1 ELSE 0 END) AS non_wins
+                    FROM round_trips
+                    WHERE exit_at >= %s
+                    GROUP BY DATE(exit_at)
+                    ORDER BY DATE(exit_at) DESC
+                    """,
+                    (strategy_id, cutoff),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
     def _list_strategy_fitness_rows_sqlite(
         self,
         *,
@@ -7405,11 +7792,13 @@ class UsageLedger:
         market_open_at: datetime,
         tick_id: str,
         checked_at: datetime,
+        baseline_equity: float | None,
         current_equity: float,
         max_daily_drawdown_usd: float,
         system_status: str,
         notes: str,
     ) -> dict[str, Any]:
+        baseline_value = current_equity if baseline_equity is None or baseline_equity <= 0 else baseline_equity
         protection_triggered_at = checked_at.isoformat() if system_status == "protected" else None
         with self._connect_sqlite() as connection:
             connection.execute(
@@ -7423,8 +7812,9 @@ class UsageLedger:
                 ON CONFLICT(session_date) DO UPDATE SET
                     last_tick_id = excluded.last_tick_id,
                     last_checked_at = excluded.last_checked_at,
+                    baseline_equity = MAX(daily_protection_state.baseline_equity, excluded.baseline_equity),
                     latest_equity = excluded.latest_equity,
-                    equity_drawdown_usd = excluded.equity_drawdown_usd,
+                    equity_drawdown_usd = ROUND(MAX(0, MAX(daily_protection_state.baseline_equity, excluded.baseline_equity) - excluded.latest_equity), 6),
                     max_daily_drawdown_usd = excluded.max_daily_drawdown_usd,
                     system_status = CASE
                         WHEN daily_protection_state.system_status = 'protected' OR excluded.system_status = 'protected'
@@ -7447,12 +7837,12 @@ class UsageLedger:
                     session_date.isoformat(),
                     market_open_at.isoformat(),
                     tick_id,
-                    current_equity,
+                    baseline_value,
                     checked_at.isoformat(),
                     tick_id,
                     checked_at.isoformat(),
                     current_equity,
-                    0.0,
+                    max(0.0, baseline_value - current_equity),
                     max_daily_drawdown_usd,
                     system_status,
                     protection_triggered_at,
@@ -7485,11 +7875,13 @@ class UsageLedger:
         market_open_at: datetime,
         tick_id: str,
         checked_at: datetime,
+        baseline_equity: float | None,
         current_equity: float,
         max_daily_drawdown_usd: float,
         system_status: str,
         notes: str,
     ) -> dict[str, Any]:
+        baseline_value = current_equity if baseline_equity is None or baseline_equity <= 0 else baseline_equity
         protection_triggered_at = checked_at if system_status == "protected" else None
         with self._connect_postgres() as connection:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -7507,8 +7899,9 @@ class UsageLedger:
                     ON CONFLICT(session_date) DO UPDATE SET
                         last_tick_id = EXCLUDED.last_tick_id,
                         last_checked_at = EXCLUDED.last_checked_at,
+                        baseline_equity = GREATEST(daily_protection_state.baseline_equity, EXCLUDED.baseline_equity),
                         latest_equity = EXCLUDED.latest_equity,
-                        equity_drawdown_usd = GREATEST(0, daily_protection_state.baseline_equity - EXCLUDED.latest_equity),
+                        equity_drawdown_usd = GREATEST(0, GREATEST(daily_protection_state.baseline_equity, EXCLUDED.baseline_equity) - EXCLUDED.latest_equity),
                         max_daily_drawdown_usd = EXCLUDED.max_daily_drawdown_usd,
                         system_status = CASE
                             WHEN daily_protection_state.system_status = 'protected' OR EXCLUDED.system_status = 'protected'
@@ -7532,12 +7925,12 @@ class UsageLedger:
                         session_date,
                         market_open_at,
                         tick_id,
-                        current_equity,
+                        baseline_value,
                         checked_at,
                         tick_id,
                         checked_at,
                         current_equity,
-                        0.0,
+                        max(0.0, baseline_value - current_equity),
                         max_daily_drawdown_usd,
                         system_status,
                         protection_triggered_at,
@@ -7669,12 +8062,14 @@ class UsageLedger:
         market_open_at: datetime,
         tick_id: str,
         checked_at: datetime,
+        baseline_equity: float | None,
         current_equity: float,
         max_daily_drawdown_usd: float,
         system_status: str,
         notes: str,
     ) -> dict[str, Any]:
         normalized_broker_id = str(broker_id).strip().lower()
+        baseline_value = current_equity if baseline_equity is None or baseline_equity <= 0 else baseline_equity
         protection_triggered_at = checked_at.isoformat() if system_status == "protected" else None
         with self._connect_sqlite() as connection:
             # Preserve the first baseline and latch `protected` once reached for
@@ -7690,8 +8085,9 @@ class UsageLedger:
                 ON CONFLICT(session_date, broker_id) DO UPDATE SET
                     last_tick_id = excluded.last_tick_id,
                     last_checked_at = excluded.last_checked_at,
+                    baseline_equity = MAX(broker_daily_protection_state.baseline_equity, excluded.baseline_equity),
                     latest_equity = excluded.latest_equity,
-                    equity_drawdown_usd = ROUND(MAX(0, broker_daily_protection_state.baseline_equity - excluded.latest_equity), 6),
+                    equity_drawdown_usd = ROUND(MAX(0, MAX(broker_daily_protection_state.baseline_equity, excluded.baseline_equity) - excluded.latest_equity), 6),
                     max_daily_drawdown_usd = excluded.max_daily_drawdown_usd,
                     system_status = CASE
                         WHEN broker_daily_protection_state.system_status = 'protected' OR excluded.system_status = 'protected'
@@ -7715,12 +8111,12 @@ class UsageLedger:
                     normalized_broker_id,
                     market_open_at.isoformat(),
                     tick_id,
-                    current_equity,
+                    baseline_value,
                     checked_at.isoformat(),
                     tick_id,
                     checked_at.isoformat(),
                     current_equity,
-                    0.0,
+                    max(0.0, baseline_value - current_equity),
                     max_daily_drawdown_usd,
                     system_status,
                     protection_triggered_at,
@@ -7746,12 +8142,14 @@ class UsageLedger:
         market_open_at: datetime,
         tick_id: str,
         checked_at: datetime,
+        baseline_equity: float | None,
         current_equity: float,
         max_daily_drawdown_usd: float,
         system_status: str,
         notes: str,
     ) -> dict[str, Any]:
         normalized_broker_id = str(broker_id).strip().lower()
+        baseline_value = current_equity if baseline_equity is None or baseline_equity <= 0 else baseline_equity
         protection_triggered_at = checked_at if system_status == "protected" else None
         with self._connect_postgres() as connection:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -7771,8 +8169,9 @@ class UsageLedger:
                     ON CONFLICT(session_date, broker_id) DO UPDATE SET
                         last_tick_id = EXCLUDED.last_tick_id,
                         last_checked_at = EXCLUDED.last_checked_at,
+                        baseline_equity = GREATEST(broker_daily_protection_state.baseline_equity, EXCLUDED.baseline_equity),
                         latest_equity = EXCLUDED.latest_equity,
-                        equity_drawdown_usd = GREATEST(0, broker_daily_protection_state.baseline_equity - EXCLUDED.latest_equity),
+                        equity_drawdown_usd = GREATEST(0, GREATEST(broker_daily_protection_state.baseline_equity, EXCLUDED.baseline_equity) - EXCLUDED.latest_equity),
                         max_daily_drawdown_usd = EXCLUDED.max_daily_drawdown_usd,
                         system_status = CASE
                             WHEN broker_daily_protection_state.system_status = 'protected' OR EXCLUDED.system_status = 'protected'
@@ -7797,12 +8196,12 @@ class UsageLedger:
                         normalized_broker_id,
                         market_open_at,
                         tick_id,
-                        current_equity,
+                        baseline_value,
                         checked_at,
                         tick_id,
                         checked_at,
                         current_equity,
-                        0.0,
+                        max(0.0, baseline_value - current_equity),
                         max_daily_drawdown_usd,
                         system_status,
                         protection_triggered_at,

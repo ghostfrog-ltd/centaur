@@ -4,6 +4,8 @@ declare(strict_types=1);
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
 
+require __DIR__ . '/navigation.php';
+
 function flowReadMermaid(string $relativePath): string
 {
     $path = dirname(__DIR__) . '/' . ltrim($relativePath, '/');
@@ -253,12 +255,9 @@ $diagrams = [
         <h1>Flow Map</h1>
         <p class="lede">Rendered Mermaid views of the current control pipeline and the entry decision funnel, with generated runtime nodes tied back to code ownership.</p>
       </div>
-      <nav class="toolbar" aria-label="Primary navigation">
-        <a class="button primary" href="/flow.php">Flow Map</a>
-        <a class="button" href="/">Slot Compounding</a>
-        <a class="button" href="/glossary.php">Glossary</a>
-        <a class="button" href="/dashboard.php">Dashboard</a>
-      </nav>
+      <div class="toolbar centaur-menu-toolbar">
+        <?php centaurRenderNavigation('/flow.php'); ?>
+      </div>
     </header>
 
     <p class="note">Update generated Mermaid files with <code>.venv-mac/bin/python scripts/update_mermaid_visuals.py</code> after changing orchestration, graph nodes, or pipeline order. Generated flow diagrams must show source ownership so the visual stays married to the code and <code>app/</code> folder structure.</p>
