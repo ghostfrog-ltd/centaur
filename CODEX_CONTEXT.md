@@ -23,11 +23,11 @@ Centaur is an auditable trading research and micro paper/live follower system. P
 ## Execution Envelope
 - Active paper lanes: `alpaca_paper` plus separate `trading212_paper` equities where eligible.
 - Approved live lane: Alpaca Live only as the same-as-paper follower recorded on 2026-05-29.
-- Alpaca Live must match paper: same strategies/assets, `$10` entries, 10 base slots, one order per tick, `$1` daily protector, shared paper/shadow fitness. No live-only thresholds/order caps without approval.
+- Alpaca Live must match paper: same strategies/assets, `$10` entries, 10 base slots, one order per tick, `$2` daily protector, shared paper/shadow fitness. No live-only thresholds/order caps without approval.
 - IG is scaffold/shadow only. Trading 212 Live has adapter/readiness wiring but order mutation is hard-disabled. Other brokers/providers fail closed until implemented, tested, reported, and approved.
 - Long-only. Paper trade notional is `$10` unless explicitly approved; Trading 212 paper currently uses `£5` native sizing for the reset £100 demo account.
 - Max orders per tick: `1`. Base slots: `10`; earned slots add +1 per full `$10` tracked P/L above baseline and can fall away.
-- Daily equity drawdown protector: `$1.00`.
+- Daily equity drawdown protector: `$2.00`.
 - Stale unfilled equity entries: reap after `5` minutes.
 - Allowed strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`.
 - Projected-gain floors: equities `1.5%`, crypto `2.0%`.
@@ -35,8 +35,9 @@ Centaur is an auditable trading research and micro paper/live follower system. P
 - Crypto momentum: `1.0%` stop; require instrument identity, reject spikes above `2.5%`, notional candidate volume below `£50,000` where derivable, and spread above `0.25%` when spread evidence exists.
 - Managed exits: capture at `1.25%`; profit ladder evidence at `1.25,2,3,4,6%`.
 - Same-symbol managed exits must use the most protective still-open entry stop.
-- Max-hold red deferral: do not sell red solely because max hold elapsed for `profit_after_1h_else_1d` or `profit_capture_else_1d`.
-- Friday equity no-weekend-carry: block new entries in final 60 minutes; flatten managed equities in final 15 minutes. Crypto unchanged.
+- Alpaca Live follower entries fail closed while any existing live position lacks a persisted managed-exit entry plan.
+- Max-hold is a hard backstop: no red deferral after the configured max hold.
+- Equity no-overnight-carry: block new entries in final 60 minutes of every equity session; flatten equities in final 15 minutes, including missing-plan positions via an audited unmanaged flatten. Crypto uses the hard max-hold backstop.
 - Alpaca Live equity PDT guard: new live equity entries fail closed unless the live account proves prior/effective equity >= `$25,000`; exits still route when permitted. Do not auto-unblock on Alpaca’s 2026-06-04 framework date without observed account/API behaviour and explicit review.
 - Trailing drawdown observer is observe-only until promoted.
 
@@ -44,7 +45,7 @@ Centaur is an auditable trading research and micro paper/live follower system. P
 - Prefer deterministic, auditable logic over opaque AI for trading, risk, execution, fitness, and replay.
 - Equity suppress threshold has adaptive paper-only rails; do not mutate `.env`, notional, broker routing, live readiness, max slots, floors, daily protection, stale-order rules, market-hours rules, long-only policy, or allowlist.
 - Crypto suppress threshold is separate and fixed.
-- Score-to-trade override: already allowed strategies with raw score >= `90.0` survive fitness suppression for paper and same-as-paper live so CFO/risk can evaluate them. Fitness remains ranking/reporting evidence.
+- Score-to-trade override: already allowed strategies with raw score >= configured `PAPER_MIN_SIGNAL_SCORE_TO_TRADE`/`LIVE_MIN_SIGNAL_SCORE_TO_TRADE` survive fitness suppression for paper and same-as-paper live so CFO/risk can evaluate them. Current dial is `90.0`. Fitness remains ranking/reporting evidence.
 - Holding-window advice is recommendation-only. When not compounding, review exits, holding-window advice, profit ladder, stale exits, and fill behaviour before loosening entries.
 
 ## Broker / Adapter Notes
@@ -65,17 +66,21 @@ Centaur is broker-agnostic: core owns instruments, signals, scoring, fitness, ri
 - Canonical instrument registry persists `InstrumentRef`, `canonical_instrument_id`, `venue`, and `venue_symbol` where derivable.
 - Config is `.env` only, grouped core/paper/live. Armed live fails closed on unnamed live-vs-paper differences outside `LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES`.
 - Dashboard/status must label paper, live, shadow, observe-only, recent, all-time, and broker-ledger evidence separately.
-- Slack is one-way notification only, never a command surface.
+- Slack is one-way notification only, never a command surface. Hourly liveness/status messages may be enabled via `SLACK_HOURLY_STATUS_*`; if they stop arriving, treat scheduler/control-loop freshness as suspect until checked.
+- Scheduled test monitoring runs the unit suite and a read-only scheduler freshness check; stale/missing/non-ok control ticks fail the monitor and can alert.
 
 ## Evidence / Reports
 For new evidence, define the question, persist provenance (mode/env/broker/providers/thresholds/execution impact), expose a report/status/query, label observe-only/counterfactual data, and keep queries bounded/indexed.
 
 Useful commands:
+- `.venv-mac/bin/python -m unittest discover tests`
+- `.venv-mac/bin/python scripts/run_test_monitor.py`
 - `.venv-mac/bin/python main.py --status`
 - `.venv-mac/bin/python main.py --evidence-report`
 - `.venv-mac/bin/python main.py --strategy-health --strategy-id <strategy>`
 - `.venv-mac/bin/python main.py --paper-exit-review --strategy-id <strategy>`
 - `.venv-mac/bin/python main.py --holding-window-advice`
+- `.venv-mac/bin/python main.py --overnight-giveback`
 - `.venv-mac/bin/python main.py --crypto-health`
 - `.venv-mac/bin/python main.py --adapter-inventory`
 - `.venv-mac/bin/python main.py --storage-separation-report`

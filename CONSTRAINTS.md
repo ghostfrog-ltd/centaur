@@ -31,7 +31,7 @@
 - Assets: equities and crypto.
 - Notional: `$10` unless approved; Trading 212 paper currently uses `£5` native sizing for the reset £100 demo account.
 - Max orders/tick `1`; base slots `10`; earned slots +1 per full `$10` tracked P/L above baseline and can fall away.
-- Daily equity drawdown protector `$1.00`; long-only.
+- Daily equity drawdown protector `$2.00`; long-only.
 - Allowed strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`.
 - Projected-gain floors: equities `1.5%`, crypto `2.0%`.
 - Crypto momentum: `1.0%` stop; require instrument identity; reject movement > `2.5%`, notional candidate volume < `£50,000` where derivable, and spread > `0.25%` when known.
@@ -39,12 +39,13 @@
 - Stale unfilled equity entries: reap after `5` minutes.
 - Managed exits: capture at `1.25%`; ladder evidence `1.25,2,3,4,6%`.
 - Same-symbol managed exits must use the most protective still-open entry stop.
-- Max-hold red deferral: do not sell red solely because elapsed max hold for `profit_after_1h_else_1d` or `profit_capture_else_1d`.
-- Friday equity no-weekend-carry: block entries in final 60 minutes; flatten managed equities in final 15 minutes. Crypto unchanged.
+- New Alpaca Live follower entries are blocked while any existing live position lacks a persisted managed-exit entry plan.
+- Max-hold is a hard backstop: no red deferral after the configured max hold.
+- Equity no-overnight-carry: block entries in final 60 minutes of every equity session; flatten equities in final 15 minutes, including missing-plan positions via an audited unmanaged flatten. Crypto uses the hard max-hold backstop.
 - Alpaca Live equity PDT guard: new live equity entries fail closed unless prior/effective equity >= `$25,000`; exits still route when permitted. Do not auto-unblock on the 2026-06-04 framework date without observed account/API behaviour and explicit review.
 
 ## Live Lane
-Alpaca Live is same-as-paper only. It must not invent live-only thresholds, order limits, strategies, assets, broker routing, or notional. The final live guard is a real-money safety boundary, not a strategy engine.
+Alpaca Live is same-as-paper only. It must not invent live-only thresholds, order limits, strategies, assets, broker routing, or notional. The final live guard is a real-money safety boundary, not a strategy engine. The live CFO gate also fails closed on new entries while current live positions cannot be matched to persisted managed-exit entry plans.
 
 Crypto momentum has separate paper/live env keys for audit clarity, but armed live defaults to paper values and fails closed on unnamed differences.
 

@@ -80,7 +80,7 @@ class StatusReporter:
                 f"limit_buffer={self.config.paper_execution_limit_buffer_bps:.1f}bps | "
                 f"crypto_limit_buffer={self.config.paper_execution_crypto_limit_buffer_bps:.1f}bps | "
                 f"score_to_trade={self.config.paper_min_signal_score_to_trade:.1f}+ | "
-                f"equity_no_weekend_carry={'on' if self.config.paper_execution_equity_no_weekend_carry_enabled else 'off'}"
+                f"equity_no_overnight_carry={'on' if self.config.paper_execution_equity_no_weekend_carry_enabled else 'off'}"
                 f"/entry_cutoff={self.config.paper_execution_equity_friday_entry_cutoff_minutes_before_close}m"
                 f"/flatten={self.config.paper_execution_equity_friday_flatten_minutes_before_close}m | "
                 f"trailing_observer={'on' if self.config.trailing_drawdown_observer_enabled else 'off'}"
@@ -1748,6 +1748,9 @@ class StatusReporter:
             "crypto_min_projected_gain_pct": float(
                 self.config.live_execution_crypto_min_projected_gain_pct
             ),
+            "min_signal_score_to_trade": float(
+                self.config.live_min_signal_score_to_trade
+            ),
             "limit_buffer_bps": float(self.config.live_execution_limit_buffer_bps),
             "crypto_limit_buffer_bps": float(
                 self.config.live_execution_crypto_limit_buffer_bps
@@ -2278,6 +2281,7 @@ class StatusReporter:
                 f"Asset scope={asset_scope} | allowed_strategies={strategies} | "
                 f"projected_gain=equity {float(overview.get('min_projected_gain_pct') or 0) * 100:.2f}%"
                 f"/crypto {float(overview.get('crypto_min_projected_gain_pct') or 0) * 100:.2f}% | "
+                f"score_to_trade={self._fmt_number(overview.get('min_signal_score_to_trade'), decimals=1)}+ | "
                 f"limit_buffer=equity {self._fmt_number(overview.get('limit_buffer_bps'), decimals=1)}bps"
                 f"/crypto {self._fmt_number(overview.get('crypto_limit_buffer_bps'), decimals=1)}bps"
             ),

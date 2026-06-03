@@ -73,10 +73,16 @@ def run_implementation(context: TickContext) -> PipelineResult:
         context,
         equity_threshold=suppress_threshold,
     )
-    # Second pass: apply the actual thresholds used by paper allocation. A
-    # paper-approved raw setup at or above the score-to-trade dial survives
-    # fitness suppression; CFO/risk still enforces instrument, projected-gain,
-    # duplicate, capacity, market, and drawdown gates before execution.
+    score_to_trade_threshold = (
+        context.config.live_min_signal_score_to_trade
+        if context.config.centaur_environment == "live"
+        else context.config.paper_min_signal_score_to_trade
+    )
+    # Second pass: apply the actual thresholds used by allocation. A strategy
+    # already approved for the active lane can survive fitness suppression only
+    # when its raw setup score meets that lane's configured score-to-trade dial;
+    # CFO/risk still enforces instrument, projected-gain, duplicate, capacity,
+    # market, and drawdown gates before execution.
     signal_dicts, allocation_stats = allocate_strategy_signals(
         signals=base_signal_dicts,
         fitness_summaries=fitness_summaries,
@@ -88,9 +94,7 @@ def run_implementation(context: TickContext) -> PipelineResult:
             bool(context.config.paper_execution_enabled)
             and not bool(context.config.paper_execution_kill_switch)
         ),
-        high_score_override_min_score=(
-            context.config.paper_min_signal_score_to_trade
-        ),
+        high_score_override_min_score=score_to_trade_threshold,
         high_score_override_fitness_margin=(
             context.config.paper_execution_high_score_override_fitness_margin
         ),

@@ -1379,6 +1379,28 @@ class UsageLedger:
             normalized_rows.append(normalized)
         return normalized_rows
 
+    def list_daily_shadow_proposal_counts(
+        self,
+        *,
+        days: int = 90,
+    ) -> list[dict[str, Any]]:
+        bounded_days = max(1, min(int(days), 366))
+        since = datetime.now().astimezone() - timedelta(days=bounded_days)
+        if self.backend == "postgres":
+            return self._list_daily_shadow_proposal_counts_postgres(since=since)
+        return self._list_daily_shadow_proposal_counts_sqlite(since=since)
+
+    def list_daily_proposal_execution_counts(
+        self,
+        *,
+        days: int = 90,
+    ) -> list[dict[str, Any]]:
+        bounded_days = max(1, min(int(days), 366))
+        since = datetime.now().astimezone() - timedelta(days=bounded_days)
+        if self.backend == "postgres":
+            return self._list_daily_proposal_execution_counts_postgres(since=since)
+        return self._list_daily_proposal_execution_counts_sqlite(since=since)
+
     def get_shadow_trade_proposal(self, *, proposal_id: str) -> dict[str, Any] | None:
         normalized_proposal_id = str(proposal_id).strip()
         if not normalized_proposal_id:
@@ -2573,8 +2595,14 @@ class UsageLedger:
                     "strategy_id": "TEXT NOT NULL DEFAULT ''",
                     "strategy_family": "TEXT NOT NULL DEFAULT ''",
                     "profile_id": "TEXT NOT NULL DEFAULT ''",
+                    "base_signal_score": "REAL NOT NULL DEFAULT 0",
                     "signal_score": "REAL NOT NULL DEFAULT 0",
                     "signal_confidence": "REAL NOT NULL DEFAULT 0",
+                    "allocation_status": "TEXT NOT NULL DEFAULT ''",
+                    "fitness_composite_score": "REAL",
+                    "fitness_sample_weight": "REAL",
+                    "fitness_checkpoints_evaluated": "INTEGER NOT NULL DEFAULT 0",
+                    "suppress_threshold_used": "REAL",
                     "rationale": "TEXT NOT NULL DEFAULT ''",
                     "environment": "TEXT NOT NULL DEFAULT 'paper'",
                     "mode": "TEXT NOT NULL DEFAULT 'paper'",
@@ -3599,6 +3627,12 @@ class UsageLedger:
                 cursor.execute(
                     """
                     ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS base_signal_score DOUBLE PRECISION NOT NULL DEFAULT 0
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
                     ADD COLUMN IF NOT EXISTS signal_score DOUBLE PRECISION NOT NULL DEFAULT 0
                     """
                 )
@@ -3606,6 +3640,36 @@ class UsageLedger:
                     """
                     ALTER TABLE shadow_trade_proposals
                     ADD COLUMN IF NOT EXISTS signal_confidence DOUBLE PRECISION NOT NULL DEFAULT 0
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS allocation_status TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS fitness_composite_score DOUBLE PRECISION
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS fitness_sample_weight DOUBLE PRECISION
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS fitness_checkpoints_evaluated INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE shadow_trade_proposals
+                    ADD COLUMN IF NOT EXISTS suppress_threshold_used DOUBLE PRECISION
                     """
                 )
                 cursor.execute(
@@ -3892,6 +3956,38 @@ class UsageLedger:
                     sql.Identifier(execution_schema),
                     sql.Identifier(table_name),
                 )
+            )
+        self._ensure_postgres_shadow_proposal_fitness_columns(
+            cursor,
+            schema_name=core_schema,
+        )
+
+    def _ensure_postgres_shadow_proposal_fitness_columns(
+        self,
+        cursor,
+        *,
+        schema_name: str,
+    ) -> None:
+        if sql is None:  # pragma: no cover
+            raise RuntimeError("psycopg2.sql is not available.")
+        table = sql.SQL("{}.{}").format(
+            sql.Identifier(schema_name),
+            sql.Identifier("shadow_trade_proposals"),
+        )
+        for column_name, column_type in (
+            ("base_signal_score", "DOUBLE PRECISION NOT NULL DEFAULT 0"),
+            ("allocation_status", "TEXT NOT NULL DEFAULT ''"),
+            ("fitness_composite_score", "DOUBLE PRECISION"),
+            ("fitness_sample_weight", "DOUBLE PRECISION"),
+            ("fitness_checkpoints_evaluated", "INTEGER NOT NULL DEFAULT 0"),
+            ("suppress_threshold_used", "DOUBLE PRECISION"),
+        ):
+            cursor.execute(
+                sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} ").format(
+                    table,
+                    sql.Identifier(column_name),
+                )
+                + sql.SQL(column_type)
             )
 
 
@@ -5734,12 +5830,14 @@ class UsageLedger:
                     environment, mode, source_environment, data_provider, execution_provider,
                     canonical_instrument_id, venue, venue_symbol,
                     source, symbol, asset_class, direction, status, action_bias, opportunity_score,
-                    signal_score, signal_confidence, confidence,
+                    base_signal_score, signal_score, signal_confidence, confidence,
+                    allocation_status, fitness_composite_score, fitness_sample_weight,
+                    fitness_checkpoints_evaluated, suppress_threshold_used,
                     discovery_score, entry_price, entry_price_gbp, stop_loss_price,
                     stop_loss_price_gbp, target_price, target_price_gbp, risk_pct,
                     target_return_pct, holding_window_code, holding_window_minutes,
                     thesis, risks_json, rationale, note, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id) DO UPDATE SET
                     environment = excluded.environment,
                     mode = excluded.mode,
@@ -5755,9 +5853,15 @@ class UsageLedger:
                     status = excluded.status,
                     action_bias = excluded.action_bias,
                     opportunity_score = excluded.opportunity_score,
+                    base_signal_score = excluded.base_signal_score,
                     signal_score = excluded.signal_score,
                     signal_confidence = excluded.signal_confidence,
                     confidence = excluded.confidence,
+                    allocation_status = excluded.allocation_status,
+                    fitness_composite_score = excluded.fitness_composite_score,
+                    fitness_sample_weight = excluded.fitness_sample_weight,
+                    fitness_checkpoints_evaluated = excluded.fitness_checkpoints_evaluated,
+                    suppress_threshold_used = excluded.suppress_threshold_used,
                     discovery_score = excluded.discovery_score,
                     entry_price = excluded.entry_price,
                     entry_price_gbp = excluded.entry_price_gbp,
@@ -5798,9 +5902,15 @@ class UsageLedger:
                         item.get("status", "active"),
                         item.get("action_bias", "watch"),
                         item.get("opportunity_score", 0),
+                        item.get("base_signal_score", item.get("opportunity_score", 0)),
                         item.get("signal_score", item.get("opportunity_score", 0)),
                         item.get("signal_confidence", item.get("confidence", 0)),
                         item.get("confidence", 0),
+                        item.get("allocation_status", ""),
+                        item.get("fitness_composite_score"),
+                        item.get("fitness_sample_weight"),
+                        item.get("fitness_checkpoints_evaluated", 0),
+                        item.get("suppress_threshold_used"),
                         item.get("discovery_score", 0),
                         item["entry_price"],
                         item.get("entry_price_gbp"),
@@ -5869,13 +5979,15 @@ class UsageLedger:
                         environment, mode, source_environment, data_provider, execution_provider,
                         canonical_instrument_id, venue, venue_symbol,
                         source, symbol, asset_class, direction, status, action_bias, opportunity_score,
-                        signal_score, signal_confidence, confidence,
+                        base_signal_score, signal_score, signal_confidence, confidence,
+                        allocation_status, fitness_composite_score, fitness_sample_weight,
+                        fitness_checkpoints_evaluated, suppress_threshold_used,
                         discovery_score, entry_price, entry_price_gbp, stop_loss_price,
                         stop_loss_price_gbp, target_price, target_price_gbp, risk_pct,
                         target_return_pct, holding_window_code, holding_window_minutes,
                         thesis, risks_json, rationale, note, raw_json
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb
                     )
                     ON CONFLICT(proposal_id) DO UPDATE SET
                         environment = EXCLUDED.environment,
@@ -5892,9 +6004,15 @@ class UsageLedger:
                         status = EXCLUDED.status,
                         action_bias = EXCLUDED.action_bias,
                         opportunity_score = EXCLUDED.opportunity_score,
+                        base_signal_score = EXCLUDED.base_signal_score,
                         signal_score = EXCLUDED.signal_score,
                         signal_confidence = EXCLUDED.signal_confidence,
                         confidence = EXCLUDED.confidence,
+                        allocation_status = EXCLUDED.allocation_status,
+                        fitness_composite_score = EXCLUDED.fitness_composite_score,
+                        fitness_sample_weight = EXCLUDED.fitness_sample_weight,
+                        fitness_checkpoints_evaluated = EXCLUDED.fitness_checkpoints_evaluated,
+                        suppress_threshold_used = EXCLUDED.suppress_threshold_used,
                         discovery_score = EXCLUDED.discovery_score,
                         entry_price = EXCLUDED.entry_price,
                         entry_price_gbp = EXCLUDED.entry_price_gbp,
@@ -5935,9 +6053,15 @@ class UsageLedger:
                             item.get("status", "active"),
                             item.get("action_bias", "watch"),
                             item.get("opportunity_score", 0),
+                            item.get("base_signal_score", item.get("opportunity_score", 0)),
                             item.get("signal_score", item.get("opportunity_score", 0)),
                             item.get("signal_confidence", item.get("confidence", 0)),
                             item.get("confidence", 0),
+                            item.get("allocation_status", ""),
+                            item.get("fitness_composite_score"),
+                            item.get("fitness_sample_weight"),
+                            item.get("fitness_checkpoints_evaluated", 0),
+                            item.get("suppress_threshold_used"),
                             item.get("discovery_score", 0),
                             item["entry_price"],
                             item.get("entry_price_gbp"),
@@ -6418,6 +6542,161 @@ class UsageLedger:
                 )
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
+
+    def _list_daily_shadow_proposal_counts_sqlite(
+        self,
+        *,
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT date(proposed_at) AS proposal_date,
+                       COALESCE(NULLIF(source_environment, ''), 'shadow') AS lane,
+                       COALESCE(NULLIF(environment, ''), 'unknown') AS environment,
+                       COALESCE(NULLIF(mode, ''), 'unknown') AS mode,
+                       COALESCE(NULLIF(allocation_status, ''), 'untracked') AS allocation_status,
+                       COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                       COUNT(*) AS proposal_count,
+                       AVG(CASE WHEN allocation_status <> '' THEN base_signal_score ELSE NULL END) AS avg_base_signal_score,
+                       MIN(signal_score) AS min_signal_score,
+                       MAX(signal_score) AS max_signal_score,
+                       AVG(signal_score) AS avg_signal_score,
+                       MIN(fitness_composite_score) AS min_fitness_composite_score,
+                       MAX(fitness_composite_score) AS max_fitness_composite_score,
+                       AVG(fitness_composite_score) AS avg_fitness_composite_score
+                FROM shadow_trade_proposals
+                WHERE proposed_at >= ?
+                GROUP BY 1, 2, 3, 4, 5, 6
+                ORDER BY proposal_date DESC, lane ASC, environment ASC, allocation_status ASC, strategy_id ASC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_daily_shadow_proposal_counts_postgres(
+        self,
+        *,
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        with self._connect_postgres(scope="core") as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT proposed_at::date AS proposal_date,
+                           COALESCE(NULLIF(source_environment, ''), 'shadow') AS lane,
+                           COALESCE(NULLIF(environment, ''), 'unknown') AS environment,
+                           COALESCE(NULLIF(mode, ''), 'unknown') AS mode,
+                           COALESCE(NULLIF(allocation_status, ''), 'untracked') AS allocation_status,
+                           COALESCE(NULLIF(strategy_id, ''), 'unassigned') AS strategy_id,
+                           COUNT(*) AS proposal_count,
+                           AVG(CASE WHEN allocation_status <> '' THEN base_signal_score ELSE NULL END) AS avg_base_signal_score,
+                           MIN(signal_score) AS min_signal_score,
+                           MAX(signal_score) AS max_signal_score,
+                           AVG(signal_score) AS avg_signal_score,
+                           MIN(fitness_composite_score) AS min_fitness_composite_score,
+                           MAX(fitness_composite_score) AS max_fitness_composite_score,
+                           AVG(fitness_composite_score) AS avg_fitness_composite_score
+                    FROM shadow_trade_proposals
+                    WHERE proposed_at >= %s
+                    GROUP BY 1, 2, 3, 4, 5, 6
+                    ORDER BY proposal_date DESC, lane ASC, environment ASC, allocation_status ASC, strategy_id ASC
+                    """,
+                    (since,),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_daily_proposal_execution_counts_sqlite(
+        self,
+        *,
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT date(p.proposed_at) AS proposal_date,
+                       COALESCE(NULLIF(o.broker_id, ''), 'unknown') AS lane,
+                       COALESCE(NULLIF(o.environment, ''), 'unknown') AS environment,
+                       COALESCE(NULLIF(o.mode, ''), 'unknown') AS mode,
+                       COALESCE(NULLIF(p.allocation_status, ''), 'untracked') AS allocation_status,
+                       COALESCE(NULLIF(p.strategy_id, ''), NULLIF(o.strategy_id, ''), 'unassigned') AS strategy_id,
+                       COUNT(DISTINCT o.proposal_id) AS proposal_count,
+                       COUNT(*) AS order_count,
+                       AVG(CASE WHEN p.allocation_status <> '' THEN p.base_signal_score ELSE NULL END) AS avg_base_signal_score,
+                       MIN(p.signal_score) AS min_signal_score,
+                       MAX(p.signal_score) AS max_signal_score,
+                       AVG(p.signal_score) AS avg_signal_score,
+                       MIN(p.fitness_composite_score) AS min_fitness_composite_score,
+                       MAX(p.fitness_composite_score) AS max_fitness_composite_score,
+                       AVG(p.fitness_composite_score) AS avg_fitness_composite_score
+                FROM paper_trade_orders o
+                JOIN shadow_trade_proposals p ON p.proposal_id = o.proposal_id
+                WHERE o.proposal_id <> ''
+                  AND p.proposed_at >= ?
+                GROUP BY 1, 2, 3, 4, 5, 6
+                ORDER BY proposal_date DESC, lane ASC, environment ASC, allocation_status ASC, strategy_id ASC
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_daily_proposal_execution_counts_postgres(
+        self,
+        *,
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        core_schema = self._postgres_core_schema_name()
+        lane_schemas = sorted(
+            {
+                self._postgres_paper_schema_name(),
+                self._postgres_live_schema_name(),
+                self._postgres_execution_schema_name(),
+            }
+        )
+        rows: list[dict[str, Any]] = []
+        with self._connect_postgres(apply_schema=False) as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                for lane_schema in lane_schemas:
+                    cursor.execute(
+                        "SELECT to_regclass(%s)",
+                        (f"{lane_schema}.paper_trade_orders",),
+                    )
+                    if cursor.fetchone()["to_regclass"] is None:
+                        continue
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            SELECT p.proposed_at::date AS proposal_date,
+                                   COALESCE(NULLIF(o.broker_id, ''), 'unknown') AS lane,
+                                   COALESCE(NULLIF(o.environment, ''), 'unknown') AS environment,
+                                   COALESCE(NULLIF(o.mode, ''), 'unknown') AS mode,
+                                   COALESCE(NULLIF(p.allocation_status, ''), 'untracked') AS allocation_status,
+                                   COALESCE(NULLIF(p.strategy_id, ''), NULLIF(o.strategy_id, ''), 'unassigned') AS strategy_id,
+                                   COUNT(DISTINCT o.proposal_id) AS proposal_count,
+                                   COUNT(*) AS order_count,
+                                   AVG(CASE WHEN p.allocation_status <> '' THEN p.base_signal_score ELSE NULL END) AS avg_base_signal_score,
+                                   MIN(p.signal_score) AS min_signal_score,
+                                   MAX(p.signal_score) AS max_signal_score,
+                                   AVG(p.signal_score) AS avg_signal_score,
+                                   MIN(p.fitness_composite_score) AS min_fitness_composite_score,
+                                   MAX(p.fitness_composite_score) AS max_fitness_composite_score,
+                                   AVG(p.fitness_composite_score) AS avg_fitness_composite_score
+                            FROM {}.paper_trade_orders o
+                            JOIN {}.shadow_trade_proposals p ON p.proposal_id = o.proposal_id
+                            WHERE o.proposal_id <> ''
+                              AND p.proposed_at >= %s
+                            GROUP BY 1, 2, 3, 4, 5, 6
+                            ORDER BY proposal_date DESC, lane ASC, environment ASC, allocation_status ASC, strategy_id ASC
+                            """
+                        ).format(
+                            sql.Identifier(lane_schema),
+                            sql.Identifier(core_schema),
+                        ),
+                        (since,),
+                    )
+                    rows.extend(dict(row) for row in cursor.fetchall())
+        return rows
 
     def _list_due_shadow_trade_outcomes_sqlite(
         self,

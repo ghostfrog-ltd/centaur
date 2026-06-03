@@ -147,17 +147,17 @@ Centaur does not buy `$10` of anything that moved up. A paper trade must pass:
 
 Only after those pass does the system size the order at `$10`.
 
-### High-score near-miss override
+### Score-to-trade override
 
 This was added after the 2026-05-28 diagnosis.
 
-If a paper-allowed strategy has a raw `signal_score >= 90.0`, and its composite fitness is only slightly below the active suppress threshold, it can survive suppression.
+If an already allowed strategy has a raw `signal_score` at or above the active score-to-trade dial, it can survive suppression. Paper uses `PAPER_MIN_SIGNAL_SCORE_TO_TRADE`; live/live-dry uses `LIVE_MIN_SIGNAL_SCORE_TO_TRADE`. The current same-as-paper dial is `90.0`.
 
 Current settings:
 
 ```text
-PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_ENABLED=true
-PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE=90.0
+PAPER_MIN_SIGNAL_SCORE_TO_TRADE=90.0
+LIVE_MIN_SIGNAL_SCORE_TO_TRADE=90.0
 PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN=0.25
 ```
 
@@ -187,10 +187,13 @@ Paper managed exits can sell when:
 - `1.25%` profit capture is hit
 - the larger planned target is hit
 - a managed policy says the hold/backstop has elapsed
+- an equity position reaches the final same-day flatten window
 
-For `crypto_momentum.trend`, the current managed policy is `profit_capture_else_1d`: the `1.25%` capture, stop, and larger target stay active, but if none of them hit the position can hold up to a `1d` backstop.
+For equities, Centaur is no-overnight-carry: new entries are blocked in the final 60 minutes of the equity session, and equity positions are flattened in the final 15 minutes regardless of red/green. Positions missing a managed entry plan use an audited unmanaged flatten instead of being allowed to drift overnight.
 
-For `mean_reversion.snapback`, profitable positions may exit after `1h`, while non-profitable positions can continue under stop/target protection until a `1d` backstop.
+For `crypto_momentum.trend`, the current managed policy is `profit_capture_else_1d`: the `1.25%` capture, stop, and larger target stay active, but if none of them hit the position exits at the hard `1d` backstop.
+
+For `mean_reversion.snapback`, profitable positions may exit after `1h`, while non-profitable positions can continue under stop/target protection until the same-day equity flatten window.
 
 ## Shadow Learning
 
@@ -419,7 +422,7 @@ Live crypto momentum values default to the paper values. When live is armed, any
 : Per-trade size. Currently `$10.00`.
 
 `PAPER_EXECUTION_MAX_DAILY_DRAWDOWN_USD`
-: Daily equity drawdown protector. Currently `$5.00`.
+: Daily equity drawdown protector. Currently `$2.00`.
 
 `PAPER_EXECUTION_STALE_ORDER_MINUTES`
 : Unfilled equity entry limits older than this are canceled.
@@ -520,8 +523,14 @@ Live crypto momentum values default to the paper values. When live is armed, any
 `SLACK_ALERT_DEDUPE_MINUTES` / `SLACK_REQUEST_TIMEOUT_SECONDS`
 : Dedupe window and request timeout for Slack alerts. Notification events are persisted so the scheduler does not spam repeated tick-level warnings.
 
+`SLACK_HOURLY_STATUS_ENABLED` / `SLACK_HOURLY_STATUS_INTERVAL_MINUTES`
+: Sends a one-way hourly Slack liveness/status message from the normal control tick. If the message stops arriving, treat the scheduler/control loop as stale until proven healthy.
+
 `TEST_MONITOR_ENABLED`
-: Enables the scheduled unit-test monitor. The monitor runs the test command, persists only a small JSON status file, and never mutates trading state.
+: Enables the scheduled unit-test monitor. The monitor runs the test command, checks scheduler freshness, persists only a small JSON status file, and never mutates trading state.
+
+`TEST_MONITOR_COMMAND`
+: Optional override for the build/change test command. Leave blank to run `python -m unittest discover tests` with the monitor's Python.
 
 `TEST_MONITOR_SLACK_ENABLED`
 : Optional override for test monitor Slack alerts. Leave blank to inherit `SLACK_ALERTS_ENABLED`.
@@ -531,6 +540,21 @@ Live crypto momentum values default to the paper values. When live is armed, any
 
 `TEST_MONITOR_STATE_PATH` / `TEST_MONITOR_LOG_PATH`
 : JSON state and append-only log paths for scheduled test monitoring.
+
+`TEST_MONITOR_SCHEDULER_FRESHNESS_ENABLED` / `TEST_MONITOR_SCHEDULER_MAX_AGE_MINUTES`
+: Adds a cron/launchd working check to the scheduled test monitor. The monitor fails if the latest persisted control tick is missing, not `ok`, or older than the configured freshness limit.
+
+For each build/change, run the unit suite:
+
+```bash
+.venv-mac/bin/python -m unittest discover tests
+```
+
+For the scheduled operational check, including the scheduler freshness test, run:
+
+```bash
+.venv-mac/bin/python scripts/run_test_monitor.py
+```
 
 To acknowledge the current failure fingerprint and stop reminders until tests change or recover:
 
@@ -660,7 +684,9 @@ Live trading requires all of these to be intentionally handled:
 API keys plus `LIVE_EXECUTION_ENABLED=true` are not enough. Live entries only
 follow paper trades that were approved and actually submitted on the same tick;
 guarded cancellation and managed sell exits exist so a deliberately activated
-live lane can protect positions like paper.
+live lane can protect positions like paper. New live follower entries are also
+blocked while any existing Alpaca Live position lacks a persisted managed-exit
+entry plan.
 
 Do not infer live readiness from paper success.
 
@@ -670,7 +696,7 @@ and no positions or recent/open orders. That balance does not widen the `$10 x
 10` live envelope. First-live strategy policy, limits, and rollback rules are
 now recorded: by operator request, live starts as a same-as-paper follower lane
 using the current paper strategy allowlist, equities plus crypto, `$10` entries,
-`10` base slots, one order per tick, the `$5.00` live daily protector, shared
+`10` base slots, one order per tick, the `$2.00` live daily protector, shared
 paper/shadow fitness, and read-only live execution intelligence. The extra
 `32.05` above the `$100` operating envelope is buffer only. On 2026-05-29 at
 about 10:48 BST, the operator explicitly approved turning Alpaca Live on within

@@ -553,7 +553,7 @@ function initialSnapshotJson(): string
       </div>
       <div class="toolbar">
         <button id="preset-current" class="button primary" type="button">Current Envelope</button>
-        <button id="preset-fast" class="button" type="button">Faster Test</button>
+        <a class="button" href="/proposal-counts.php">Proposal Counts</a>
         <button id="reset" class="button" type="button">Reset</button>
         <a class="button" href="/reports/50-dollar-day-plan.md" download>Download Plan</a>
         <a class="button" href="/flow.php">Flow Map</a>
@@ -829,20 +829,6 @@ function initialSnapshotJson(): string
       startingProfit: 0,
       cycles: currentEnvelope.activeDaysPerYear,
       cyclesPerDay: 1
-    };
-
-    const fastPreset = {
-      baseSlots: 10,
-      slotSize: 10,
-      backMode: "percent",
-      returnPercent: 2.5,
-      returnDollars: 0.25,
-      winRate: 100,
-      lossPercent: 0,
-      slotFill: 100,
-      startingProfit: 0,
-      cycles: 240,
-      cyclesPerDay: 12
     };
 
     const fields = {
@@ -1644,7 +1630,6 @@ function initialSnapshotJson(): string
         }
       }
     });
-    document.getElementById("preset-fast").addEventListener("click", () => applyPreset(fastPreset, "Faster test"));
     document.getElementById("reset").addEventListener("click", () => applyPreset(defaults, "Current envelope"));
     window.addEventListener("resize", render);
 

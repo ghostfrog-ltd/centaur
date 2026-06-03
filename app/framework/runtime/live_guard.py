@@ -79,17 +79,23 @@ class LiveRiskGuard:
             raise LiveRiskGuardError("trading212_live_not_approved")
 
         normalized_action = str(action or "").strip().lower()
-        if normalized_action in {"entry", "exit"}:
-            normalized_strategy_id = str(strategy_id or "").strip().lower()
-            allowed_strategies = {
-                str(item).strip().lower()
-                for item in getattr(config, "live_execution_allowed_strategies", ())
-                if str(item).strip()
-            }
-            if not allowed_strategies:
-                raise LiveRiskGuardError("no_live_strategies_allowed")
-            if normalized_strategy_id not in allowed_strategies:
-                raise LiveRiskGuardError("strategy_not_allowed_live")
+        if normalized_action in {"entry", "exit", "flatten"}:
+            if normalized_action != "flatten":
+                normalized_strategy_id = str(strategy_id or "").strip().lower()
+                allowed_strategies = {
+                    str(item).strip().lower()
+                    for item in getattr(config, "live_execution_allowed_strategies", ())
+                    if str(item).strip()
+                }
+                if not allowed_strategies:
+                    raise LiveRiskGuardError("no_live_strategies_allowed")
+                if normalized_strategy_id not in allowed_strategies:
+                    raise LiveRiskGuardError("strategy_not_allowed_live")
+            elif (
+                not isinstance(order_request, dict)
+                or str(order_request.get("side", "")).strip().lower() != "sell"
+            ):
+                raise LiveRiskGuardError("live_flatten_requires_sell")
             self._assert_instrument_allowed(
                 broker_id=normalized_broker_id,
                 order_request=order_request,

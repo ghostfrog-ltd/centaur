@@ -10,6 +10,7 @@ from app.framework.reporting.adapter_inventory import AdapterInventoryReport
 from app.framework.reporting.crypto_health_report import CryptoHealthReport
 from app.framework.reporting.evidence_report import EvidenceReport
 from app.framework.reporting.holding_window_advisor import HoldingWindowAdvisor
+from app.framework.reporting.overnight_giveback_report import OvernightGivebackReport
 from app.framework.reporting.paper_exit_review import PaperExitReview
 from app.framework.reporting.status import StatusReporter
 from app.framework.reporting.strategy_health_report import StrategyHealthReport
@@ -80,6 +81,11 @@ def parse_args() -> argparse.Namespace:
         "--crypto-health",
         action="store_true",
         help="Run a read-only crypto health report focused on overnight crypto scan activity and signal visibility.",
+    )
+    parser.add_argument(
+        "--overnight-giveback",
+        action="store_true",
+        help="Run a read-only report for 01:00-to-09:00 Alpaca Paper mark-to-market giveback.",
     )
     parser.add_argument(
         "--evidence-report",
@@ -236,6 +242,16 @@ def main() -> None:
         print(
             reporter.render(
                 report=reporter.build_report(lookback_hours=lookback_hours)
+            ),
+            flush=True,
+        )
+        return
+
+    if args.overnight_giveback:
+        reporter = OvernightGivebackReport()
+        print(
+            reporter.render(
+                report=reporter.build_report(days=args.days if args.days > 0 else 7)
             ),
             flush=True,
         )

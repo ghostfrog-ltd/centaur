@@ -9,8 +9,12 @@ from app.heartbeat.support import (
     _account_trade_ready,
     _build_live_trade_approval,
     _earned_slot_policy,
+    _find_most_protective_managed_entry_order,
     _live_runtime_allows_broker_reads,
 )
+
+
+LIVE_ENTRY_PLAN_AUDIT_ORDER_LIMIT = 500
 
 
 def run_implementation(context: TickContext) -> PipelineResult:
@@ -57,6 +61,7 @@ def run_implementation(context: TickContext) -> PipelineResult:
     orders_summary = context.state.get("alpaca_live_orders", {}).get("summary", {})
     open_positions = int(positions_summary.get("open_positions", 0) or 0)
     open_orders = int(orders_summary.get("open_orders", 0) or 0)
+    unmanaged_live_symbols = _unmanaged_live_position_symbols(context)
     occupied_slots = open_positions + open_orders
     slot_policy = _earned_slot_policy(
         context=context,
@@ -90,6 +95,8 @@ def run_implementation(context: TickContext) -> PipelineResult:
         reason = gate["reason"]
     elif not config.live_execution_allowed_strategies:
         reason = "no_live_strategies_allowed"
+    elif unmanaged_live_symbols:
+        reason = "unmanaged_live_positions_present"
     elif not paper_approvals:
         reason = "no_paper_approved_trade_to_follow"
     elif not submitted_paper_approvals:
@@ -176,6 +183,9 @@ def run_implementation(context: TickContext) -> PipelineResult:
         "earned_slots": int(slot_policy["earned_slots"]),
         "earned_slot_pnl_usd": slot_policy["total_pnl_usd"],
     }
+    if unmanaged_live_symbols:
+        result["unmanaged_live_positions"] = unmanaged_live_symbols
+        result["unmanaged_live_position_count"] = len(unmanaged_live_symbols)
     if approved:
         result["approved_symbols"] = [item["symbol"] for item in approved]
         result["approved_strategy"] = approved[0]["strategy_id"]
@@ -188,3 +198,45 @@ def run_implementation(context: TickContext) -> PipelineResult:
         "rejected_candidates": rejected,
     }
     return result
+
+
+def _unmanaged_live_position_symbols(context: TickContext) -> list[str]:
+    """Return live positions that lack a persisted managed-exit entry plan.
+
+    Live entries may only follow paper, but existing real-money exposure still
+    needs an auditable stop/target/holding policy before new live exposure is
+    added. This entry gate is intentionally conservative and leaves sell exits
+    available when a managed plan exists.
+    """
+    positions = list(context.state.get("alpaca_live_positions", {}).get("raw", []))
+    if not positions:
+        return []
+    list_orders = getattr(
+        context.usage_ledger,
+        "list_recent_execution_lane_trade_orders",
+        None,
+    )
+    if list_orders is None:
+        return [
+            str(position.get("symbol", "")).upper()
+            for position in positions
+            if str(position.get("symbol", "")).strip()
+        ]
+    recent_orders = list(list_orders(limit=LIVE_ENTRY_PLAN_AUDIT_ORDER_LIMIT))
+    missing: list[str] = []
+    for position in positions:
+        symbol = str(position.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        broker_id = (
+            str(position.get("broker_id", "alpaca_live")).strip().lower()
+            or "alpaca_live"
+        )
+        entry_order = _find_most_protective_managed_entry_order(
+            symbol=symbol,
+            orders=recent_orders,
+            broker_id=broker_id,
+        )
+        if entry_order is None:
+            missing.append(symbol)
+    return sorted(set(missing))

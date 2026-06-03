@@ -52,7 +52,7 @@ If a human override is granted, first live mode should still be extremely constr
 - same risk rules and same kill-switch mentality
 - immediate rollback to paper on suspicious behavior
 
-The 2026-05-29 operator-selected plan explicitly chooses the same-as-paper follower lane instead of the one-strategy default. That exception is acceptable only while the `$10` notional, `10` base slots, one-order-per-tick cap, same-tick submitted-paper-order follow rule, `$5.00` daily protector, and rollback triggers remain in force.
+The 2026-05-29 operator-selected plan explicitly chooses the same-as-paper follower lane instead of the one-strategy default. That exception is acceptable only while the `$10` notional, `10` base slots, one-order-per-tick cap, same-tick submitted-paper-order follow rule, `$2.00` daily protector, and rollback triggers remain in force.
 
 ## Current Dormant Live Lane
 Current May-readiness prep is:
@@ -63,7 +63,7 @@ Current May-readiness prep is:
 - planned maximum envelope: `10 x 10` Alpaca account-currency units
 - readiness asset classes: equities and crypto, matching paper
 - readiness strategy allowlist: `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`, matching paper
-- readiness entry economics: `$10` notional, one order per tick, `$5.00` daily drawdown protector, `1.5%` equity projected-gain floor, `2.0%` crypto projected-gain floor, `5` bps equity limit buffer, and `25` bps crypto limit buffer
+- readiness entry economics: `$10` notional, one order per tick, `$2.00` daily drawdown protector, `1.5%` equity projected-gain floor, `2.0%` crypto projected-gain floor, `5` bps equity limit buffer, and `25` bps crypto limit buffer
 - earned-slot rule: after live has its own baseline, each full `10` account-currency units of tracked P/L may add one effective `10` unit slot
 - live entry submission: dormant unless all explicit go-live gates pass
 - live cancellation/stale-order cleanup: implemented but guarded by live credentials plus activation acknowledgement
@@ -162,7 +162,7 @@ Rollback triggers:
 - any live order that does not correspond to a same-proposal submitted paper order
 - any surprising live-vs-paper fill drift, status mismatch, reject, or partial-fill behavior
 - any stale live order that cannot be canceled/refreshed by the guarded live path
-- live daily drawdown reaches the configured `$5.00` protector
+- live daily drawdown reaches the configured `$2.00` protector
 - account/equity numbers diverge from Alpaca or become unavailable
 - the operator is unsure or uncomfortable with what happened
 
@@ -178,7 +178,7 @@ Before activating live entries, do this in order:
 
 1. Re-run the read-only status/sync check immediately before activation and confirm Alpaca Live cash, equity, buying power, positions, and orders are still sane.
 2. Confirm the live account has no unexpected positions and no unexpected open orders.
-3. Confirm the live readiness envelope still matches the intended first phase: `$10` notional, one order per tick, `10` base slots, `$5.00` daily protector, same paper strategy allowlist, equities plus crypto, and the same projected-gain/limit-buffer settings. The `$132.05` balance does not widen the `$10 x 10` envelope.
+3. Confirm the live readiness envelope still matches the intended first phase: `$10` notional, one order per tick, `10` base slots, `$2.00` daily protector, same paper strategy allowlist, equities plus crypto, and the same projected-gain/limit-buffer settings. The `$132.05` balance does not widen the `$10 x 10` envelope.
 4. Confirm the recorded first-live policy above still stands: same-as-paper follower lane, same paper strategy allowlist, and no independent live strategy scoring.
 5. Run one final paper tick/status check and confirm paper execution is not showing unresolved broker, order, stale-exit, or accounting alerts.
 6. Update this checklist, `CONSTRAINTS.md`, `DECISION_LOG.md`, `docs/DECISION_LOG.md`, `docs/PROJECT_RECORD.md`, and `PROGRESS.txt` with the explicit go-live override.

@@ -40,6 +40,8 @@ def _config() -> SimpleNamespace:
         slack_webhook_url="https://hooks.slack.test/services/example",
         slack_alert_dedupe_minutes=360,
         slack_request_timeout_seconds=5,
+        slack_hourly_status_enabled=False,
+        slack_hourly_status_interval_minutes=60,
         live_equity_pdt_review_reminders_enabled=True,
         live_equity_pdt_review_reminder_start_date="2026-06-04",
         live_equity_pdt_review_reminder_interval_minutes=30,
@@ -170,6 +172,61 @@ class SlackNotificationTests(unittest.TestCase):
         self.assertFalse(
             any("Action required: review live equity PDT unblock" in item for item in sent_messages)
         )
+
+    def test_hourly_status_sends_liveness_summary_with_hour_dedupe(self) -> None:
+        sent_messages: list[str] = []
+        ledger = FakeLedger()
+        config = _config()
+        config.slack_hourly_status_enabled = True
+        context = TickContext(
+            tick_id="tick-123",
+            started_at=datetime(2026, 6, 3, 13, 5).astimezone(),
+            config=config,
+            usage_ledger=ledger,
+            state={
+                "market_gate": {
+                    "reason": "crypto_only_window",
+                    "equity_scan_ready": False,
+                    "crypto_scan_ready": True,
+                },
+                "risk_cfo": {
+                    "decision": "hold",
+                    "reason": "no_shadow_proposals",
+                    "open_positions": 8,
+                    "open_orders": 0,
+                    "available_slots": 2,
+                },
+                "execution": {
+                    "orders_submitted": 0,
+                    "execution_status": "idle",
+                },
+                "daily_protection": {
+                    "system_status": "active",
+                    "equity_drawdown_usd": 0.25,
+                    "max_daily_drawdown_usd": 2.0,
+                },
+                "alpaca_account": {
+                    "summary": {
+                        "equity": 100010.13,
+                        "open_position_unrealized_pl": -1.64,
+                    }
+                },
+            },
+            metadata={
+                "slack_post_message": lambda _webhook, text: sent_messages.append(text)
+            },
+        )
+
+        result = pipelines.slack_notifications(context)
+
+        self.assertEqual(result["alerts_sent"], 1)
+        self.assertEqual(len(sent_messages), 1)
+        self.assertIn("Centaur hourly status", sent_messages[0])
+        self.assertIn("tick=tick-123", sent_messages[0])
+        self.assertIn("orders_submitted=0", sent_messages[0])
+        self.assertEqual(ledger.notification_events[0]["event_key"], "centaur_hourly_status")
+        seconds = (context.started_at - ledger.notification_checks[0]["since"]).total_seconds()
+        self.assertEqual(seconds, 60 * 60)
 
 
 if __name__ == "__main__":

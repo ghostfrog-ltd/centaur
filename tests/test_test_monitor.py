@@ -8,6 +8,7 @@ import unittest
 from app.framework.runtime.test_monitor import (
     TestMonitorConfig,
     TestRunResult,
+    append_scheduler_freshness_check,
     build_failure_fingerprint,
     mark_alerts_sent,
     plan_state_update,
@@ -98,6 +99,61 @@ class TestMonitorTests(unittest.TestCase):
         self.assertEqual(state["last_status"], "passed")
         self.assertEqual(state["current_failure_fingerprint"], "")
 
+    def test_scheduler_freshness_passes_for_recent_ok_tick(self) -> None:
+        now = self._now()
+        result = append_scheduler_freshness_check(
+            result=TestRunResult(
+                exit_code=0,
+                output="unit tests OK",
+                duration_seconds=1.0,
+            ),
+            config=self._config(),
+            latest_tick={
+                "tick_id": "20260603-120000",
+                "status": "ok",
+                "started_at": now - timedelta(minutes=2),
+            },
+            now=now,
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("PASS: latest tick 20260603-120000", result.output)
+
+    def test_scheduler_freshness_fails_for_stale_tick(self) -> None:
+        now = self._now()
+        result = append_scheduler_freshness_check(
+            result=TestRunResult(
+                exit_code=0,
+                output="unit tests OK",
+                duration_seconds=1.0,
+            ),
+            config=self._config(),
+            latest_tick={
+                "tick_id": "20260603-114000",
+                "status": "ok",
+                "started_at": now - timedelta(minutes=25),
+            },
+            now=now,
+        )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("reason=stale", result.output)
+
+    def test_scheduler_freshness_fails_for_missing_latest_tick(self) -> None:
+        result = append_scheduler_freshness_check(
+            result=TestRunResult(
+                exit_code=0,
+                output="unit tests OK",
+                duration_seconds=1.0,
+            ),
+            config=self._config(),
+            latest_tick=None,
+            now=self._now(),
+        )
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("no control tick has been recorded", result.output)
+
     def _failed_result(self, output: str) -> TestRunResult:
         return TestRunResult(exit_code=1, output=output, duration_seconds=0.5)
 
@@ -110,6 +166,8 @@ class TestMonitorTests(unittest.TestCase):
             log_path=temp_root / "centaur-test-monitor.log",
             reminder_minutes=60,
             output_tail_lines=20,
+            scheduler_freshness_enabled=True,
+            scheduler_max_age_minutes=10,
             slack_enabled=True,
             slack_webhook_url="https://hooks.slack.test/services/example",
             slack_timeout_seconds=5,

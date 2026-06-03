@@ -136,10 +136,18 @@ def build_shadow_proposals(
             "direction": str(signal.get("direction", "long")),
             "status": "active",
             "action_bias": "watch",
+            "base_signal_score": round(float(signal.get("base_signal_score", signal_score) or signal_score), 6),
             "opportunity_score": signal_score,
             "signal_score": signal_score,
             "signal_confidence": round(float(signal.get("confidence", 0) or 0), 6),
             "confidence": round(float(signal.get("confidence", 0) or 0), 6),
+            "allocation_status": str(signal.get("allocation_status", "")).strip(),
+            "fitness_composite_score": _to_float(signal.get("fitness_composite_score")),
+            "fitness_sample_weight": _to_float(signal.get("fitness_sample_weight")),
+            "fitness_checkpoints_evaluated": int(
+                signal.get("fitness_checkpoints_evaluated", 0) or 0
+            ),
+            "suppress_threshold_used": _to_float(signal.get("suppress_threshold_used")),
             "discovery_score": round(float(signal.get("discovery_score", 0) or 0), 6),
             "entry_price": round(entry_price, 8),
             "entry_price_gbp": round(entry_price_gbp, 8) if entry_price_gbp is not None else None,

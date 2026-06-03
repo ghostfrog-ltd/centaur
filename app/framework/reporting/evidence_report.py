@@ -205,10 +205,10 @@ class EvidenceReport:
                 "action_rule": "records would-block only; does not affect entries/exits",
             },
             {
-                "name": "Exit deferral and Friday exit reasons",
+                "name": "Timed exit and no-overnight exit reasons",
                 "mode": "audit_trail",
                 "source": "paper/live order exit_reason values",
-                "action_rule": "review max_hold_red_deferred and friday_no_weekend_carry separately",
+                "action_rule": "review max_holding_window_elapsed and equity_no_overnight_carry separately",
             },
         ]
 

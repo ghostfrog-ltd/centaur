@@ -65,6 +65,8 @@ class RuntimeConfig:
     slack_webhook_url: str
     slack_alert_dedupe_minutes: int
     slack_request_timeout_seconds: int
+    slack_hourly_status_enabled: bool
+    slack_hourly_status_interval_minutes: int
     live_equity_pdt_review_reminders_enabled: bool
     live_equity_pdt_review_reminder_start_date: str
     live_equity_pdt_review_reminder_interval_minutes: int
@@ -344,6 +346,16 @@ def load_runtime_config() -> RuntimeConfig:
         default=paper_crypto_momentum_max_spread_pct,
     )
     active_crypto_momentum_is_live = centaur_environment == "live"
+    paper_min_signal_score_to_trade = _parse_float(
+        os.getenv("PAPER_MIN_SIGNAL_SCORE_TO_TRADE")
+        or os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
+        default=90.0,
+    )
+    live_min_signal_score_to_trade = _parse_float(
+        os.getenv("LIVE_MIN_SIGNAL_SCORE_TO_TRADE")
+        or os.getenv("LIVE_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
+        default=90.0,
+    )
 
     config = RuntimeConfig(
         centaur_mode=centaur_mode,
@@ -401,6 +413,14 @@ def load_runtime_config() -> RuntimeConfig:
         slack_request_timeout_seconds=_parse_int(
             os.getenv("SLACK_REQUEST_TIMEOUT_SECONDS"),
             default=5,
+        ),
+        slack_hourly_status_enabled=_parse_bool(
+            os.getenv("SLACK_HOURLY_STATUS_ENABLED"),
+            default=True,
+        ),
+        slack_hourly_status_interval_minutes=_parse_int(
+            os.getenv("SLACK_HOURLY_STATUS_INTERVAL_MINUTES"),
+            default=60,
         ),
         live_equity_pdt_review_reminders_enabled=_parse_bool(
             os.getenv("LIVE_EQUITY_PDT_REVIEW_REMINDERS_ENABLED"),
@@ -747,20 +767,12 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_ENABLED"),
             default=False,
         ),
-        paper_execution_high_score_override_min_score=_parse_float(
-            os.getenv("PAPER_MIN_SIGNAL_SCORE_TO_TRADE")
-            or os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
-            default=90.0,
-        ),
+        paper_execution_high_score_override_min_score=paper_min_signal_score_to_trade,
         paper_execution_high_score_override_fitness_margin=_parse_float(
             os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN"),
             default=0.25,
         ),
-        paper_min_signal_score_to_trade=_parse_float(
-            os.getenv("PAPER_MIN_SIGNAL_SCORE_TO_TRADE")
-            or os.getenv("PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
-            default=90.0,
-        ),
+        paper_min_signal_score_to_trade=paper_min_signal_score_to_trade,
         paper_execution_equity_no_weekend_carry_enabled=_parse_bool(
             os.getenv("PAPER_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED"),
             default=True,
@@ -867,20 +879,12 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("LIVE_EXECUTION_HIGH_SCORE_OVERRIDE_ENABLED"),
             default=True,
         ),
-        live_execution_high_score_override_min_score=_parse_float(
-            os.getenv("LIVE_MIN_SIGNAL_SCORE_TO_TRADE")
-            or os.getenv("LIVE_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
-            default=90.0,
-        ),
+        live_execution_high_score_override_min_score=live_min_signal_score_to_trade,
         live_execution_high_score_override_fitness_margin=_parse_float(
             os.getenv("LIVE_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN"),
             default=0.25,
         ),
-        live_min_signal_score_to_trade=_parse_float(
-            os.getenv("LIVE_MIN_SIGNAL_SCORE_TO_TRADE")
-            or os.getenv("LIVE_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE"),
-            default=90.0,
-        ),
+        live_min_signal_score_to_trade=live_min_signal_score_to_trade,
         live_execution_equity_no_weekend_carry_enabled=_parse_bool(
             os.getenv("LIVE_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED"),
             default=True,

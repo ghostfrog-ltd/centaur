@@ -326,6 +326,85 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(due["venue"], "alpaca")
         self.assertEqual(due["venue_symbol"], "AAPL")
 
+    def test_daily_proposal_count_reports_group_generated_and_execution_lanes(self) -> None:
+        now = datetime.now().astimezone()
+        self.ledger.record_shadow_trade_proposals(
+            proposals=[
+                {
+                    "proposal_id": "proposal-count-1",
+                    "tick_id": "test-tick",
+                    "proposed_at": now.isoformat(),
+                    "environment": "live",
+                    "mode": "live",
+                    "source_environment": "shadow",
+                    "data_provider": "alpaca",
+                    "execution_provider": "shadow",
+                    "strategy_id": "mean_reversion.snapback",
+                    "strategy_family": "mean_reversion",
+                    "profile_id": "snapback",
+                    "source": "alpaca",
+                    "symbol": "AAPL",
+                    "asset_class": "equity",
+                    "entry_price": 100.0,
+                    "stop_loss_price": 98.0,
+                    "target_price": 103.0,
+                    "base_signal_score": 90.0,
+                    "signal_score": 91.5,
+                    "allocation_status": "weighted",
+                    "fitness_composite_score": 1.25,
+                    "fitness_sample_weight": 0.5,
+                    "fitness_checkpoints_evaluated": 6,
+                    "suppress_threshold_used": -2.0,
+                    "holding_window_code": "1h",
+                    "holding_window_minutes": 60,
+                    "checkpoint_windows": [
+                        {
+                            "checkpoint_code": "1h",
+                            "checkpoint_minutes": 60,
+                            "due_at": now.isoformat(),
+                        }
+                    ],
+                }
+            ]
+        )
+        self.ledger.record_paper_trade_orders(
+            tick_id="test-tick",
+            captured_at=now,
+            orders=[
+                {
+                    "id": "proposal-count-order",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "status": "filled",
+                    "broker_id": "alpaca_live",
+                    "proposal_id": "proposal-count-1",
+                    "strategy_id": "mean_reversion.snapback",
+                    "source": "alpaca",
+                }
+            ],
+        )
+
+        generated = self.ledger.list_daily_shadow_proposal_counts(days=7)
+        executions = self.ledger.list_daily_proposal_execution_counts(days=7)
+
+        self.assertEqual(generated[0]["lane"], "shadow")
+        self.assertEqual(generated[0]["environment"], "live")
+        self.assertEqual(generated[0]["allocation_status"], "weighted")
+        self.assertEqual(generated[0]["strategy_id"], "mean_reversion.snapback")
+        self.assertEqual(generated[0]["proposal_count"], 1)
+        self.assertEqual(generated[0]["avg_base_signal_score"], 90.0)
+        self.assertEqual(generated[0]["avg_signal_score"], 91.5)
+        self.assertEqual(generated[0]["avg_fitness_composite_score"], 1.25)
+
+        self.assertEqual(executions[0]["lane"], "alpaca_live")
+        self.assertEqual(executions[0]["environment"], "live")
+        self.assertEqual(executions[0]["allocation_status"], "weighted")
+        self.assertEqual(executions[0]["proposal_count"], 1)
+        self.assertEqual(executions[0]["order_count"], 1)
+        self.assertEqual(executions[0]["avg_base_signal_score"], 90.0)
+        self.assertEqual(executions[0]["avg_signal_score"], 91.5)
+        self.assertEqual(executions[0]["avg_fitness_composite_score"], 1.25)
+
     def test_legacy_live_activation_flags_make_runtime_label_live(self) -> None:
         os.environ.pop("CENTAUR_MODE", None)
         os.environ.pop("CENTAUR_ENVIRONMENT", None)
@@ -407,6 +486,20 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(config.paper_crypto_momentum_min_signal_score, 60.0)
         self.assertEqual(config.live_crypto_momentum_min_signal_score, 72.0)
         self.assertEqual(config.crypto_momentum_min_signal_score, 72.0)
+
+    def test_score_to_trade_paper_and_live_settings_are_parsed_separately(self) -> None:
+        os.environ["CENTAUR_MODE"] = "paper"
+        os.environ["CENTAUR_ENVIRONMENT"] = "paper"
+        os.environ["PAPER_MIN_SIGNAL_SCORE_TO_TRADE"] = "91.0"
+        os.environ["LIVE_MIN_SIGNAL_SCORE_TO_TRADE"] = "97.0"
+        os.environ[
+            "LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES"
+        ] = "min_signal_score_to_trade"
+
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_min_signal_score_to_trade, 91.0)
+        self.assertEqual(config.live_min_signal_score_to_trade, 97.0)
 
     def test_armed_live_config_fails_when_crypto_momentum_differs_from_paper(self) -> None:
         os.environ["LIVE_EXECUTION_ENABLED"] = "true"

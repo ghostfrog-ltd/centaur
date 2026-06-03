@@ -6,7 +6,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from app.framework.runtime.settings import RuntimeConfig, load_runtime_config
 from .status import StatusReporter
@@ -26,12 +26,12 @@ def run_web_dashboard(
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            query_params = dict(
-                item.split("=", 1) if "=" in item else (item, "")
-                for item in parsed.query.split("&")
-                if item
-            )
-            include_recent_ticks = query_params.get("full") in {"1", "true", "yes"}
+            query_params = parse_qs(parsed.query)
+            include_recent_ticks = _first_query_value(query_params, "full") in {
+                "1",
+                "true",
+                "yes",
+            }
             if parsed.path == "/":
                 snapshot = reporter.snapshot(
                     include_visuals=False,
@@ -49,6 +49,23 @@ def run_web_dashboard(
                     include_recent_ticks=include_recent_ticks,
                 )
                 self._send_json(_json_safe(snapshot))
+                return
+
+            if parsed.path == "/api/proposal-counts":
+                days = _bounded_int(
+                    _first_query_value(query_params, "days"),
+                    default=90,
+                    minimum=1,
+                    maximum=366,
+                )
+                self._send_json(
+                    _json_safe(
+                        _build_proposal_counts_report(
+                            reporter=reporter,
+                            days=days,
+                        )
+                    )
+                )
                 return
 
             if parsed.path == "/healthz":
@@ -98,6 +115,198 @@ def run_web_dashboard(
         print("Centaur web dashboard stopped", flush=True)
     finally:
         server.server_close()
+
+
+def _first_query_value(params: dict[str, list[str]], key: str) -> str:
+    values = params.get(key, [])
+    if not values:
+        return ""
+    return str(values[0]).strip().lower()
+
+
+def _bounded_int(
+    value: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _build_proposal_counts_report(
+    *,
+    reporter: StatusReporter,
+    days: int,
+) -> dict[str, Any]:
+    ledger = reporter.usage_ledger
+    generated_flat = ledger.list_daily_shadow_proposal_counts(days=days)
+    execution_flat = ledger.list_daily_proposal_execution_counts(days=days)
+    generated = _pivot_proposal_counts(generated_flat)
+    executions = _pivot_proposal_counts(execution_flat)
+    return {
+        "ok": True,
+        "checked_at": datetime.now().astimezone().isoformat(),
+        "days": days,
+        "backend": ledger.backend,
+        "backend_detail": ledger.backend_detail,
+        "runtime": {
+            "mode": reporter.config.centaur_mode,
+            "environment": reporter.config.centaur_environment,
+        },
+        "generated": generated,
+        "proposal_linked_executions": executions,
+    }
+
+
+def _pivot_proposal_counts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    strategy_totals: dict[str, int] = {}
+    grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    total_count = 0
+    order_count = 0
+
+    for row in rows:
+        strategy_id = str(row.get("strategy_id", "unassigned") or "unassigned")
+        proposal_count = int(row.get("proposal_count", 0) or 0)
+        row_order_count = int(row.get("order_count", 0) or 0)
+        proposal_date = _date_key(row.get("proposal_date"))
+        key = (
+            proposal_date,
+            str(row.get("lane", "unknown") or "unknown"),
+            str(row.get("environment", "unknown") or "unknown"),
+            str(row.get("mode", "unknown") or "unknown"),
+            str(row.get("allocation_status", "untracked") or "untracked"),
+        )
+        item = grouped.setdefault(
+            key,
+            {
+                "proposal_date": key[0],
+                "lane": key[1],
+                "environment": key[2],
+                "mode": key[3],
+                "allocation_status": key[4],
+                "strategy_counts": {},
+                "total_count": 0,
+                "order_count": 0,
+                "avg_base_signal_score": None,
+                "min_signal_score": None,
+                "max_signal_score": None,
+                "avg_signal_score": None,
+                "min_fitness_composite_score": None,
+                "max_fitness_composite_score": None,
+                "avg_fitness_composite_score": None,
+            },
+        )
+        item["strategy_counts"][strategy_id] = (
+            int(item["strategy_counts"].get(strategy_id, 0)) + proposal_count
+        )
+        item["total_count"] = int(item["total_count"]) + proposal_count
+        item["order_count"] = int(item["order_count"]) + row_order_count
+        if row.get("avg_base_signal_score") is not None:
+            item["avg_base_signal_score"] = _weighted_average(
+                current=item["avg_base_signal_score"],
+                current_weight=int(item["total_count"]) - proposal_count,
+                incoming=row.get("avg_base_signal_score"),
+                incoming_weight=proposal_count,
+            )
+        item["min_signal_score"] = _merge_min(
+            item["min_signal_score"],
+            row.get("min_signal_score"),
+        )
+        item["max_signal_score"] = _merge_max(
+            item["max_signal_score"],
+            row.get("max_signal_score"),
+        )
+        if row.get("avg_signal_score") is not None:
+            item["avg_signal_score"] = _weighted_average(
+                current=item["avg_signal_score"],
+                current_weight=int(item["total_count"]) - proposal_count,
+                incoming=row.get("avg_signal_score"),
+                incoming_weight=proposal_count,
+            )
+        item["min_fitness_composite_score"] = _merge_min(
+            item["min_fitness_composite_score"],
+            row.get("min_fitness_composite_score"),
+        )
+        item["max_fitness_composite_score"] = _merge_max(
+            item["max_fitness_composite_score"],
+            row.get("max_fitness_composite_score"),
+        )
+        if row.get("avg_fitness_composite_score") is not None:
+            item["avg_fitness_composite_score"] = _weighted_average(
+                current=item["avg_fitness_composite_score"],
+                current_weight=int(item["total_count"]) - proposal_count,
+                incoming=row.get("avg_fitness_composite_score"),
+                incoming_weight=proposal_count,
+            )
+        strategy_totals[strategy_id] = strategy_totals.get(strategy_id, 0) + proposal_count
+        total_count += proposal_count
+        order_count += row_order_count
+
+    strategies = [
+        strategy
+        for strategy, _count in sorted(
+            strategy_totals.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    ]
+    return {
+        "strategies": strategies,
+        "strategy_totals": strategy_totals,
+        "total_count": total_count,
+        "order_count": order_count,
+        "rows": sorted(
+            grouped.values(),
+            key=lambda item: (
+                str(item["proposal_date"]),
+                str(item["lane"]),
+                str(item["environment"]),
+                str(item["mode"]),
+                str(item["allocation_status"]),
+            ),
+            reverse=True,
+        ),
+    }
+
+
+def _date_key(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return str(value.isoformat())
+    return str(value or "")
+
+
+def _merge_min(current: Any, incoming: Any) -> float | None:
+    values = [_to_float(value) for value in (current, incoming)]
+    finite = [value for value in values if value is not None]
+    return min(finite) if finite else None
+
+
+def _merge_max(current: Any, incoming: Any) -> float | None:
+    values = [_to_float(value) for value in (current, incoming)]
+    finite = [value for value in values if value is not None]
+    return max(finite) if finite else None
+
+
+def _weighted_average(
+    *,
+    current: Any,
+    current_weight: int,
+    incoming: Any,
+    incoming_weight: int,
+) -> float | None:
+    incoming_float = _to_float(incoming)
+    if incoming_float is None or incoming_weight <= 0:
+        return _to_float(current)
+    current_float = _to_float(current)
+    if current_float is None or current_weight <= 0:
+        return incoming_float
+    return (
+        (current_float * current_weight) + (incoming_float * incoming_weight)
+    ) / (current_weight + incoming_weight)
 
 
 def _render_dashboard_html(*, snapshot: dict[str, Any], config: RuntimeConfig) -> str:

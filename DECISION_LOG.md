@@ -2,6 +2,11 @@
 
 This is the short rolling decision head. Keep the full canonical history in `docs/DECISION_LOG.md`, but do not load it for every task.
 
+## 2026-06-03
+- Operator approved raising the paper/live daily equity drawdown protector from `$1.00` to `$2.00` for the active Alpaca Paper, Trading 212 Paper, and Alpaca Live same-as-paper lanes.
+- Rationale: the recent `$10` micro-trade/10-slot paper evidence showed normal open-P/L noise around `$1.35-$1.80`, making `$1.00` too likely to halt new entries before enough throughput can be observed.
+- This widens only the daily entry-protection latch. It does not widen notional, slots, strategies, broker routing, order frequency, projected-gain floors, long-only policy, or live independence.
+
 ## 2026-06-01
 - Architecture constraint tightened from "pipeline-first, LangGraph-compatible" to LangGraph-first with Pydantic-backed state and node contracts.
 - Current `ControlPipelineRunner` remains the behaviour-preserving migration scaffold, but new orchestration work should not deepen untyped dict-only pipeline control flow when a typed graph node/model is practical.

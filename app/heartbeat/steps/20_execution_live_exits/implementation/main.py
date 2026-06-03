@@ -8,7 +8,9 @@ from app.heartbeat.support import (
     PipelineResult,
     TickContext,
     _build_exit_order_request,
+    _build_unmanaged_equity_flatten_entry_order,
     _coerce_datetime,
+    _equity_flatten_due,
     _find_most_protective_managed_entry_order,
     _latest_bars_by_symbol,
     _live_limit_buffer_bps,
@@ -91,6 +93,44 @@ def run_implementation(context: TickContext) -> PipelineResult:
             broker_id=broker_id,
         )
         if entry_order is None:
+            latest_bar = latest_bars.get(symbol) or latest_bars.get(symbol_key)
+            if (
+                latest_bar is not None
+                and _equity_flatten_due(
+                    context.config,
+                    asset_class="equity",
+                    as_of=context.started_at,
+                    next_close=context.state.get("market_gate", {}).get("next_close"),
+                )
+            ):
+                exit_request, skip_reason = _build_exit_order_request(
+                    context=context,
+                    tick_id=context.tick_id,
+                    position=position,
+                    entry_order=_build_unmanaged_equity_flatten_entry_order(
+                        position=position,
+                        broker_id=broker_id,
+                        symbol=symbol,
+                    ),
+                    latest_bar=latest_bar,
+                    bar_history=[],
+                    as_of=context.started_at,
+                    limit_buffer_bps=_live_limit_buffer_bps(
+                        context.config,
+                        "equity",
+                    ),
+                )
+                if exit_request is not None:
+                    exit_request["unmanaged_flatten"] = True
+                    exit_requests.append(exit_request)
+                    continue
+                skipped.append(
+                    {
+                        "symbol": symbol,
+                        "reason": skip_reason or "unmanaged_flatten_failed",
+                    }
+                )
+                continue
             skipped.append({"symbol": symbol, "reason": "missing_entry_plan"})
             continue
 
@@ -232,7 +272,7 @@ def run_implementation(context: TickContext) -> PipelineResult:
             broker_id=exit_request["broker_id"],
             order_request=exit_request["order_request"],
             lane="live",
-            action="exit",
+            action="flatten" if exit_request.get("unmanaged_flatten") else "exit",
             strategy_id=exit_request.get("strategy_id"),
         )
         if routed.submitted and routed.order is not None:
@@ -281,6 +321,7 @@ def run_implementation(context: TickContext) -> PipelineResult:
                     ),
                     "exit_reason": exit_request["exit_reason"],
                     "linked_order_id": exit_request.get("linked_order_id", ""),
+                    "unmanaged_flatten": exit_request.get("unmanaged_flatten", False),
                     "refreshed_exit_order_id": exit_request.get(
                         "refreshed_exit_order_id", ""
                     ),

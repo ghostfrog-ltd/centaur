@@ -62,6 +62,22 @@ class FitnessEngineAllocationTests(unittest.TestCase):
         self.assertEqual(stats["high_score_overrides"], 0)
         self.assertEqual(stats["suppressed"], 1)
 
+    def test_score_to_trade_uses_configured_trade_dial_not_literal_90(self) -> None:
+        signals, stats = allocate_strategy_signals(
+            signals=[self._signal(score=92.0)],
+            fitness_summaries=[self._fitness_summary()],
+            min_checkpoints=2,
+            favor_threshold=3.0,
+            suppress_threshold=-8.9,
+            high_score_override_enabled=True,
+            high_score_override_min_score=93.0,
+            high_score_override_allowed_strategies={"mean_reversion.snapback"},
+        )
+
+        self.assertEqual(signals, [])
+        self.assertEqual(stats["high_score_overrides"], 0)
+        self.assertEqual(stats["suppressed"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

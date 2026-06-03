@@ -79,6 +79,35 @@ class ManagedExitEntrySelectionTests(unittest.TestCase):
 
         self.assertIsNone(selected)
 
+    def test_expired_unfilled_sell_does_not_close_managed_entry_plan(self) -> None:
+        orders = [
+            self._buy(
+                order_id="entry",
+                submitted_at="2026-06-01T15:07:22+01:00",
+                stop=84.78588,
+            ),
+            {
+                "order_id": "expired-exit",
+                "broker_id": "alpaca_paper",
+                "symbol": "LINK/USD",
+                "side": "sell",
+                "status": "expired",
+                "filled_qty": 0.0,
+                "qty": 1.0,
+                "submitted_at": datetime.fromisoformat("2026-06-02T14:34:52+01:00"),
+                "raw_json": {},
+            },
+        ]
+
+        selected = _find_most_protective_managed_entry_order(
+            symbol="LINK/USD",
+            orders=orders,
+            broker_id="alpaca_paper",
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["order_id"], "entry")
+
     def _buy(self, *, order_id: str, submitted_at: str, stop: float) -> dict:
         return {
             "order_id": order_id,

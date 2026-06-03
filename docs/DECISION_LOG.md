@@ -2,7 +2,25 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-06-02
+Last updated: 2026-06-03
+
+## 2026-06-03
+
+### Raise paper/live daily drawdown protector to $2.00
+Decision:
+- by explicit operator override, raise `PAPER_EXECUTION_MAX_DAILY_DRAWDOWN_USD` from `$1.00` to `$2.00`
+- keep Alpaca Live same-as-paper by raising `LIVE_EXECUTION_MAX_DAILY_DRAWDOWN_USD` from `$1.00` to `$2.00`
+- apply the paper setting to all paper execution lanes that read the shared paper protector, including Alpaca Paper and Trading 212 Paper
+
+Why:
+- the active `$10` micro-trade, 10-slot paper lane has shown normal open-P/L noise around `$1.35-$1.80`
+- the `$1.00` protector can halt new entries before enough throughput is observed for a low-margin strategy test
+- `$2.00` is the smallest tested step that covered the observed session-start drawdown noise in the available sample; `$3.00` is not yet justified by evidence
+
+Implementation notes:
+- this widens only the daily entry-protection latch
+- it does not widen per-trade notional, slot count, broker routing, live independence, strategy allowlists, projected-gain floors, order frequency, stale-order rules, or long-only policy
+- existing positions and managed exits remain governed by their existing stop/target/exit rules
 
 ## 2026-06-02
 

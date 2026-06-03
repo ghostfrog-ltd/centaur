@@ -13,7 +13,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.framework.runtime.slack import SlackNotificationError
+from app.framework.runtime.settings import load_runtime_config
 from app.framework.runtime.test_monitor import (
+    append_scheduler_freshness_check,
     append_monitor_log,
     load_dotenv,
     load_state,
@@ -25,6 +27,7 @@ from app.framework.runtime.test_monitor import (
     send_slack_alerts,
     write_state,
 )
+from app.framework.storage.usage import UsageLedger
 
 
 def main() -> int:
@@ -60,6 +63,21 @@ def main() -> int:
 
     try:
         result = run_test_command(command=config.command, cwd=PROJECT_ROOT)
+        latest_tick = None
+        scheduler_check_error = ""
+        if config.scheduler_freshness_enabled:
+            try:
+                runtime_config = load_runtime_config()
+                latest_tick = UsageLedger(config=runtime_config).get_latest_tick_run()
+            except Exception as exc:
+                scheduler_check_error = f"{type(exc).__name__}: {exc}"
+        result = append_scheduler_freshness_check(
+            result=result,
+            config=config,
+            latest_tick=latest_tick,
+            now=now,
+            check_error=scheduler_check_error,
+        )
         state, alerts = plan_state_update(
             previous_state=load_state(config.state_path),
             result=result,

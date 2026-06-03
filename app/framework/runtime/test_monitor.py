@@ -21,6 +21,8 @@ class TestMonitorConfig:
     log_path: Path
     reminder_minutes: int
     output_tail_lines: int
+    scheduler_freshness_enabled: bool
+    scheduler_max_age_minutes: int
     slack_enabled: bool
     slack_webhook_url: str
     slack_timeout_seconds: int
@@ -73,6 +75,17 @@ def load_test_monitor_config(
             5,
             _parse_int(environ.get("TEST_MONITOR_OUTPUT_TAIL_LINES"), default=80),
         ),
+        scheduler_freshness_enabled=_parse_bool(
+            environ.get("TEST_MONITOR_SCHEDULER_FRESHNESS_ENABLED"),
+            default=True,
+        ),
+        scheduler_max_age_minutes=max(
+            1,
+            _parse_int(
+                environ.get("TEST_MONITOR_SCHEDULER_MAX_AGE_MINUTES"),
+                default=10,
+            ),
+        ),
         slack_enabled=_parse_bool(
             environ.get("TEST_MONITOR_SLACK_ENABLED"),
             default=_parse_bool(environ.get("SLACK_ALERTS_ENABLED"), default=False),
@@ -122,6 +135,60 @@ def run_test_command(
         exit_code=int(completed.returncode),
         output=str(completed.stdout or ""),
         duration_seconds=max(0.0, (finished_at - started_at).total_seconds()),
+    )
+
+
+def append_scheduler_freshness_check(
+    *,
+    result: TestRunResult,
+    config: TestMonitorConfig,
+    latest_tick: dict[str, Any] | None,
+    now: datetime,
+    check_error: str = "",
+) -> TestRunResult:
+    """Fold the non-mutating scheduler liveness check into the monitored result."""
+    if not config.scheduler_freshness_enabled:
+        return result
+
+    passed = False
+    lines = ["", "Centaur scheduler freshness check:"]
+    if check_error:
+        lines.append(f"FAILED: could not read latest control tick: {check_error}")
+    elif latest_tick is None:
+        lines.append("FAILED: no control tick has been recorded")
+    else:
+        tick_id = str(latest_tick.get("tick_id") or "-")
+        status = str(latest_tick.get("status") or "unknown").strip().lower()
+        started_at = _coerce_datetime(latest_tick.get("started_at"))
+        if started_at is None:
+            lines.append(
+                f"FAILED: latest tick {tick_id} has no parseable started_at value"
+            )
+        else:
+            age_seconds = max(0, int((now - started_at).total_seconds()))
+            max_age_seconds = config.scheduler_max_age_minutes * 60
+            age_text = _format_age(seconds=age_seconds)
+            if status == "ok" and age_seconds <= max_age_seconds:
+                passed = True
+                lines.append(
+                    f"PASS: latest tick {tick_id} status=ok age={age_text} "
+                    f"limit={config.scheduler_max_age_minutes}m"
+                )
+            else:
+                reason = "stale" if age_seconds > max_age_seconds else "not_ok"
+                lines.append(
+                    f"FAILED: latest tick {tick_id} status={status} age={age_text} "
+                    f"limit={config.scheduler_max_age_minutes}m reason={reason}"
+                )
+
+    output = "\n".join(
+        part for part in [result.output.rstrip(), "\n".join(lines)] if part
+    )
+    exit_code = result.exit_code if result.exit_code != 0 or passed else 1
+    return TestRunResult(
+        exit_code=exit_code,
+        output=output,
+        duration_seconds=result.duration_seconds,
     )
 
 
@@ -366,6 +433,28 @@ def _parse_datetime(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = _parse_datetime(str(value or ""))
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_age(*, seconds: int) -> str:
+    minutes, remaining_seconds = divmod(max(0, seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes}m{remaining_seconds}s"
+    if minutes:
+        return f"{minutes}m{remaining_seconds}s"
+    return f"{remaining_seconds}s"
 
 
 def _utc_now() -> datetime:

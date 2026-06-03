@@ -160,7 +160,7 @@ def _empty_trading212_paper_state(
     }
     return result
 
-def _equity_weekend_carry_enabled(config: Any) -> bool:
+def _equity_no_overnight_carry_enabled(config: Any) -> bool:
     return bool(
         getattr(config, "paper_execution_equity_no_weekend_carry_enabled", False)
     )
@@ -172,7 +172,7 @@ def _market_session_minutes(
     next_close: Any = None,
 ) -> tuple[int, int] | None:
     market_now = as_of.astimezone(ZoneInfo(market_timezone))
-    if market_now.weekday() != 4:
+    if market_now.weekday() > 4:
         return None
     close_at = _coerce_datetime(next_close)
     if close_at is not None:
@@ -180,20 +180,20 @@ def _market_session_minutes(
         if market_close.date() == market_now.date():
             regular_close_minutes = (market_close.hour * 60) + market_close.minute
         else:
-            regular_close_minutes = 16 * 60
+            return None
     else:
         regular_close_minutes = 16 * 60
     minutes_since_midnight = (market_now.hour * 60) + market_now.minute
     return minutes_since_midnight, regular_close_minutes
 
-def _equity_friday_entry_cutoff_active(
+def _equity_entry_cutoff_active(
     config: Any,
     as_of: datetime,
     *,
     next_close: Any = None,
 ) -> bool:
-    """Protect equity entries from creating calendar-weekend hold drift."""
-    if not _equity_weekend_carry_enabled(config):
+    """Protect equity entries from creating overnight hold drift."""
+    if not _equity_no_overnight_carry_enabled(config):
         return False
     session = _market_session_minutes(
         as_of,
@@ -216,17 +216,17 @@ def _equity_friday_entry_cutoff_active(
     cutoff_at = regular_close_minutes - cutoff_minutes
     return cutoff_at <= minutes_since_midnight < regular_close_minutes
 
-def _equity_friday_flatten_due(
+def _equity_flatten_due(
     config: Any,
     *,
     asset_class: str,
     as_of: datetime,
     next_close: Any = None,
 ) -> bool:
-    """Return true when an equity managed exit should avoid weekend carry."""
+    """Return true when an equity managed exit should avoid overnight carry."""
     if str(asset_class).strip().lower() != "equity":
         return False
-    if not _equity_weekend_carry_enabled(config):
+    if not _equity_no_overnight_carry_enabled(config):
         return False
     session = _market_session_minutes(
         as_of,
@@ -248,6 +248,38 @@ def _equity_friday_flatten_due(
     )
     flatten_at = regular_close_minutes - flatten_minutes
     return flatten_at <= minutes_since_midnight < regular_close_minutes
+
+def _build_unmanaged_equity_flatten_entry_order(
+    *,
+    position: dict[str, Any],
+    broker_id: str,
+    symbol: str,
+) -> dict[str, Any]:
+    """Build a synthetic entry plan only for no-overnight equity flattening.
+
+    Missing entry plans are an audit defect, but they must not let equity
+    positions drift overnight. This placeholder carries enough provenance to
+    submit a sell-to-flatten order while preserving the fact that the original
+    managed plan was missing.
+    """
+    return {
+        "order_id": "",
+        "broker_id": broker_id,
+        "symbol": symbol,
+        "asset_class": "equity",
+        "strategy_id": "unmanaged_position",
+        "strategy_family": "risk",
+        "profile_id": "no_overnight_carry",
+        "source": "broker_position",
+        "filled_avg_price": _as_float(position.get("avg_entry_price")),
+        "submitted_at": _coerce_datetime(
+            position.get("created_at") or position.get("asset_created_at")
+        ),
+        "raw_json": {
+            "missing_entry_plan": True,
+            "planned_managed_exit_policy": "unmanaged_no_overnight_carry",
+        },
+    }
 
 def _paper_allocation_suppress_thresholds(
     context: TickContext,
@@ -601,6 +633,10 @@ def _build_tick_blocker_summary(context: TickContext) -> dict[str, Any]:
 
 def _build_slack_alerts(context: TickContext) -> list[dict[str, Any]]:
     alerts: list[dict[str, Any]] = []
+    hourly_status = _build_slack_hourly_status_alert(context)
+    if hourly_status is not None:
+        alerts.append(hourly_status)
+
     live_exit = context.state.get("live_exit_management", {})
     if isinstance(live_exit, dict):
         for item in live_exit.get("errors", []) or []:
@@ -674,6 +710,85 @@ def _build_slack_alerts(context: TickContext) -> list[dict[str, Any]]:
             )
     return alerts
 
+def _build_slack_hourly_status_alert(context: TickContext) -> dict[str, Any] | None:
+    """Build a one-way operator liveness/status reminder for Slack.
+
+    This is deliberately informational: it proves the scheduled control loop ran
+    recently and summarizes already-computed gates, but it must not feed back
+    into execution decisions or widen any trading envelope.
+    """
+    if not bool(getattr(context.config, "slack_hourly_status_enabled", True)):
+        return None
+    interval_minutes = max(
+        1,
+        int(getattr(context.config, "slack_hourly_status_interval_minutes", 60) or 60),
+    )
+    market_gate = context.state.get("market_gate", {})
+    risk_cfo = context.state.get("risk_cfo", {})
+    execution = context.state.get("execution", {})
+    protection = context.state.get("daily_protection", {})
+    account = context.state.get("alpaca_account", {})
+    if not isinstance(market_gate, dict):
+        market_gate = {}
+    if not isinstance(risk_cfo, dict):
+        risk_cfo = {}
+    if not isinstance(execution, dict):
+        execution = {}
+    if not isinstance(protection, dict):
+        protection = {}
+    if not isinstance(account, dict):
+        account = {}
+    account_summary = account.get("summary", {})
+    if not isinstance(account_summary, dict):
+        account_summary = {}
+
+    detail_parts = [
+        f"tick={context.tick_id}",
+        f"started={context.started_at.isoformat(timespec='seconds')}",
+        (
+            f"runtime={getattr(context.config, 'centaur_mode', '-')}/"
+            f"{getattr(context.config, 'centaur_environment', '-')}"
+        ),
+        (
+            f"market={market_gate.get('reason', '-')}"
+            f" equity_ready={bool(market_gate.get('equity_scan_ready'))}"
+            f" crypto_ready={bool(market_gate.get('crypto_scan_ready'))}"
+        ),
+        (
+            f"cfo={risk_cfo.get('decision', '-')}"
+            f" reason={risk_cfo.get('reason', '-')}"
+        ),
+        (
+            f"orders_submitted={int(execution.get('orders_submitted', 0) or 0)}"
+            f" status={execution.get('execution_status', '-')}"
+        ),
+        (
+            f"positions={int(risk_cfo.get('open_positions', 0) or 0)}"
+            f" open_orders={int(risk_cfo.get('open_orders', 0) or 0)}"
+            f" slots_free={int(risk_cfo.get('available_slots', 0) or 0)}"
+        ),
+        (
+            f"protection={protection.get('system_status', '-')}"
+            f" drawdown=${_fmt_optional_float(protection.get('equity_drawdown_usd'))}"
+            f"/${_fmt_optional_float(protection.get('max_daily_drawdown_usd'))}"
+        ),
+        (
+            f"paper_equity=${_fmt_optional_float(account_summary.get('equity'))}"
+            f" open_pl=${_fmt_optional_float(account_summary.get('open_position_unrealized_pl'))}"
+        ),
+        (
+            "If this hourly status stops arriving, check the Centaur scheduler "
+            "before trusting dashboard freshness."
+        ),
+    ]
+    return {
+        "level": "info",
+        "event_key": "centaur_hourly_status",
+        "summary": "Centaur hourly status",
+        "detail": " | ".join(detail_parts),
+        "dedupe_minutes": interval_minutes,
+    }
+
 def _format_slack_alert(alert: dict[str, Any]) -> str:
     level = str(alert.get("level", "info")).upper()
     summary = str(alert.get("summary", "")).strip() or "Centaur alert"
@@ -701,6 +816,12 @@ def _live_alpaca_pdt_basis_equity(context: TickContext) -> float | None:
 
 def _alert_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")[:80] or "alert"
+
+def _fmt_optional_float(value: Any, *, decimals: int = 2) -> str:
+    number = _as_float(value)
+    if number is None:
+        return "-"
+    return f"{number:.{decimals}f}"
 
 def _parse_iso_date(value: Any) -> date | None:
     try:
@@ -766,7 +887,7 @@ def _build_paper_trade_approval(
                 broker_id=broker_id,
             ),
         }
-    if asset_class == "equity" and _equity_friday_entry_cutoff_active(
+    if asset_class == "equity" and _equity_entry_cutoff_active(
         config,
         context.started_at,
         next_close=_broker_equity_next_close(
@@ -778,7 +899,7 @@ def _build_paper_trade_approval(
             "symbol": symbol,
             "strategy_id": strategy_id,
             "broker_id": broker_id,
-            "reason": "friday_entry_cutoff_no_weekend_carry",
+            "reason": "equity_entry_cutoff_no_overnight_carry",
         }
     if asset_class == "crypto" and not bool(market_gate.get("crypto_scan_ready")):
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "crypto_unavailable"}
@@ -996,7 +1117,7 @@ def _build_live_trade_approval(
             "broker_id": broker_id,
             "reason": pdt_rejection,
         }
-    if asset_class == "equity" and _equity_friday_entry_cutoff_active(
+    if asset_class == "equity" and _equity_entry_cutoff_active(
         config,
         context.started_at,
         next_close=market_gate.get("next_close"),
@@ -1004,7 +1125,7 @@ def _build_live_trade_approval(
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
-            "reason": "friday_entry_cutoff_no_weekend_carry_live",
+            "reason": "equity_entry_cutoff_no_overnight_carry_live",
         }
     if asset_class == "crypto" and not bool(market_gate.get("crypto_scan_ready")):
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "crypto_unavailable"}
@@ -1812,7 +1933,16 @@ def _managed_entry_stop_loss_price(order: dict[str, Any]) -> float | None:
     )
 
 def _order_filled_qty(order: dict[str, Any]) -> float:
-    return _as_float(order.get("filled_qty")) or _as_float(order.get("qty")) or 0.0
+    filled_qty = _as_float(order.get("filled_qty"))
+    if filled_qty is not None:
+        return filled_qty
+    filled_quantity = _as_float(order.get("filledQuantity"))
+    if filled_quantity is not None:
+        return filled_quantity
+    status = str(order.get("status", "")).strip().lower()
+    if status and status not in {"filled", "partially_filled"}:
+        return 0.0
+    return _as_float(order.get("qty")) or _as_float(order.get("quantity")) or 0.0
 
 def _order_activity_timestamp(order: dict[str, Any]) -> float:
     activity_at = _coerce_datetime(
@@ -1839,9 +1969,9 @@ def _build_exit_order_request(
     """Build one managed sell request or a skip reason for audit.
 
     The decision order is capital-preservation first: stop, profit capture,
-    target, Friday no-weekend flatten, and then policy-specific time exits.
-    Red max-hold deferrals deliberately avoid realizing a loss solely because a
-    timer elapsed while leaving stop/profit rules active.
+    target, same-day equity flatten, and then policy-specific time exits.
+    Max-hold limits are hard backstops; they do not defer just because the
+    position is red.
     """
     symbol = str(position.get("symbol", "")).upper()
     broker_symbol = str(entry_order.get("symbol") or symbol).upper()
@@ -2021,13 +2151,13 @@ def _build_exit_order_request(
         exit_reason = "profit_capture_hit"
     elif target_price is not None and high_price is not None and high_price >= target_price:
         exit_reason = "take_profit_hit"
-    elif _equity_friday_flatten_due(
+    elif _equity_flatten_due(
         context.config,
         asset_class=asset_class,
         as_of=as_of,
         next_close=context.state.get("market_gate", {}).get("next_close"),
     ):
-        exit_reason = "friday_no_weekend_carry"
+        exit_reason = "equity_no_overnight_carry"
     elif (
         managed_exit_policy == "profit_after_1h_else_1d"
         and entry_submitted_at is not None
@@ -2048,12 +2178,6 @@ def _build_exit_order_request(
             max_hold_window_minutes > 0
             and as_of >= entry_submitted_at + timedelta(minutes=max_hold_window_minutes)
         ):
-            if (
-                profit_reference_price is not None
-                and entry_reference_price is not None
-                and profit_reference_price < entry_reference_price
-            ):
-                return None, "max_hold_red_deferred"
             exit_reason = "max_holding_window_elapsed"
         else:
             return None, "exit_not_due"
@@ -2063,13 +2187,6 @@ def _build_exit_order_request(
         and as_of >= entry_submitted_at + timedelta(minutes=holding_window_minutes)
     ):
         if managed_exit_policy == "profit_capture_else_1d":
-            time_exit_reference_price = close_price or current_price
-            if (
-                time_exit_reference_price is not None
-                and entry_reference_price is not None
-                and time_exit_reference_price < entry_reference_price
-            ):
-                return None, "max_hold_red_deferred"
             exit_reason = "max_holding_window_elapsed"
         else:
             exit_reason = "holding_window_elapsed"

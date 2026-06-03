@@ -117,7 +117,7 @@ Current micro paper mode rules:
 - projected gain must be at least `1.5%` for equities and `2.0%` for crypto
 - `crypto_momentum.trend` uses a `1.0%` stop by explicit operator override on 2026-06-01, reducing future `$10` stop losses from roughly `$0.30` to roughly `$0.10` while keeping crypto enabled
 - paper entries and exits use marketable limit orders rather than raw market orders
-- already allowed strategies may use the score-to-trade rule when raw `signal_score >= 90.0`; those candidates survive fitness suppression so CFO/risk can evaluate them. This does not change notional, stops, projected-gain floors, broker routing, max orders, or same-as-paper live following
+- already allowed strategies may use the score-to-trade rule when raw `signal_score` is at or above the active configured dial (`PAPER_MIN_SIGNAL_SCORE_TO_TRADE` for paper, `LIVE_MIN_SIGNAL_SCORE_TO_TRADE` for live/live-dry; currently same-as-paper at `90.0`); those candidates survive fitness suppression so CFO/risk can evaluate them. This does not change notional, stops, projected-gain floors, broker routing, max orders, or same-as-paper live following
 - paper managed exits may capture profit at `1.25%` for both equity and crypto positions while preserving the higher entry projected-gain gates
 - shadow outcomes record a profit-target ladder of `1.25%`, `2%`, `3%`, `4%`, and `6%` so the project can learn whether waiting for higher exits would have worked without changing the actual paper capture rule
 - `crypto_momentum.trend` paper exits use `profit_capture_else_1d`: stop, `1.25%` capture, and target remain active, with a finite `1d` max-hold backstop instead of the old `60m` forced time exit
@@ -126,7 +126,7 @@ Current micro paper mode rules:
 - `mean_reversion.snapback` paper exits now use an explicit override: profitable positions may exit after `1` hour, while non-profitable positions continue under the same stop/target protection until a `1d` max-hold backstop
 - equities now use the paper-only adaptive suppress-threshold lane anchored at `-5.60`, while crypto uses its own fixed suppress threshold `-6.90`
 - the adaptive paper-only cliff governor now uses a dedicated `0.10` safety gap by explicit human override on 2026-05-27 so weak `mean_reversion.snapback` cliffs near `-6.77` are blocked again
-- new paper entries are disabled for the session once the persisted equity drawdown reaches `$1.00`
+- new paper entries are disabled for the session once the persisted equity drawdown reaches `$2.00`
 - untouched equity entry limits older than `5` minutes are canceled by the in-pipeline stale-order reaper
 - orders are logged into `paper_trade_orders`
 - current broker routing is explicit:
@@ -138,7 +138,7 @@ Current micro paper mode rules:
 - Trading 212 latest-bar plumbing preserves Trading 212 venue ticker casing and converts GBX quote prices to GBP for fixed `£10` quantity sizing when a real API-derived price is available
 - Trading 212 Live now has explicit `TRADING212_LIVE_*` configuration and adapter/readiness identity using the documented live API base URL, but `TRADING212_LIVE_EXECUTION_ENABLED=false` and live order validate/build/submit/cancel fail closed until separately approved
 - Alpaca Live is approved for same-as-paper follower activation by explicit 2026-05-29 operator override and must not submit real-money entries outside those go-live gates
-- Alpaca Live mirrors paper settings for equities plus crypto, the same three allowed strategies, `$10` notional, `10` base slots, one order per tick, `$1.00` persisted daily protector, `1.5%` equity projected-gain, `2.0%` crypto projected-gain, `5` bps equity buffer, and `25` bps crypto buffer; activation is authorized only inside this recorded envelope
+- Alpaca Live mirrors paper settings for equities plus crypto, the same three allowed strategies, `$10` notional, `10` base slots, one order per tick, `$2.00` persisted daily protector, `1.5%` equity projected-gain, `2.0%` crypto projected-gain, `5` bps equity buffer, and `25` bps crypto buffer; activation is authorized only inside this recorded envelope
 - The recorded first-live policy is same-as-paper by operator request, but extra account funds above `$100` are launch buffer only and do not create additional first-live slots
 - Alpaca Live protective mechanics now mirror paper readiness: guarded cancellation, stale equity-entry reaping, and stale/non-marketable managed sell-exit refresh are implemented for a future activated lane
 - Live execution intelligence is separate from strategy intelligence: strategy scoring stays shared through shadow fitness, while live diagnostics monitor future live-vs-paper execution quality
@@ -187,6 +187,8 @@ Operational visibility now also includes:
 - `scripts/centaur-agent.sh status` for launch agent details, tail logs, and the same summary
 - `scripts/centaur-agent.sh dashboard` as a convenience launcher for the DDEV-routed dashboard
 - explicit paper-execution alerts in status and dashboard output so broker failures are visible with reasons
+- hourly one-way Slack liveness/status messages via `SLACK_HOURLY_STATUS_*`, deduped in `notification_events`; if those messages stop arriving, treat the scheduler/control loop as stale until proven healthy
+- scheduled test monitoring via `.venv-mac/bin/python scripts/run_test_monitor.py`, which runs the unit suite and fails if the latest persisted control tick is missing, non-ok, or stale beyond `TEST_MONITOR_SCHEDULER_MAX_AGE_MINUTES`
 - a read-only paper-exit post-mortem command that compares actual paper exits to stored `15m`, `1h`, and `1d` shadow outcomes for the same proposal ids
 - strategy-coverage graphs so newly installed strategies can be seen even before they have fitness rows
 - a ranked strategy leaderboard that orders all strategies by current best fitness and explains, in plain English, why the current leader is on top

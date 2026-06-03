@@ -248,6 +248,43 @@ class ExecutionRouterTests(unittest.TestCase):
         self.assertFalse(result.submitted)
         self.assertEqual(result.error, "strategy_not_allowed_live")
 
+    def test_live_flatten_allows_unmanaged_sell_without_strategy_allowlist(self) -> None:
+        class FakeAdapter:
+            def submit_order(self, context, *, order_request):
+                return {"id": "flatten-1", "symbol": order_request["symbol"]}
+
+        context = self._context(mode="live", environment="live")
+        router = ExecutionRouter(adapter_factory=lambda _context, _broker_id: FakeAdapter())
+        result = router.route_order_request(
+            context=context,
+            broker_id="alpaca_live",
+            order_request={"symbol": "AAPL", "side": "sell"},
+            lane="live",
+            action="flatten",
+            strategy_id="unmanaged_position",
+        )
+
+        self.assertTrue(result.submitted)
+        self.assertEqual(result.order["id"], "flatten-1")
+
+    def test_live_flatten_rejects_non_sell(self) -> None:
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("adapter should not be called when flatten guard blocks")
+
+        context = self._context(mode="live", environment="live")
+        router = ExecutionRouter(adapter_factory=fail_if_called)
+        result = router.route_order_request(
+            context=context,
+            broker_id="alpaca_live",
+            order_request={"symbol": "AAPL", "side": "buy"},
+            lane="live",
+            action="flatten",
+            strategy_id="unmanaged_position",
+        )
+
+        self.assertFalse(result.submitted)
+        self.assertEqual(result.error, "live_flatten_requires_sell")
+
     def test_live_cancel_uses_guard_before_adapter(self) -> None:
         def fail_if_called(*_args, **_kwargs):
             raise AssertionError("adapter should not be called when guard blocks")
