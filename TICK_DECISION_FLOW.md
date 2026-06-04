@@ -53,9 +53,10 @@ flowchart TD
   proposals --> cfo{"CFO risk gate"}
   cfo -->|rejects| hold["Hold"]
   cfo -->|approves| paper["Paper order"]
-  paper --> live{"Live follower gate"}
+  paper --> live{"Current live follower gate"}
   live -->|blocked| hold
-  live -->|approved same-as-paper follower| liveOrder["Live order"]
+  live -->|approved current follower| liveOrder["Live order"]
+  proposals -.-> liveTarget["Target live lane<br/>LIVE_* .env dials"]
 ```
 
 ## Where The Tick Starts
@@ -896,16 +897,18 @@ If there are no CFO approvals, execution is idle.
 If there are approvals, execution routes the approved request through the broker
 adapter and records the broker response.
 
-## Live Follower
+## Live Lane
 
-Live is downstream of paper.
+Current runtime: live is downstream of paper.
 
 The live CFO gate is:
 
 - `app/framework/engine/pipelines.py`
 - function: `live_risk_cfo_gate`
 
-Live only considers trades that paper both approved and actually submitted.
+Today, live only considers trades that paper both approved and actually
+submitted. This is the 2026-05-29 first-live safety envelope, not the intended
+end-state.
 
 It then applies live-specific safety gates:
 
@@ -923,8 +926,24 @@ same-paper-follow validation
 PDT guard for live equities
 ```
 
-The live lane shares paper/shadow strategy fitness. It must not invent its own
-strategy brain or widen the paper envelope.
+Target runtime direction as of 2026-06-04: live should be its own lane, not a
+blind paper copy. The intended shape is:
+
+```text
+shared market evidence
+shared strategy/signal engine
+paper proposal lane -> PAPER_* .env dials -> paper CFO/risk -> paper execution
+live proposal lane  -> LIVE_* .env dials  -> live CFO/risk  -> LiveRiskGuard -> live execution
+```
+
+In that target design, paper and live may independently trade, skip, reduce, or
+block based on their lane dials and account/broker state. Live independence does
+not mean widening risk or inventing live-only behaviour in code. It means the
+live lane follows the configured `LIVE_*` `.env` values exactly and reports the
+specific dial/gate that authorized or blocked each action.
+
+Until that migration is implemented, tested, reported, and explicitly activated,
+the current same-tick paper follower rule remains the live-money safety boundary.
 
 ## A Tick That Does Nothing Is Often Correct
 

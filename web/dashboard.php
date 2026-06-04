@@ -12,117 +12,466 @@ require __DIR__ . '/navigation.php';
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Project Centaur Dashboard</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f7f5;
+      --surface: #ffffff;
+      --surface-2: #eef5f1;
+      --ink: #172022;
+      --muted: #657174;
+      --line: #d7e1dc;
+      --teal: #0f8b8d;
+      --teal-dark: #096669;
+      --gold: #c98f13;
+      --rose: #c94b5f;
+      --green: #258b57;
+      --shadow: 0 16px 40px rgba(18, 31, 32, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        linear-gradient(180deg, rgba(15, 139, 141, 0.08), rgba(244, 247, 245, 0) 34rem),
+        var(--bg);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    button {
+      font: inherit;
+    }
+
+    .shell {
+      width: min(1460px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 34px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .eyebrow {
+      margin: 0 0 7px;
+      color: var(--teal-dark);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 3vw, 44px);
+      line-height: 1.02;
+      letter-spacing: 0;
+    }
+
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    .subtle {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 750;
+      padding: 0 14px;
+      box-shadow: 0 6px 18px rgba(18, 31, 32, 0.05);
+      text-decoration: none;
+    }
+
+    .button:hover {
+      border-color: rgba(15, 139, 141, 0.45);
+    }
+
+    .button.primary {
+      background: var(--teal);
+      border-color: var(--teal);
+      color: white;
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(156px, 1fr));
+      gap: 14px;
+    }
+
+    .metric-card,
+    .panel,
+    .subpanel,
+    .alert-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: var(--shadow);
+    }
+
+    .metric-card {
+      min-width: 0;
+      padding: 15px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 760;
+    }
+
+    .metric-value {
+      margin-top: 11px;
+      color: var(--ink);
+      font-size: 24px;
+      font-weight: 850;
+      line-height: 1.1;
+      overflow-wrap: anywhere;
+    }
+
+    .metric-value.is-compact {
+      font-size: 20px;
+      line-height: 1.15;
+    }
+
+    .metric-detail {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+
+    .tone-positive {
+      color: var(--green);
+    }
+
+    .tone-negative {
+      color: var(--rose);
+    }
+
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.9fr);
+      gap: 18px;
+      align-items: start;
+      margin-top: 18px;
+    }
+
+    .stack {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .panel {
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      min-height: 56px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.76);
+    }
+
+    .panel-title {
+      font-size: 15px;
+      font-weight: 850;
+    }
+
+    .panel-body {
+      padding: 16px;
+    }
+
+    .account-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .subpanel {
+      box-shadow: none;
+      background: var(--surface-2);
+      padding: 14px;
+    }
+
+    .subpanel-title {
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 850;
+    }
+
+    .detail-list {
+      display: grid;
+      gap: 8px;
+      margin: 12px 0 0;
+      padding: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+      list-style: none;
+    }
+
+    .list-stack {
+      display: grid;
+      gap: 8px;
+    }
+
+    .list-row {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+      padding: 10px 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.42;
+      overflow-wrap: anywhere;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    .data-table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+    }
+
+    .data-table th {
+      padding: 11px 13px;
+      background: var(--surface-2);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 850;
+      letter-spacing: 0.06em;
+      text-align: left;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .data-table td {
+      padding: 11px 13px;
+      border-top: 1px solid var(--line);
+      color: #263336;
+      font-size: 13px;
+      vertical-align: top;
+    }
+
+    .signal-sections {
+      display: grid;
+      gap: 14px;
+    }
+
+    .alert-card {
+      box-shadow: none;
+      background: var(--surface-2);
+      padding: 14px;
+    }
+
+    .alert-level {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 850;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .alert-title {
+      margin-top: 8px;
+      color: var(--ink);
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    .alert-meta,
+    .alert-detail {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.42;
+    }
+
+    @media (max-width: 1180px) {
+      .metric-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .shell {
+        width: min(100% - 24px, 1460px);
+        padding-top: 18px;
+      }
+
+      .topbar {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      .toolbar {
+        justify-content: flex-start;
+      }
+
+      .metric-grid,
+      .account-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
 </head>
-<body class="bg-stone-100 text-stone-900">
-  <main class="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-    <header class="mb-6 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+<body>
+  <main class="shell">
+    <header class="topbar">
       <div>
-        <p class="text-sm font-medium uppercase tracking-wide text-amber-700">Project Centaur</p>
-        <h1 class="text-3xl font-semibold tracking-tight">Operator Dashboard</h1>
-        <p id="checked-at" class="mt-2 text-sm text-stone-500">Loading latest snapshot...</p>
+        <p class="eyebrow">Project Centaur</p>
+        <h1>Operator Dashboard</h1>
+        <p id="checked-at" class="subtle" style="margin-top: 10px;">Loading latest snapshot...</p>
       </div>
-      <div class="centaur-menu-toolbar flex flex-wrap gap-2">
-        <button id="refresh-button" class="inline-flex items-center rounded-md border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-700 shadow-sm hover:bg-stone-50">Refresh</button>
+      <div class="centaur-menu-toolbar toolbar">
+        <button id="refresh-button" class="button primary" type="button">Refresh</button>
         <?php centaurRenderNavigation('/dashboard.php'); ?>
       </div>
     </header>
 
-    <section id="metric-cards" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-6"></section>
+    <section id="metric-cards" class="metric-grid"></section>
 
-    <section class="mt-6 grid gap-6 xl:grid-cols-[1.3fr_0.9fr]">
-      <div class="space-y-6">
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Account</h2>
+    <section class="dashboard-grid">
+      <div class="stack">
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Account lanes</h2>
           </div>
-          <div id="account-panel" class="grid gap-4 p-4 md:grid-cols-2"></div>
+          <div id="account-panel" class="panel-body"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Open positions</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Paper open positions</h2>
           </div>
-          <div id="positions-table" class="overflow-x-auto"></div>
+          <div id="positions-table" class="table-wrap"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Recent paper orders</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Recent paper orders</h2>
           </div>
-          <div id="orders-table" class="overflow-x-auto"></div>
+          <div id="orders-table" class="table-wrap"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Recent shadow proposals</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Recent shadow proposals</h2>
           </div>
-          <div id="proposals-table" class="overflow-x-auto"></div>
+          <div id="proposals-table" class="table-wrap"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Signal pipeline</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Signal pipeline</h2>
           </div>
-          <div id="signal-panels" class="space-y-4 p-4"></div>
+          <div id="signal-panels" class="panel-body signal-sections"></div>
         </div>
       </div>
 
-      <div class="space-y-6">
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Trade diagnostics</h2>
+      <div class="stack">
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Trade diagnostics</h2>
           </div>
-          <div id="trade-diagnostics" class="space-y-2 p-4"></div>
+          <div id="trade-diagnostics" class="panel-body list-stack"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Centaur activity</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Centaur activity</h2>
           </div>
-          <div id="activity-panel" class="space-y-2 p-4"></div>
+          <div id="activity-panel" class="panel-body list-stack"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">GA threshold advice</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">GA threshold advice</h2>
           </div>
-          <div id="threshold-panel" class="space-y-2 p-4"></div>
+          <div id="threshold-panel" class="panel-body list-stack"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Holding-window fitness</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Holding-window fitness</h2>
           </div>
-          <div id="holding-window-panel" class="space-y-2 p-4"></div>
+          <div id="holding-window-panel" class="panel-body list-stack"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Broker accounts</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Broker accounts</h2>
           </div>
-          <div id="broker-panel" class="space-y-2 p-4"></div>
+          <div id="broker-panel" class="panel-body list-stack"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Live readiness</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Live readiness</h2>
           </div>
-          <div id="live-panel" class="space-y-2 p-4"></div>
+          <div id="live-panel" class="panel-body list-stack"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">API cost</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">API cost</h2>
           </div>
-          <div id="cost-panel" class="space-y-2 p-4"></div>
+          <div id="cost-panel" class="panel-body list-stack"></div>
         </div>
 
-        <div class="rounded-lg border border-stone-200 bg-white shadow-sm">
-          <div class="border-b border-stone-200 px-4 py-3">
-            <h2 class="text-base font-semibold">Alerts</h2>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">Alerts</h2>
           </div>
-          <div id="alerts-panel" class="space-y-3 p-4"></div>
+          <div id="alerts-panel" class="panel-body list-stack"></div>
         </div>
       </div>
     </section>
@@ -177,6 +526,58 @@ require __DIR__ . '/navigation.php';
       return `${number >= 0 ? "+" : ""}${number.toFixed(2)}%`;
     }
 
+    function numberOrNull(value) {
+      if (value === null || value === undefined || value === "") return null;
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    }
+
+    function currencySymbol(currency) {
+      return String(currency || "USD").trim().toUpperCase() === "GBP" ? "\u00a3" : "$";
+    }
+
+    function fmtCurrencyFor(value, currency = "USD", decimals = 2) {
+      const number = numberOrNull(value);
+      if (number === null) return "-";
+      return `${currencySymbol(currency)}${number.toFixed(decimals)}`;
+    }
+
+    function fmtSignedCurrencyFor(value, currency = "USD") {
+      const number = numberOrNull(value);
+      if (number === null) return "-";
+      return `${currencySymbol(currency)}${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
+    }
+
+    function brokerAccounts(snapshot) {
+      return Array.isArray(snapshot?.broker_accounts) ? snapshot.broker_accounts.filter(Boolean) : [];
+    }
+
+    function findBrokerAccount(snapshot, brokerId) {
+      const expected = String(brokerId || "").trim().toLowerCase();
+      if (!expected) return null;
+      return brokerAccounts(snapshot).find((row) => String(row.broker_id || "").trim().toLowerCase() === expected) || null;
+    }
+
+    function brokerDayChange(account) {
+      const equity = numberOrNull(account?.equity);
+      const lastEquity = numberOrNull(account?.last_equity);
+      if (equity === null || lastEquity === null) return null;
+      return Number((equity - lastEquity).toFixed(6));
+    }
+
+    function brokerDayChangePct(account) {
+      const change = brokerDayChange(account);
+      const lastEquity = numberOrNull(account?.last_equity);
+      if (change === null || !lastEquity) return null;
+      return Number(((change / lastEquity) * 100).toFixed(6));
+    }
+
+    function toneClass(value) {
+      const number = numberOrNull(value);
+      if (number === null || number === 0) return "";
+      return number > 0 ? "tone-positive" : "tone-negative";
+    }
+
     function escapeHtml(value) {
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -189,28 +590,28 @@ require __DIR__ . '/navigation.php';
     function renderList(target, items, emptyLabel = "Nothing recorded yet.") {
       const rows = Array.isArray(items) ? items.filter(Boolean) : [];
       if (!rows.length) {
-        target.innerHTML = `<p class="text-sm text-stone-500">${escapeHtml(emptyLabel)}</p>`;
+        target.innerHTML = `<p class="subtle">${escapeHtml(emptyLabel)}</p>`;
         return;
       }
       target.innerHTML = rows.map((item) => `
-        <div class="rounded-md border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-700">
-          <span class="font-mono text-[12px]">${escapeHtml(item)}</span>
+        <div class="list-row">
+          <span class="mono">${escapeHtml(item)}</span>
         </div>
       `).join("");
     }
 
     function renderTable(target, columns, rows, emptyLabel) {
       if (!Array.isArray(rows) || !rows.length) {
-        target.innerHTML = `<p class="p-4 text-sm text-stone-500">${escapeHtml(emptyLabel)}</p>`;
+        target.innerHTML = `<div class="panel-body"><p class="subtle">${escapeHtml(emptyLabel)}</p></div>`;
         return;
       }
-      const head = columns.map((column) => `<th class="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">${escapeHtml(column.label)}</th>`).join("");
+      const head = columns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("");
       const body = rows.map((row) => `
-        <tr class="border-t border-stone-200">
-          ${columns.map((column) => `<td class="px-4 py-3 text-sm text-stone-700 ${column.mono ? "font-mono text-[12px]" : ""}">${column.render(row)}</td>`).join("")}
+        <tr>
+          ${columns.map((column) => `<td class="${column.mono ? "mono" : ""}">${column.render(row)}</td>`).join("")}
         </tr>
       `).join("");
-      target.innerHTML = `<table class="min-w-full">${`<thead class="bg-stone-50"><tr>${head}</tr></thead><tbody>${body}</tbody>`}</table>`;
+      target.innerHTML = `<table class="data-table">${`<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`}</table>`;
     }
 
     function buildMetricCards(snapshot) {
@@ -220,55 +621,114 @@ require __DIR__ . '/navigation.php';
       const riskCfo = tickState.risk_cfo || {};
       const blockers = (snapshot.centaur_activity || {}).blockers || {};
       const account = snapshot.account_overview || {};
+      const liveOverview = snapshot.live_execution_overview || {};
+      const liveAccount = findBrokerAccount(snapshot, liveOverview.broker_id || "alpaca_live");
+      const liveDayChange = brokerDayChange(liveAccount);
+      const liveCurrency = liveAccount?.currency || "USD";
+      const paperOpen = numberOrNull(account.open_positions_count) || 0;
+      const paperSlots = numberOrNull(account.effective_max_open_positions)
+        ?? numberOrNull(account.base_max_open_positions)
+        ?? 10;
 
       const cards = [
         { label: "Latest tick", value: String(latestTick.status || "none").toUpperCase(), detail: latestTick.started_at || "-" },
         { label: "Market", value: marketGate.market_open ? "OPEN" : "CLOSED", detail: marketGate.reason || "-" },
         { label: "CFO", value: riskCfo.decision || "-", detail: riskCfo.reason || "-" },
-        { label: "Day P/L", value: fmtSignedCurrency(account.day_change_usd), detail: fmtSignedPct(account.day_change_pct), tone: Number(account.day_change_usd) > 0 ? "text-emerald-600" : Number(account.day_change_usd) < 0 ? "text-rose-600" : "" },
-        { label: "Open positions", value: String(account.open_positions_count || 0), detail: `slots ${account.open_positions_count || 0}/10` },
+        {
+          label: "Paper day P/L",
+          value: fmtSignedCurrency(account.day_change_usd),
+          detail: `Alpaca Paper ${fmtSignedPct(account.day_change_pct)}`,
+          tone: toneClass(account.day_change_usd)
+        },
+        {
+          label: "Live day P/L",
+          value: liveAccount ? fmtSignedCurrencyFor(liveDayChange, liveCurrency) : "-",
+          detail: liveAccount
+            ? `${liveAccount.broker_label || "Alpaca Live"} ${fmtSignedPct(brokerDayChangePct(liveAccount))}`
+            : `${liveOverview.status || "not available"} follower snapshot`,
+          tone: toneClass(liveDayChange)
+        },
+        { label: "Paper positions", value: String(paperOpen), detail: `slots ${paperOpen}/${paperSlots}` },
         { label: "Primary blocker", value: blockers.primary_stage || "-", detail: blockers.cfo_reason || "-" }
       ];
 
       cardContainer.innerHTML = cards.map((card) => `
-        <article class="rounded-lg border border-stone-200 bg-white p-4 shadow-sm">
-          <div class="text-sm text-stone-500">${escapeHtml(card.label)}</div>
-          <div class="mt-3 text-2xl font-semibold ${card.tone || ""}">${escapeHtml(card.value)}</div>
-          <div class="mt-2 text-sm text-stone-500">${escapeHtml(card.detail || "-")}</div>
+        <article class="metric-card">
+          <div class="metric-label">${escapeHtml(card.label)}</div>
+          <div class="metric-value ${String(card.value || "").length > 12 ? "is-compact" : ""} ${card.tone || ""}">${escapeHtml(card.value)}</div>
+          <div class="metric-detail">${escapeHtml(card.detail || "-")}</div>
         </article>
       `).join("");
     }
 
-    function buildAccountPanel(account) {
-      const blocks = [
-        {
-          title: "Balances",
+    function buildAccountPanel(snapshot) {
+      const paper = snapshot.account_overview || {};
+      const liveOverview = snapshot.live_execution_overview || {};
+      const liveAccount = findBrokerAccount(snapshot, liveOverview.broker_id || "alpaca_live");
+      const trading212Paper = findBrokerAccount(snapshot, "trading212_paper");
+      const blocks = [];
+
+      if (Object.keys(paper).length) {
+        const paperOpen = numberOrNull(paper.open_positions_count) || 0;
+        const paperSlots = numberOrNull(paper.effective_max_open_positions)
+          ?? numberOrNull(paper.base_max_open_positions)
+          ?? 10;
+        blocks.push({
+          title: "Alpaca Paper",
           rows: [
-            `Equity ${fmtCurrency(account.equity)}`,
-            `Cash ${fmtCurrency(account.cash)}`,
-            `Buying power ${fmtCurrency(account.buying_power)}`,
-            `Position value ${fmtCurrency(account.position_market_value_usd)}`
+            `Paper execution lane | status ${paper.status || "-"}`,
+            `Equity ${fmtCurrency(paper.equity)} | cash ${fmtCurrency(paper.cash)}`,
+            `Day change ${fmtSignedCurrency(paper.day_change_usd)} (${fmtSignedPct(paper.day_change_pct)})`,
+            `Open unrealized ${fmtSignedCurrency(paper.open_position_unrealized_pl_usd)}`,
+            `Capital committed ${fmtCurrency(paper.capital_committed_usd)} | free ${fmtCurrency(paper.capital_free_usd)}`,
+            `Positions ${paperOpen}/${paperSlots} | earned slots ${paper.earned_slots || 0}`
           ]
-        },
-        {
-          title: "Capital and P/L",
+        });
+      }
+
+      if (liveAccount) {
+        const liveCurrency = liveAccount.currency || "USD";
+        blocks.push({
+          title: liveAccount.broker_label || "Alpaca Live",
           rows: [
-            `Day change ${fmtSignedCurrency(account.day_change_usd)} (${fmtSignedPct(account.day_change_pct)})`,
-            `Open unrealized ${fmtSignedCurrency(account.open_position_unrealized_pl_usd)}`,
-            `Committed ${fmtCurrency(account.capital_committed_usd)}`,
-            `Free ${fmtCurrency(account.capital_free_usd)}`
+            `Approved same-as-paper follower | ${liveOverview.enabled ? "enabled" : "disabled"} | status ${liveOverview.status || liveAccount.status || "-"}`,
+            `Equity ${fmtCurrencyFor(liveAccount.equity, liveCurrency)} | cash ${fmtCurrencyFor(liveAccount.cash, liveCurrency)}`,
+            `Day change ${fmtSignedCurrencyFor(brokerDayChange(liveAccount), liveCurrency)} (${fmtSignedPct(brokerDayChangePct(liveAccount))})`,
+            `Open unrealized ${fmtSignedCurrencyFor(liveAccount.open_position_unrealized_pl, liveCurrency)}`,
+            `Position value ${fmtCurrencyFor(liveAccount.position_market_value, liveCurrency)} | envelope ${fmtCurrency(liveOverview.envelope_max_usd)}`,
+            `Entry blockers ${(liveOverview.equity_entry_blockers || []).join(", ") || "none"}`
           ]
-        }
-      ];
+        });
+      }
+
+      if (trading212Paper) {
+        const currency = trading212Paper.currency || "GBP";
+        blocks.push({
+          title: trading212Paper.broker_label || "Trading 212 Paper",
+          rows: [
+            `Separate paper equity lane | status ${trading212Paper.status || "-"}`,
+            `Equity ${fmtCurrencyFor(trading212Paper.equity, currency)} | cash ${fmtCurrencyFor(trading212Paper.cash, currency)}`,
+            `Day change ${fmtSignedCurrencyFor(brokerDayChange(trading212Paper), currency)} (${fmtSignedPct(brokerDayChangePct(trading212Paper))})`,
+            `Open unrealized ${fmtSignedCurrencyFor(trading212Paper.open_position_unrealized_pl, currency)}`,
+            `Captured ${trading212Paper.captured_at || "-"}`
+          ]
+        });
+      }
+
+      if (!blocks.length) {
+        accountPanel.innerHTML = `<p class="subtle">No account snapshots available yet.</p>`;
+        return;
+      }
 
       accountPanel.innerHTML = blocks.map((block) => `
-        <div class="rounded-md border border-stone-200 bg-stone-50 p-4">
-          <h3 class="text-sm font-semibold text-stone-800">${escapeHtml(block.title)}</h3>
-          <ul class="mt-3 space-y-2 text-sm text-stone-600">
+        <div class="subpanel">
+          <h3 class="subpanel-title">${escapeHtml(block.title)}</h3>
+          <ul class="detail-list">
             ${block.rows.map((row) => `<li>${escapeHtml(row)}</li>`).join("")}
           </ul>
         </div>
       `).join("");
+      accountPanel.className = "panel-body account-grid";
     }
 
     function buildSignalPanels(activity) {
@@ -280,32 +740,32 @@ require __DIR__ . '/navigation.php';
 
       signalPanels.innerHTML = sections.map((section) => {
         if (!section.rows.length) {
-          return `<section class="rounded-md border border-stone-200 bg-stone-50 p-4"><h3 class="text-sm font-semibold">${escapeHtml(section.title)}</h3><p class="mt-3 text-sm text-stone-500">${escapeHtml(section.empty)}</p></section>`;
+          return `<section class="subpanel"><h3 class="subpanel-title">${escapeHtml(section.title)}</h3><p class="subtle" style="margin-top: 12px;">${escapeHtml(section.empty)}</p></section>`;
         }
         return `
-          <section class="rounded-md border border-stone-200 bg-stone-50 p-4">
-            <h3 class="text-sm font-semibold">${escapeHtml(section.title)}</h3>
-            <div class="mt-3 overflow-x-auto">
-              <table class="min-w-full">
+          <section class="subpanel">
+            <h3 class="subpanel-title">${escapeHtml(section.title)}</h3>
+            <div class="table-wrap" style="margin-top: 12px;">
+              <table class="data-table">
                 <thead>
                   <tr>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Strategy</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Symbol</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Status</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Score</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Fitness</th>
-                    <th class="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-stone-500">Target</th>
+                    <th>Strategy</th>
+                    <th>Symbol</th>
+                    <th>Status</th>
+                    <th>Score</th>
+                    <th>Fitness</th>
+                    <th>Target</th>
                   </tr>
                 </thead>
                 <tbody>
                   ${section.rows.slice(0, 8).map((row) => `
-                    <tr class="border-t border-stone-200">
-                      <td class="px-3 py-2 text-sm text-stone-700">${escapeHtml(row.strategy_id || "-")}</td>
-                      <td class="px-3 py-2 font-mono text-[12px] text-stone-700">${escapeHtml((row.symbol || "-").toUpperCase())}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${escapeHtml(row.allocation_status || "-")}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${fmtNumber(row.signal_score, 2)}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${fmtNumber(row.fitness_composite_score, 2)}</td>
-                      <td class="px-3 py-2 text-sm text-stone-700">${fmtNumber(row.target_return_pct, 2)}%</td>
+                    <tr>
+                      <td>${escapeHtml(row.strategy_id || "-")}</td>
+                      <td class="mono">${escapeHtml((row.symbol || "-").toUpperCase())}</td>
+                      <td>${escapeHtml(row.allocation_status || "-")}</td>
+                      <td>${fmtNumber(row.signal_score, 2)}</td>
+                      <td>${fmtNumber(row.fitness_composite_score, 2)}</td>
+                      <td>${fmtNumber(row.target_return_pct, 2)}%</td>
                     </tr>
                   `).join("")}
                 </tbody>
@@ -328,7 +788,7 @@ require __DIR__ . '/navigation.php';
     function renderSnapshot(snapshot) {
       checkedAtNode.textContent = `Checked ${snapshot.checked_at || "-"} | auto refresh every 15s`;
       buildMetricCards(snapshot);
-      buildAccountPanel(snapshot.account_overview || {});
+      buildAccountPanel(snapshot);
 
       renderTable(
         positionsTable,
@@ -436,8 +896,27 @@ require __DIR__ . '/navigation.php';
         "No holding-window fitness advice available yet."
       );
 
-      renderList(brokerPanel, snapshot.broker_accounts || [], "No broker snapshots recorded yet.");
-      renderList(livePanel, snapshot.live_execution_overview || [], "No live-readiness state available.");
+      renderList(
+        brokerPanel,
+        brokerAccounts(snapshot).map((account) => {
+          const currency = account.currency || "USD";
+          const roles = Array.isArray(account.roles) && account.roles.length ? account.roles.join(",") : "no active role";
+          return `${account.broker_label || account.broker_id || "-"} | ${account.status || "-"} | ${roles} | equity ${fmtCurrencyFor(account.equity, currency)} | open P/L ${fmtSignedCurrencyFor(account.open_position_unrealized_pl, currency)} | snapshot ${account.has_snapshot ? account.captured_at || "yes" : "missing"}`;
+        }),
+        "No broker snapshots recorded yet."
+      );
+      const liveOverview = snapshot.live_execution_overview || {};
+      renderList(
+        livePanel,
+        [
+          `Status ${liveOverview.status || "-"} | enabled=${liveOverview.enabled ? "yes" : "no"} | broker=${liveOverview.broker_id || "-"}`,
+          `Envelope | slot=${fmtCurrency(liveOverview.slot_size_usd)} | max_positions=${liveOverview.max_open_positions || "-"} | max_orders_per_tick=${liveOverview.max_orders_per_tick || "-"}`,
+          `Protection | drawdown=${fmtCurrency(liveOverview.max_daily_drawdown_usd)} | kill_switch=${liveOverview.kill_switch_on ? "on" : "off"} | activation_ack=${liveOverview.activation_ack_present ? "yes" : "no"}`,
+          `Equity entries | PDT basis=${fmtCurrency(liveOverview.pdt_basis_equity_usd)} | min=${fmtCurrency(liveOverview.pdt_min_equity_usd)} | blockers=${(liveOverview.equity_entry_blockers || []).join(", ") || "none"}`,
+          liveOverview.note || ""
+        ],
+        "No live-readiness state available."
+      );
 
       const cost = snapshot.cost_overview || {};
       const today = cost.today || {};
@@ -455,14 +934,14 @@ require __DIR__ . '/navigation.php';
 
       const alerts = Array.isArray(snapshot.alerts) ? snapshot.alerts : [];
       if (!alerts.length) {
-        alertsPanel.innerHTML = `<p class="text-sm text-stone-500">No current alerts.</p>`;
+        alertsPanel.innerHTML = `<p class="subtle">No current alerts.</p>`;
       } else {
         alertsPanel.innerHTML = alerts.slice(0, 8).map((alert) => `
-          <article class="rounded-md border border-stone-200 bg-stone-50 p-4">
-            <div class="text-xs font-semibold uppercase tracking-wide text-stone-500">${escapeHtml(alert.level || "info")}</div>
-            <div class="mt-2 text-sm font-medium text-stone-800">${escapeHtml(alert.summary || "-")}</div>
-            <div class="mt-2 text-xs text-stone-500">${escapeHtml(alert.at || "-")}</div>
-            <div class="mt-2 text-sm text-stone-600">${escapeHtml(alert.detail || "-")}</div>
+          <article class="alert-card">
+            <div class="alert-level">${escapeHtml(alert.level || "info")}</div>
+            <div class="alert-title">${escapeHtml(alert.summary || "-")}</div>
+            <div class="alert-meta">${escapeHtml(alert.at || "-")}</div>
+            <div class="alert-detail">${escapeHtml(alert.detail || "-")}</div>
           </article>
         `).join("");
       }

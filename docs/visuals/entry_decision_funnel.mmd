@@ -14,8 +14,12 @@ flowchart TD
   paper["Paper order request<br/>approved"]
   execution["Execution router<br/>broker adapter"]
   order["Submitted order<br/>if broker accepts"]
-  live{"Live follower gate<br/>same-as-paper only"}
-  live_order["Live order<br/>only after paper submitted<br/>and live gates pass"]
+  live{"Current live follower gate<br/>same-as-paper only"}
+  live_order["Current live order<br/>only after paper submitted<br/>and live gates pass"]
+  target["Target live lane<br/>shared evidence + LIVE_* .env dials"]
+  live_cfo{"Target live CFO/risk<br/>independent proposal decision"}
+  live_guard["LiveRiskGuard<br/>final broker mutation boundary"]
+  target_order["Target live order<br/>trade / skip / block audited"]
 
   universe --> bars
   bars --> candidates
@@ -34,3 +38,7 @@ flowchart TD
   order --> live
   live -->|blocked| hold
   live -->|approved follower| live_order
+  proposals -.-> target
+  target -.-> live_cfo
+  live_cfo -.-> live_guard
+  live_guard -.-> target_order

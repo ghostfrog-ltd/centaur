@@ -54,6 +54,8 @@ If a human override is granted, first live mode should still be extremely constr
 
 The 2026-05-29 operator-selected plan explicitly chooses the same-as-paper follower lane instead of the one-strategy default. That exception is acceptable only while the `$10` notional, `10` base slots, one-order-per-tick cap, same-tick submitted-paper-order follow rule, `$2.00` daily protector, and rollback triggers remain in force.
 
+2026-06-04 direction: this checklist describes the current first-live follower envelope, not the desired final architecture. The target design is an independent live lane that follows `LIVE_*` `.env` dials exactly over shared evidence/signals, while paper follows `PAPER_*`. That future lane needs a separate implementation/checklist/reporting update before activation.
+
 ## Current Dormant Live Lane
 Current May-readiness prep is:
 
@@ -179,7 +181,7 @@ Before activating live entries, do this in order:
 1. Re-run the read-only status/sync check immediately before activation and confirm Alpaca Live cash, equity, buying power, positions, and orders are still sane.
 2. Confirm the live account has no unexpected positions and no unexpected open orders.
 3. Confirm the live readiness envelope still matches the intended first phase: `$10` notional, one order per tick, `10` base slots, `$2.00` daily protector, same paper strategy allowlist, equities plus crypto, and the same projected-gain/limit-buffer settings. The `$132.05` balance does not widen the `$10 x 10` envelope.
-4. Confirm the recorded first-live policy above still stands: same-as-paper follower lane, same paper strategy allowlist, and no independent live strategy scoring.
+4. Confirm which live policy is being activated: the existing same-as-paper follower lane, or a separately implemented/tested/reported independent live lane that obeys `LIVE_*` `.env` dials exactly. Do not blur the two policies.
 5. Run one final paper tick/status check and confirm paper execution is not showing unresolved broker, order, stale-exit, or accounting alerts.
 6. Update this checklist, `CONSTRAINTS.md`, `DECISION_LOG.md`, `docs/DECISION_LOG.md`, `docs/PROJECT_RECORD.md`, and `PROGRESS.txt` with the explicit go-live override.
 7. Only after that documentation exists, set `LIVE_EXECUTION_ENABLED=true`, set `LIVE_EXECUTION_ACTIVATION_ACK=LIVE_TRADING_APPROVED`, and clear `LIVE_EXECUTION_KILL_SWITCH=false`.

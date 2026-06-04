@@ -3,7 +3,7 @@
 Purpose: compact read-first truth for safe work. Load archived logs only when the task needs history.
 
 ## Identity
-Centaur is an auditable trading research and micro paper/live follower system. Preserve capital first; optimise risk-adjusted, measurable growth rather than raw profit.
+Centaur is an auditable trading research and micro paper/live execution system. Preserve capital first; optimise risk-adjusted, measurable growth rather than raw profit.
 
 ## Prime Rules
 1. Preserve capital and compliance.
@@ -22,8 +22,9 @@ Centaur is an auditable trading research and micro paper/live follower system. P
 
 ## Execution Envelope
 - Active paper lanes: `alpaca_paper` plus separate `trading212_paper` equities where eligible.
-- Approved live lane: Alpaca Live only as the same-as-paper follower recorded on 2026-05-29.
-- Alpaca Live must match paper: same strategies/assets, `$10` entries, 10 base slots, one order per tick, `$2` daily protector, shared paper/shadow fitness. No live-only thresholds/order caps without approval.
+- Current approved live runtime: Alpaca Live is still implemented as the same-as-paper follower recorded on 2026-05-29 until the independent live proposal lane is implemented, tested, reported, and explicitly activated.
+- Target live architecture, approved as documentation direction on 2026-06-04: paper and live should be independent execution lanes over shared evidence/strategy signals. Paper must obey `PAPER_*` dials; live must obey `LIVE_*` dials from `.env` exactly. Live must not blindly copy paper once this migration is implemented, and it must not invent behaviour outside `.env`.
+- The independent live lane must keep the existing capital envelope unless `.env` and an explicit approval say otherwise: configured strategies/assets only, configured notional, configured slots, configured per-tick order cap, configured daily protector, configured projected-gain floors, configured buffers, and configured broker routing.
 - IG is scaffold/shadow only. Trading 212 Live has adapter/readiness wiring but order mutation is hard-disabled. Other brokers/providers fail closed until implemented, tested, reported, and approved.
 - Long-only. Paper trade notional is `$10` unless explicitly approved; Trading 212 paper currently uses `£5` native sizing for the reset £100 demo account.
 - Max orders per tick: `1`. Base slots: `10`; earned slots add +1 per full `$10` tracked P/L above baseline and can fall away.
@@ -36,7 +37,7 @@ Centaur is an auditable trading research and micro paper/live follower system. P
 - Managed exits: profit capture uses the current runtime config (`PAPER_EXECUTION_PROFIT_CAPTURE_PCT` / `LIVE_EXECUTION_PROFIT_CAPTURE_PCT`) at exit-decision time, not the value or take-profit target stored on the entry order; stored targets are only a legacy fallback when current profit capture is disabled. Profit ladder evidence remains at `1.25,2,3,4,6%` unless reconfigured.
 - Operator-facing ratio controls for profit capture, stop loss, projected-gain floors, and trailing giveback use percent notation in `.env`: `0.5` means `0.5%`, `1` means `1%`, `2` means `2%`; legacy decimal ratio values below `0.1` are still parsed as-is. Movement, spread, and ladder `PCT` fields are already percent-point values.
 - Same-symbol managed exits must use the most protective still-open entry stop.
-- Alpaca Live follower entries fail closed while any existing live position lacks a persisted managed-exit entry plan.
+- Alpaca Live entries fail closed while any existing live position lacks a persisted managed-exit entry plan.
 - Max-hold is a hard backstop: no red deferral after the configured max hold.
 - Equity no-overnight-carry: block new entries in final 60 minutes of every equity session; flatten equities in final 15 minutes, including missing-plan positions via an audited unmanaged flatten. Close-flattening must fall back to broker position price when latest bars are unavailable. Crypto uses the hard max-hold backstop.
 - Alpaca Live equity PDT guard: new live equity entries fail closed unless the live account proves prior/effective equity >= `$25,000`; exits still route when permitted. Do not auto-unblock on Alpaca’s 2026-06-04 framework date without observed account/API behaviour and explicit review.
@@ -46,7 +47,7 @@ Centaur is an auditable trading research and micro paper/live follower system. P
 - Prefer deterministic, auditable logic over opaque AI for trading, risk, execution, fitness, and replay.
 - Equity suppress threshold has adaptive paper-only rails; do not mutate `.env`, notional, broker routing, live readiness, max slots, floors, daily protection, stale-order rules, market-hours rules, long-only policy, or allowlist.
 - Crypto suppress threshold is separate and fixed.
-- Score-to-trade override: already allowed strategies with raw score >= configured `PAPER_MIN_SIGNAL_SCORE_TO_TRADE`/`LIVE_MIN_SIGNAL_SCORE_TO_TRADE` survive fitness suppression for paper and same-as-paper live so CFO/risk can evaluate them. Current dial is `90.0`. Fitness remains ranking/reporting evidence.
+- Score-to-trade override: already allowed strategies with raw score >= configured `PAPER_MIN_SIGNAL_SCORE_TO_TRADE`/`LIVE_MIN_SIGNAL_SCORE_TO_TRADE` survive fitness suppression so the relevant lane CFO/risk gate can evaluate them. Current dial is `90.0`. Fitness remains ranking/reporting evidence.
 - Holding-window advice is recommendation-only. When not compounding, review exits, holding-window advice, profit ladder, stale exits, and fill behaviour before loosening entries.
 
 ## Broker / Adapter Notes
@@ -65,7 +66,7 @@ Centaur is broker-agnostic: core owns instruments, signals, scoring, fitness, ri
 - `ModeContext`, `ExecutionRouter`, and `LiveRiskGuard` are core safety boundaries.
 - `live_dry` records live intents in `execution_router_intents` without mutating brokers.
 - Canonical instrument registry persists `InstrumentRef`, `canonical_instrument_id`, `venue`, and `venue_symbol` where derivable.
-- Config is `.env` only, grouped core/paper/live. Armed live fails closed on unnamed live-vs-paper differences outside `LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES`.
+- Config is `.env` only, grouped core/paper/live. Current same-as-paper runtime fails closed on unnamed live-vs-paper differences outside `LIVE_EXECUTION_ALLOWED_PAPER_DIFFERENCES`; the migration target is stricter and clearer lane ownership where paper uses `PAPER_*`, live uses `LIVE_*`, and any live action reports the exact dials that authorized it.
 - Dashboard/status must label paper, live, shadow, observe-only, recent, all-time, and broker-ledger evidence separately.
 - Slack is one-way notification only, never a command surface. Hourly liveness/status messages may be enabled via `SLACK_HOURLY_STATUS_*`; if they stop arriving, treat scheduler/control-loop freshness as suspect until checked.
 - Scheduled test monitoring runs the unit suite and a read-only scheduler freshness check; stale/missing/non-ok control ticks fail the monitor and can alert.

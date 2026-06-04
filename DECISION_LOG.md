@@ -2,6 +2,12 @@
 
 This is the short rolling decision head. Keep the full canonical history in `docs/DECISION_LOG.md`, but do not load it for every task.
 
+## 2026-06-04
+- Operator clarified the target live architecture: live should follow the active `.env` live dials exactly, not blindly copy paper.
+- Desired design: shared evidence/signals feed separate paper and live proposal/risk/execution lanes. Paper applies `PAPER_*`; live applies `LIVE_*`; each lane independently trades/skips/blocks with audited reasons.
+- This is a documentation/design direction first. Current Alpaca Live runtime remains the 2026-05-29 same-as-paper follower until the independent live lane is implemented, tested, reported, and explicitly activated.
+- Live independence must not widen risk outside config: no unapproved notional, slots, broker routing, strategy allowlists, projected-gain floors, daily protection, direction, or execution-provider changes.
+
 ## 2026-06-03
 - Operator approved raising the paper/live daily equity drawdown protector from `$1.00` to `$2.00` for the active Alpaca Paper, Trading 212 Paper, and Alpaca Live same-as-paper lanes.
 - Rationale: the recent `$10` micro-trade/10-slot paper evidence showed normal open-P/L noise around `$1.35-$1.80`, making `$1.00` too likely to halt new entries before enough throughput can be observed.

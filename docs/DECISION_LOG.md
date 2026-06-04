@@ -2,7 +2,27 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-06-03
+Last updated: 2026-06-04
+
+## 2026-06-04
+
+### Set independent live lane as the target design
+Decision:
+- by operator clarification, set the target live architecture to follow the active `.env` live dials exactly rather than blindly copying paper
+- shared market evidence, strategy signals, instrument identity, and fitness evidence should feed separate paper and live proposal/risk/execution lanes
+- paper applies `PAPER_*` dials; live applies `LIVE_*` dials; each lane independently records trade, skip, and block decisions with the dial/gate reasons that produced them
+- current Alpaca Live runtime remains the 2026-05-29 same-as-paper follower until the independent live lane is implemented, tested, reported, and explicitly activated
+
+Why:
+- a live lane that only follows paper is safe as a first-live step, but it is not the intended intelligent architecture
+- `.env` is the explicit operator control surface, so live behaviour should be governed by live dials rather than hidden coupling to submitted paper orders
+- separating lanes lets live be more selective, crypto-first where appropriate, and honest about account/broker constraints such as the live equity PDT guard
+
+Implementation notes:
+- this decision is documentation/design direction only in this commit; it does not change live order submission yet
+- live independence must not widen risk outside config: no unapproved notional, slots, broker routing, strategy allowlists, projected-gain floors, daily protection, direction, or execution-provider changes
+- the migration needs bounded status/reporting for live proposal counts, approvals, rejections, skipped paper-only trades, live-only approvals, final `LiveRiskGuard` outcomes, and broker-order provenance
+- any live entry still requires enablement, kill switch off, credentials, activation acknowledgement, live account/sync readiness, managed-exit plan safety, supported broker/instrument, and final `LiveRiskGuard`
 
 ## 2026-06-03
 
