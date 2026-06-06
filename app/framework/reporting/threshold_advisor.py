@@ -201,6 +201,8 @@ class ThresholdAdvisor:
 
         state = self.usage_ledger.get_strategy_threshold_adaptive_state()
         state_threshold = _as_float((state or {}).get("effective_threshold"))
+        if state_threshold is not None and state_threshold < -7.00:
+            state_threshold = -7.00
         state_floor = (
             min(hard_floor, state_threshold)
             if state_threshold is not None

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import hashlib
+import json
 from time import perf_counter
 from typing import Any
 
@@ -11,6 +13,7 @@ from app.framework.reporting.console import ScreenLogger
 from app.framework.runtime.models import StepProfile, TickContext, TickReport
 from app.framework.runtime.settings import RuntimeConfig, load_runtime_config
 from app.framework.storage.usage import UsageLedger
+from app.framework.strategies.registry import build_strategy_registry
 from app.framework.strategies.registry import evaluate_strategies
 
 from .candidate_engine import rank_candidates
@@ -18,6 +21,7 @@ from .fitness_engine import enrich_strategy_fitness_rows
 from .pipelines import StepDefinition
 from .shadow import build_shadow_proposals, evaluate_shadow_checkpoint
 from .technicals import compute_volatility_breakout_context
+from app.framework.strategies.common import liquidity_component
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +33,7 @@ class HistoricalReplayRequest:
     max_timestamps: int
     start_at: datetime | None = None
     end_at: datetime | None = None
+    dry_run: bool = False
 
 
 def load_replay_history(context: TickContext) -> dict[str, object]:
@@ -95,6 +100,7 @@ def load_replay_history(context: TickContext) -> dict[str, object]:
         "bars_loaded": len(rows),
         "timestamps_loaded": len(replay_timestamps),
         "eligible_timestamps": len(eligible_timestamps),
+        "replay_timestamps_processed": len(eligible_timestamps),
         "timeframe": request.timeframe,
         "days": request.days,
         "range_start": start_at.isoformat(),
@@ -102,6 +108,8 @@ def load_replay_history(context: TickContext) -> dict[str, object]:
         "data_range_end": data_end_at.isoformat(),
         "equity_symbols": len(request.equity_symbols),
         "crypto_symbols": len(request.crypto_symbols),
+        "historical_store_only": True,
+        "stale_or_account_only_source_skipped": 0,
         "mode": "historical_store",
     }
     context.state["historical_replay_load"] = result
@@ -133,8 +141,19 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
     proposals: list[dict[str, Any]] = []
     outcomes: list[dict[str, Any]] = []
     strategy_counts: dict[str, int] = defaultdict(int)
+    blocker_counts: Counter[str] = Counter()
+    candidates_evaluated = 0
+    signals_generated = 0
+    paper_execution_signals_generated = 0
+    paper_research_signals_generated = 0
+    outcomes_skipped_not_enough_future_data = 0
+    stale_or_account_only_source_skipped = 0
     previous_by_symbol: dict[tuple[str, str], dict[str, Any]] = {}
     recent_proposal_times: dict[tuple[str, str, str], datetime] = {}
+    strategy_flags = _strategy_replay_flags(context.config)
+    replay_run_id = str(context.metadata.get("replay_run_id", context.tick_id))
+    replay_started_at = context.started_at.isoformat()
+    replay_config_hash = str(context.metadata.get("replay_config_hash", ""))
     existing_events = []
     if isinstance(range_start, datetime) and isinstance(range_end, datetime):
         existing_events = context.usage_ledger.list_shadow_proposal_events(
@@ -182,6 +201,7 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
             replay_timestamp=replay_timestamp,
             lookback_periods=20,
         )
+        candidates_evaluated += len(enriched_candidates)
 
         replay_tick_id = _replay_tick_id(
             timeframe=_safe_slug(_get_request(context).timeframe),
@@ -197,11 +217,22 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
                 "replay_timeframe": _get_request(context).timeframe,
             },
         )
+        for item in batch.rejection_summary.get("by_strategy_reason", []) or []:
+            blocker_counts[
+                f"{str(item.get('strategy_id', '-') or '-')}/{str(item.get('reason', '-') or '-')}"
+            ] += int(item.get("count", 0) or 0)
         signal_dicts = [
             item.as_dict(tick_id=replay_tick_id)
             for item in batch.signals
             if int(item.holding_window_minutes) >= timeframe_minutes
         ]
+        signals_generated += len(signal_dicts)
+        for item in signal_dicts:
+            flags = strategy_flags.get(str(item.get("strategy_id", "")), {})
+            if bool(flags.get("paper_execution_allowed")):
+                paper_execution_signals_generated += 1
+            if bool(flags.get("paper_research_allowed")):
+                paper_research_signals_generated += 1
         if not signal_dicts:
             continue
 
@@ -222,11 +253,51 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
         if not replay_proposals:
             continue
 
+        candidate_context_by_key = {
+            (
+                str(item.get("source", "")),
+                str(item.get("symbol", "")).upper(),
+            ): item
+            for item in enriched_candidates
+        }
         for proposal in replay_proposals:
             strategy_counts[str(proposal.get("strategy_id", ""))] += 1
-            proposal["note"] = (
-                f"historical_replay:{_get_request(context).timeframe.lower()}:{proposal.get('note', '')}"
+            candidate_context = candidate_context_by_key.get(
+                (
+                    str(proposal.get("source", "")),
+                    str(proposal.get("symbol", "")).upper(),
+                ),
+                {},
             )
+            trade_count = _to_int(candidate_context.get("trade_count"))
+            volume = _to_int(candidate_context.get("volume"))
+            volume_gbp = _to_float(candidate_context.get("volume_gbp"))
+            if volume_gbp is None:
+                close_price_gbp = _to_float(candidate_context.get("close_price_gbp"))
+                if close_price_gbp is not None and volume is not None:
+                    volume_gbp = close_price_gbp * volume
+            proposal["movement_pct"] = _to_float(candidate_context.get("movement_pct"))
+            proposal["discovery_score"] = _to_float(
+                candidate_context.get("discovery_score", proposal.get("discovery_score"))
+            )
+            proposal["trade_count"] = trade_count
+            proposal["volume"] = volume
+            proposal["volume_gbp"] = volume_gbp
+            proposal["liquidity_score"] = liquidity_component(
+                volume=volume,
+                trade_count=trade_count,
+            )
+            proposal["environment"] = context.config.centaur_environment
+            proposal["mode"] = "shadow"
+            proposal["source_environment"] = "backtest"
+            proposal["data_provider"] = "historical_store"
+            proposal["execution_provider"] = "simulator"
+            proposal["note"] = (
+                f"historical_replay:{replay_run_id}:{_get_request(context).timeframe.lower()}:{proposal.get('note', '')}"
+            )
+            proposal["replay_run_id"] = replay_run_id
+            proposal["replay_started_at"] = replay_started_at
+            proposal["replay_config_hash"] = replay_config_hash
             recent_proposal_times[
                 (
                     str(proposal.get("strategy_id", "")),
@@ -239,16 +310,19 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
             symbol_history = list(bars_by_symbol.get(symbol_key, []))
             symbol_timestamps = list(timestamps_by_symbol.get(symbol_key, []))
             if not symbol_history or not symbol_timestamps:
+                outcomes_skipped_not_enough_future_data += len(proposal.get("checkpoint_windows", []))
                 continue
 
             future_index = bisect_left(symbol_timestamps, replay_timestamp)
             future_bars = symbol_history[future_index:]
             if not future_bars:
+                outcomes_skipped_not_enough_future_data += len(proposal.get("checkpoint_windows", []))
                 continue
 
             for checkpoint in proposal.get("checkpoint_windows", []):
                 due_at = _to_datetime(checkpoint.get("due_at"))
                 if due_at is None:
+                    outcomes_skipped_not_enough_future_data += 1
                     continue
                 outcome = evaluate_shadow_checkpoint(
                     checkpoint={
@@ -264,6 +338,11 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
                         "entry_price_gbp": proposal.get("entry_price_gbp"),
                         "stop_loss_price": proposal["stop_loss_price"],
                         "target_price": proposal["target_price"],
+                        "environment": proposal.get("environment"),
+                        "mode": proposal.get("mode"),
+                        "source_environment": proposal.get("source_environment"),
+                        "data_provider": proposal.get("data_provider"),
+                        "execution_provider": proposal.get("execution_provider"),
                         "risk_pct": proposal.get("risk_pct", 0),
                         "holding_window_code": proposal["holding_window_code"],
                         "holding_window_minutes": proposal["holding_window_minutes"],
@@ -280,27 +359,48 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
                     reference_notional_usd=context.config.paper_execution_default_notional_usd,
                     profit_target_ladder_pct=context.config.shadow_profit_target_ladder_pct,
                 )
-                if outcome is not None:
-                    outcomes.append(outcome)
+                if outcome is None:
+                    outcomes_skipped_not_enough_future_data += 1
+                    continue
+                outcome["replay_run_id"] = replay_run_id
+                outcome["replay_started_at"] = replay_started_at
+                outcome["replay_config_hash"] = replay_config_hash
+                outcomes.append(outcome)
 
         proposals.extend(replay_proposals)
 
     proposals_created = 0
     outcomes_evaluated = 0
-    if proposals:
+    if proposals and not _get_request(context).dry_run:
         context.usage_ledger.record_shadow_trade_proposals(proposals=proposals)
         proposals_created = len(proposals)
-    if outcomes:
+    else:
+        proposals_created = len(proposals)
+    if outcomes and not _get_request(context).dry_run:
         outcomes_evaluated = context.usage_ledger.record_shadow_trade_outcomes(
             outcomes=outcomes,
         )
+    else:
+        outcomes_evaluated = len(outcomes)
 
     result = {
+        "replay_run_id": replay_run_id,
+        "replay_started_at": replay_started_at,
+        "replay_config_hash": replay_config_hash,
         "timestamps_replayed": len(eligible_timestamps),
+        "replay_timestamps_processed": len(eligible_timestamps),
+        "candidates_evaluated": candidates_evaluated,
+        "signals_generated": signals_generated,
+        "paper_execution_signals_generated": paper_execution_signals_generated,
+        "paper_research_signals_generated": paper_research_signals_generated,
         "proposals_created": proposals_created,
         "outcomes_evaluated": outcomes_evaluated,
+        "outcomes_recorded": outcomes_evaluated,
+        "outcome_checkpoints_skipped_not_enough_future_data": outcomes_skipped_not_enough_future_data,
+        "stale_or_account_only_source_skipped": stale_or_account_only_source_skipped,
         "strategies_triggered": len(strategy_counts),
-        "mode": "historical_shadow_replay",
+        "dry_run": bool(_get_request(context).dry_run),
+        "mode": "historical_shadow_replay_dry_run" if _get_request(context).dry_run else "historical_shadow_replay",
     }
     if strategy_counts:
         top_strategy = max(strategy_counts.items(), key=lambda item: item[1])
@@ -309,35 +409,54 @@ def replay_shadow_training(context: TickContext) -> dict[str, object]:
     context.state["historical_replay_training"] = {
         **result,
         "strategy_counts": dict(sorted(strategy_counts.items())),
+        "top_blockers_by_strategy": [
+            {"blocker": blocker, "count": count}
+            for blocker, count in blocker_counts.most_common(10)
+        ],
     }
     return result
 
 
 def replay_strategy_fitness(context: TickContext) -> dict[str, object]:
+    strategy_ids, profile_ids = _fitness_scope_registry_filters(context.config)
+    note_prefix = f"historical_replay:{context.metadata.get('replay_run_id', context.tick_id)}:"
     raw_rows = context.usage_ledger.list_strategy_fitness_rows(
         as_of=context.started_at,
         lookback_days=context.config.strategy_fitness_lookback_days,
+        source_environments=("backtest",),
+        execution_providers=("simulator",),
+        strategy_ids=strategy_ids,
+        profile_ids=profile_ids,
+        note_prefix=note_prefix,
     )
     summaries = enrich_strategy_fitness_rows(
         rows=raw_rows,
         min_checkpoints=context.config.strategy_fitness_min_checkpoints,
     )
-    saved_count = context.usage_ledger.record_strategy_fitness_snapshots(
-        tick_id=context.tick_id,
-        captured_at=context.started_at,
-        summaries=summaries,
-        environment=context.config.centaur_environment,
-        mode="shadow",
-        source_environment="backtest",
-        broker_id="simulator",
-        data_provider="historical_store",
-        execution_provider="simulator",
-    )
+    saved_count = 0
+    if not _get_request(context).dry_run:
+        saved_count = context.usage_ledger.record_strategy_fitness_snapshots(
+            tick_id=context.tick_id,
+            captured_at=context.started_at,
+            summaries=summaries,
+            environment=context.config.centaur_environment,
+            mode="shadow",
+            source_environment="backtest",
+            broker_id="simulator",
+            data_provider="historical_store",
+            execution_provider="simulator",
+        )
     result = {
+        "replay_run_id": str(context.metadata.get("replay_run_id", context.tick_id)),
         "strategy_summaries": len(summaries),
         "summaries_saved": saved_count,
         "lookback_days": context.config.strategy_fitness_lookback_days,
-        "mode": "scorecard" if summaries else "insufficient_data",
+        "dry_run": bool(_get_request(context).dry_run),
+        "mode": (
+            "scorecard_dry_run"
+            if summaries and _get_request(context).dry_run
+            else "scorecard" if summaries else "insufficient_data"
+        ),
     }
     if summaries:
         result["top_strategy"] = summaries[0]["strategy_id"]
@@ -379,6 +498,7 @@ class HistoricalReplayRunner:
         max_timestamps: int | None = None,
         start_at: datetime | None = None,
         end_at: datetime | None = None,
+        dry_run: bool = False,
     ) -> TickReport:
         request = HistoricalReplayRequest(
             days=max(1, days or self.config.historical_replay_default_days),
@@ -389,6 +509,7 @@ class HistoricalReplayRunner:
             max_timestamps=max(0, max_timestamps or self.config.historical_replay_max_timestamps),
             start_at=start_at,
             end_at=end_at,
+            dry_run=dry_run,
         )
         started_at = datetime.now().astimezone()
         started_perf = perf_counter()
@@ -400,8 +521,13 @@ class HistoricalReplayRunner:
             usage_ledger=self.usage_ledger,
         )
         context.metadata["historical_replay_request"] = request
+        context.metadata["replay_run_id"] = tick_id
+        context.metadata["replay_config_hash"] = _replay_config_hash(request)
         context.state["run"] = {
             "pipeline": "historical_replay",
+            "replay_run_id": tick_id,
+            "replay_started_at": started_at.isoformat(),
+            "replay_config_hash": context.metadata["replay_config_hash"],
             "days": request.days,
             "timeframe": request.timeframe,
             "equity_symbols": list(request.equity_symbols),
@@ -409,6 +535,7 @@ class HistoricalReplayRunner:
             "max_timestamps": request.max_timestamps,
             "range_start": (request.start_at.isoformat() if request.start_at else None),
             "range_end": (request.end_at.isoformat() if request.end_at else None),
+            "dry_run": dry_run,
         }
 
         self.logger.tick_start(
@@ -426,6 +553,7 @@ class HistoricalReplayRunner:
                 f"equities={len(request.equity_symbols)} | "
                 f"crypto={len(request.crypto_symbols)} | "
                 f"max_timestamps={request.max_timestamps or 'all'} | "
+                f"dry_run={'yes' if request.dry_run else 'no'} | "
                 f"range_start={(request.start_at or (started_at - timedelta(days=request.days))).isoformat()} | "
                 f"range_end={(request.end_at or started_at).isoformat()}"
             ),
@@ -482,10 +610,11 @@ class HistoricalReplayRunner:
             operations_backend=self.usage_ledger.backend,
             operations_backend_detail=self.usage_ledger.backend_detail,
         )
-        try:
-            report.persisted_tick_run = self.usage_ledger.record_tick_run(report)
-        except Exception as exc:
-            report.persistence_error = f"{type(exc).__name__}: {exc}"
+        if not dry_run:
+            try:
+                report.persisted_tick_run = self.usage_ledger.record_tick_run(report)
+            except Exception as exc:
+                report.persistence_error = f"{type(exc).__name__}: {exc}"
 
         self.logger.profiling_summary(report)
         self.logger.api_usage_summary(report)
@@ -683,6 +812,24 @@ def _to_datetime(value: Any) -> datetime | None:
     return datetime.fromisoformat(str(value))
 
 
+def _to_float(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _safe_slug(value: str) -> str:
     return (
         value.strip()
@@ -690,3 +837,47 @@ def _safe_slug(value: str) -> str:
         .replace("/", "_")
         .replace(" ", "_")
     )
+
+
+def _replay_config_hash(request: HistoricalReplayRequest) -> str:
+    payload = {
+        "days": request.days,
+        "timeframe": request.timeframe,
+        "equity_symbols": list(request.equity_symbols),
+        "crypto_symbols": list(request.crypto_symbols),
+        "max_timestamps": request.max_timestamps,
+        "start_at": request.start_at.isoformat() if request.start_at else None,
+        "end_at": request.end_at.isoformat() if request.end_at else None,
+        "dry_run": request.dry_run,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _fitness_scope_registry_filters(config: RuntimeConfig) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    strategy_ids: list[str] = []
+    profile_ids: list[str] = []
+    for strategy in build_strategy_registry():
+        for profile in strategy.build_profiles(config):
+            strategy_ids.append(str(profile.strategy_id))
+            profile_ids.append(str(profile.profile_id))
+    return tuple(sorted(set(strategy_ids))), tuple(sorted(set(profile_ids)))
+
+
+def _strategy_replay_flags(config: RuntimeConfig) -> dict[str, dict[str, bool]]:
+    paper_execution_allowed = {
+        str(item).strip().lower()
+        for item in getattr(config, "paper_execution_allowed_strategies", ())
+        if str(item).strip()
+    }
+    flags: dict[str, dict[str, bool]] = {}
+    for strategy in build_strategy_registry():
+        for profile in strategy.build_profiles(config):
+            strategy_id = str(profile.strategy_id).strip()
+            if not strategy_id:
+                continue
+            flags[strategy_id] = {
+                "paper_execution_allowed": strategy_id.lower() in paper_execution_allowed,
+                "paper_research_allowed": bool(profile.parameters.get("paper_allowed")),
+                "research_only": bool(profile.parameters.get("research_only")),
+            }
+    return flags

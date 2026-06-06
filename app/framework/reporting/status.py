@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -79,7 +80,7 @@ class StatusReporter:
                 f"profit_capture={self.config.paper_execution_profit_capture_pct * 100:.2f}% | "
                 f"limit_buffer={self.config.paper_execution_limit_buffer_bps:.1f}bps | "
                 f"crypto_limit_buffer={self.config.paper_execution_crypto_limit_buffer_bps:.1f}bps | "
-                f"score_to_trade={self.config.paper_min_signal_score_to_trade:.1f}+ | "
+                "decision_policy=fitness_only | "
                 f"equity_no_overnight_carry={'on' if self.config.paper_execution_equity_no_weekend_carry_enabled else 'off'}"
                 f"/entry_cutoff={self.config.paper_execution_equity_friday_entry_cutoff_minutes_before_close}m"
                 f"/flatten={self.config.paper_execution_equity_friday_flatten_minutes_before_close}m | "
@@ -528,6 +529,1477 @@ class StatusReporter:
             ],
         }
 
+    def build_recent_trade_session_report(
+        self,
+        *,
+        broker_id: str = "alpaca_paper",
+        window_hours: int = 24,
+    ) -> dict[str, Any]:
+        """Return read-only execution diagnostics for the latest operator window.
+
+        This is an evidence surface only. It deliberately works from persisted
+        broker fills, keeps the query bounded, and does not feed risk, execution,
+        strategy selection, or slot policy.
+        """
+
+        bounded_hours = max(1, min(int(window_hours or 24), 168))
+        checked_at = datetime.now().astimezone()
+        window_start = checked_at - timedelta(hours=bounded_hours)
+        normalized_broker_id = str(broker_id or "alpaca_paper").strip().lower()
+
+        base_select = """
+            SELECT order_id, proposal_id, strategy_id, symbol, side, status,
+                   environment, mode, broker_id, execution_provider,
+                   COALESCE(submitted_at, captured_at) AS activity_at,
+                   submitted_at, captured_at,
+                   COALESCE(filled_qty, qty, 0) AS filled_qty,
+                   COALESCE(filled_avg_price, 0) AS filled_avg_price,
+                   COALESCE(filled_qty, qty, 0) * COALESCE(filled_avg_price, 0) AS notional_value
+            FROM paper_trade_orders
+            WHERE broker_id = ?
+              AND status = 'filled'
+              AND side IN ('buy', 'sell')
+              AND COALESCE(filled_qty, qty, 0) > 0
+              AND COALESCE(filled_avg_price, 0) > 0
+        """
+        window_query = (
+            base_select
+            + """
+              AND COALESCE(submitted_at, captured_at) >= ?
+              AND COALESCE(submitted_at, captured_at) <= ?
+            ORDER BY COALESCE(submitted_at, captured_at) DESC, order_id DESC
+            LIMIT 1000
+            """
+        )
+        fifo_query = (
+            "SELECT * FROM ("
+            + base_select
+            + """
+              AND COALESCE(submitted_at, captured_at) <= ?
+            ORDER BY COALESCE(submitted_at, captured_at) DESC, order_id DESC
+            LIMIT 5000
+            ) recent_fills
+            ORDER BY activity_at ASC, order_id ASC
+            """
+        )
+        try:
+            window_fills = self._query_rows(
+                query=window_query,
+                params=(normalized_broker_id, window_start, checked_at),
+            )
+            fifo_fills = self._query_rows(
+                query=fifo_query,
+                params=(normalized_broker_id, checked_at),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "broker_id": normalized_broker_id,
+                "window_hours": bounded_hours,
+                "reason": f"recent trade session unavailable: {exc}",
+            }
+
+        round_trips = self._match_fifo_round_trips(fifo_fills)
+        closed_in_window = [
+            row
+            for row in round_trips
+            if self._datetime_in_window(
+                row.get("exit_at"),
+                start=window_start,
+                end=checked_at,
+            )
+        ]
+        returns = [
+            value
+            for value in (self._to_float(row.get("return_pct")) for row in closed_in_window)
+            if value is not None
+        ]
+        wins = [value for value in returns if value > 0]
+        losses = [value for value in returns if value < 0]
+        flats = [value for value in returns if value == 0]
+        buy_fills = [
+            row for row in window_fills if str(row.get("side") or "").strip().lower() == "buy"
+        ]
+        sell_fills = [
+            row for row in window_fills if str(row.get("side") or "").strip().lower() == "sell"
+        ]
+        buy_notional = self._sum_float(row.get("notional_value") for row in buy_fills)
+        sell_notional = self._sum_float(row.get("notional_value") for row in sell_fills)
+        realized_pnl = self._sum_float(row.get("pnl_usd") for row in closed_in_window)
+        total_buy_value = self._sum_float(row.get("buy_value") for row in closed_in_window)
+        closed_trades = len(returns)
+        sell_to_buy_fill_ratio = (
+            round(len(sell_fills) / len(buy_fills), 6) if buy_fills else None
+        )
+        win_rate = round(len(wins) / closed_trades, 6) if closed_trades else 0.0
+        loss_rate = round(len(losses) / closed_trades, 6) if closed_trades else 0.0
+        flat_rate = round(len(flats) / closed_trades, 6) if closed_trades else 0.0
+        avg_return_pct = (
+            round(sum(returns) / closed_trades, 6) if closed_trades else 0.0
+        )
+
+        last_buy = self._latest_fill(buy_fills)
+        last_sell = self._latest_fill(sell_fills)
+        broker_account = self._recent_trade_broker_account(normalized_broker_id)
+        reconciliation = self._recent_trade_reconciliation(
+            broker_account=broker_account,
+            closed_realized_pnl=realized_pnl,
+        )
+        diagnostics = self._recent_trade_session_diagnostics(
+            buy_fills=buy_fills,
+            sell_fills=sell_fills,
+            closed_trades=closed_trades,
+            win_rate=win_rate,
+            loss_rate=loss_rate,
+            last_buy=last_buy,
+            last_sell=last_sell,
+            reconciliation=reconciliation,
+            checked_at=checked_at,
+            window_hours=bounded_hours,
+        )
+
+        return {
+            "ok": True,
+            "status": "ok",
+            "mode": "read_only_recent_broker_fills",
+            "broker_id": normalized_broker_id,
+            "match_method": "broker_order_fifo_by_symbol",
+            "checked_at": checked_at.isoformat(),
+            "window": {
+                "hours": bounded_hours,
+                "start_at": window_start.isoformat(),
+                "end_at": checked_at.isoformat(),
+                "label": f"Last {bounded_hours}h rolling execution window",
+                "timezone": checked_at.tzname(),
+            },
+            "fills": {
+                "sampled": len(window_fills),
+                "buy_count": len(buy_fills),
+                "sell_count": len(sell_fills),
+                "buy_notional_usd": round(buy_notional, 6),
+                "sell_notional_usd": round(sell_notional, 6),
+                "sell_to_buy_fill_ratio": sell_to_buy_fill_ratio,
+                "net_buy_fill_count": len(buy_fills) - len(sell_fills),
+                "net_buy_notional_usd": round(buy_notional - sell_notional, 6),
+                "last_buy": last_buy,
+                "last_sell": last_sell,
+            },
+            "closed_trades": {
+                "count": closed_trades,
+                "wins": len(wins),
+                "losses": len(losses),
+                "flats": len(flats),
+                "win_rate": win_rate,
+                "loss_rate": loss_rate,
+                "flat_rate": flat_rate,
+                "avg_return_pct": avg_return_pct,
+                "avg_win_pct": round(sum(wins) / len(wins), 6) if wins else 0.0,
+                "avg_loss_pct": round(abs(sum(losses) / len(losses)), 6) if losses else 0.0,
+                "realized_pnl_usd": round(realized_pnl, 6),
+                "total_buy_value_usd": round(total_buy_value, 6),
+            },
+            "broker_account": broker_account,
+            "reconciliation": reconciliation,
+            "diagnostics": diagnostics,
+            "by_symbol": self._recent_trade_groups(
+                window_fills=window_fills,
+                closed_trades=closed_in_window,
+                group_key="symbol",
+            ),
+            "by_strategy": self._recent_trade_groups(
+                window_fills=window_fills,
+                closed_trades=closed_in_window,
+                group_key="strategy_id",
+            ),
+            "recent_closed_trades": [
+                self._compact_round_trip(row) for row in closed_in_window[:50]
+            ],
+            "recent_fills": [self._compact_fill(row) for row in window_fills[:100]],
+            "scope_note": (
+                "Read-only Alpaca paper fill report over a bounded rolling window. "
+                "Closed trades are FIFO matched by symbol so sells can close buys "
+                "from before the window. Broker day change is account/equity-ledger "
+                "evidence and can differ from closed-trade realized P/L."
+            ),
+        }
+
+    def build_profit_lock_review_report(
+        self,
+        *,
+        broker_id: str = "alpaca_paper",
+        window_hours: int = 24,
+    ) -> dict[str, Any]:
+        """Review intraday peak giveback without changing trading behaviour.
+
+        The report intentionally stays read-only: it joins account snapshots and
+        persisted broker fills to explain where profit was available, where it
+        was given back, and which exit knobs deserve operator review.
+        """
+
+        bounded_hours = max(1, min(int(window_hours or 24), 168))
+        checked_at = datetime.now().astimezone()
+        window_start = checked_at - timedelta(hours=bounded_hours)
+        normalized_broker_id = str(broker_id or "alpaca_paper").strip().lower()
+
+        account_query = """
+            SELECT *
+            FROM (
+                SELECT broker_id, captured_at, account_status, currency,
+                       equity, last_equity, cash, buying_power, portfolio_value,
+                       position_market_value, open_position_unrealized_pl
+                FROM broker_account_snapshots
+                WHERE broker_id = ?
+                  AND captured_at >= ?
+                  AND captured_at <= ?
+                  AND equity IS NOT NULL
+                ORDER BY captured_at DESC
+                LIMIT 10000
+            ) recent_snapshots
+            ORDER BY captured_at ASC
+        """
+        fill_select = """
+            SELECT order_id, proposal_id, strategy_id, symbol, side, status,
+                   environment, mode, broker_id, execution_provider,
+                   COALESCE(submitted_at, captured_at) AS activity_at,
+                   submitted_at, captured_at,
+                   COALESCE(filled_qty, qty, 0) AS filled_qty,
+                   COALESCE(filled_avg_price, 0) AS filled_avg_price,
+                   COALESCE(filled_qty, qty, 0) * COALESCE(filled_avg_price, 0) AS notional_value
+            FROM paper_trade_orders
+            WHERE broker_id = ?
+              AND status = 'filled'
+              AND side IN ('buy', 'sell')
+              AND COALESCE(filled_qty, qty, 0) > 0
+              AND COALESCE(filled_avg_price, 0) > 0
+              AND COALESCE(submitted_at, captured_at) <= ?
+            ORDER BY COALESCE(submitted_at, captured_at) DESC, order_id DESC
+            LIMIT 5000
+        """
+        try:
+            account_rows = self._query_rows(
+                query=account_query,
+                params=(normalized_broker_id, window_start, checked_at),
+            )
+            fill_rows_desc = self._query_rows(
+                query=fill_select,
+                params=(normalized_broker_id, checked_at),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "broker_id": normalized_broker_id,
+                "window_hours": bounded_hours,
+                "reason": f"profit lock review unavailable: {exc}",
+            }
+
+        fill_rows = sorted(
+            fill_rows_desc,
+            key=lambda row: (
+                str(row.get("activity_at") or ""),
+                str(row.get("order_id") or ""),
+            ),
+        )
+        round_trips = self._match_fifo_round_trips(fill_rows)
+        account_curve = self._profit_lock_account_curve(account_rows)
+        peak = account_curve.get("peak") or {}
+        final = account_curve.get("final") or {}
+        peak_at = self._as_datetime(peak.get("captured_at"))
+
+        closed_in_window = [
+            row
+            for row in round_trips
+            if self._datetime_in_window(
+                row.get("exit_at"),
+                start=window_start,
+                end=checked_at,
+            )
+        ]
+        carryover_closes = [
+            row
+            for row in closed_in_window
+            if (self._as_datetime(row.get("entry_at")) or checked_at) < window_start
+        ]
+        same_window_closes = [
+            row for row in closed_in_window if row not in carryover_closes
+        ]
+        open_at_peak = (
+            self._profit_lock_open_at_peak(
+                round_trips=round_trips,
+                peak_at=peak_at,
+                window_start=window_start,
+            )
+            if peak_at is not None
+            else []
+        )
+        red_after_peak = [
+            row for row in open_at_peak if (self._to_float(row.get("pnl_usd")) or 0.0) < 0
+        ]
+        weak_after_peak = [
+            row
+            for row in open_at_peak
+            if -0.000001
+            <= (self._to_float(row.get("return_pct")) or 0.0)
+            < max(self.config.paper_execution_profit_capture_pct * 100.0, 0.0)
+        ]
+        closed_after_peak_pnl = self._sum_float(row.get("pnl_usd") for row in open_at_peak)
+        carryover_pnl = self._sum_float(row.get("pnl_usd") for row in carryover_closes)
+        same_window_pnl = self._sum_float(row.get("pnl_usd") for row in same_window_closes)
+        account_giveback = self._to_float(account_curve.get("giveback_usd")) or 0.0
+
+        return {
+            "ok": True,
+            "status": "ok",
+            "mode": "read_only_profit_lock_review",
+            "broker_id": normalized_broker_id,
+            "match_method": "broker_order_fifo_by_symbol",
+            "checked_at": checked_at.isoformat(),
+            "window": {
+                "hours": bounded_hours,
+                "start_at": window_start.isoformat(),
+                "end_at": checked_at.isoformat(),
+                "label": f"Last {bounded_hours}h rolling profit-lock review",
+                "timezone": checked_at.tzname(),
+            },
+            "config": {
+                "paper_profit_capture_pct": round(
+                    self.config.paper_execution_profit_capture_pct * 100.0,
+                    6,
+                ),
+                "paper_max_daily_drawdown_usd": self.config.paper_execution_max_daily_drawdown_usd,
+                "trailing_observer_enabled": self.config.trailing_drawdown_observer_enabled,
+                "trailing_observer_paper_giveback_usd": self.config.trailing_drawdown_observer_paper_giveback_usd,
+                "trailing_observer_paper_giveback_pct": round(
+                    self.config.trailing_drawdown_observer_paper_giveback_pct * 100.0,
+                    6,
+                ),
+            },
+            "account_curve": account_curve,
+            "counterfactuals": {
+                "profit_floor_locks": self._profit_floor_lock_counterfactuals(
+                    peak=peak,
+                    final=final,
+                    floors=(0.10, 0.25, 0.40, 0.60, 1.00, 2.00),
+                ),
+                "trailing_giveback_locks": self._trailing_giveback_counterfactuals(
+                    curve=account_curve.get("points", []),
+                    peak_at=peak_at,
+                    final=final,
+                    givebacks=(0.10, 0.20, 0.30, 0.50),
+                ),
+            },
+            "trade_review": {
+                "closed_in_window": self._profit_lock_trade_summary(closed_in_window),
+                "same_window_closes": self._profit_lock_trade_summary(same_window_closes),
+                "carryover_closes": self._profit_lock_trade_summary(carryover_closes),
+                "open_at_peak": {
+                    "count": len(open_at_peak),
+                    "realized_pnl_usd": round(closed_after_peak_pnl, 6),
+                    "red_after_peak_count": len(red_after_peak),
+                    "weak_or_flat_after_peak_count": len(weak_after_peak),
+                    "rows": open_at_peak[:80],
+                },
+                "carryover_rows": [
+                    self._profit_lock_trade_row(row, peak_at=peak_at, window_start=window_start)
+                    for row in carryover_closes[:40]
+                ],
+            },
+            "diagnostics": self._profit_lock_diagnostics(
+                peak=peak,
+                final=final,
+                account_giveback=account_giveback,
+                open_at_peak=open_at_peak,
+                red_after_peak=red_after_peak,
+                carryover_pnl=carryover_pnl,
+                same_window_pnl=same_window_pnl,
+            ),
+            "recommendations": self._profit_lock_recommendations(
+                account_giveback=account_giveback,
+                peak=peak,
+                final=final,
+                open_at_peak=open_at_peak,
+                red_after_peak=red_after_peak,
+                weak_after_peak=weak_after_peak,
+                carryover_pnl=carryover_pnl,
+            ),
+            "learning_advice": self._profit_lock_learning_advice(
+                account_giveback=account_giveback,
+                peak=peak,
+                final=final,
+                same_window_pnl=same_window_pnl,
+                carryover_pnl=carryover_pnl,
+                open_at_peak=open_at_peak,
+                red_after_peak=red_after_peak,
+                weak_after_peak=weak_after_peak,
+            ),
+            "tracking_plan": [
+                {
+                    "name": "account_high_water",
+                    "status": "tracked",
+                    "detail": "Broker account snapshots identify peak day P/L and final giveback.",
+                },
+                {
+                    "name": "open_at_peak_trades",
+                    "status": "tracked",
+                    "detail": "FIFO round trips identify trades open at the account high-water timestamp.",
+                },
+                {
+                    "name": "carryover_closes",
+                    "status": "tracked",
+                    "detail": "Trades with entries before the review window are separated from same-window entries.",
+                },
+                {
+                    "name": "per_position_unrealized_at_peak",
+                    "status": "partial",
+                    "detail": "Current storage does not persist per-position mark-to-market at every account snapshot, so exact per-trade peak giveback is not yet fully attributable.",
+                },
+            ],
+            "scope_note": (
+                "Read-only profit-lock review. Counterfactual locks are advisory "
+                "and do not change paper/live execution, risk, slots, notional, "
+                "broker routing, or .env settings."
+            ),
+        }
+
+    def _recent_trade_broker_account(self, broker_id: str) -> dict[str, Any]:
+        rows = [
+            row
+            for row in self.usage_ledger.list_recent_broker_account_snapshots(limit=100)
+            if str(row.get("broker_id", "")).strip().lower() == broker_id
+        ]
+        if not rows:
+            return {
+                "broker_id": broker_id,
+                "has_snapshot": False,
+                "status": "no_snapshot",
+                "note": "No recent broker account snapshot is available.",
+            }
+        row = rows[0]
+        equity = self._to_float(row.get("equity"))
+        last_equity = self._to_float(row.get("last_equity"))
+        day_change = (
+            round(equity - last_equity, 6)
+            if equity is not None and last_equity is not None
+            else None
+        )
+        day_change_pct = (
+            round((day_change / last_equity) * 100.0, 6)
+            if day_change is not None and last_equity
+            else None
+        )
+        return {
+            "broker_id": broker_id,
+            "has_snapshot": True,
+            "status": str(row.get("account_status", "unknown") or "unknown"),
+            "captured_at": self._fmt_optional_dt(row.get("captured_at")),
+            "currency": str(row.get("currency", "USD") or "USD").upper(),
+            "equity": equity,
+            "cash": self._to_float(row.get("cash")),
+            "buying_power": self._to_float(row.get("buying_power")),
+            "portfolio_value": self._to_float(row.get("portfolio_value")),
+            "last_equity": last_equity,
+            "day_change": day_change,
+            "day_change_pct": day_change_pct,
+            "position_market_value": self._to_float(row.get("position_market_value")),
+            "open_position_unrealized_pl": self._to_float(
+                row.get("open_position_unrealized_pl")
+            ),
+        }
+
+    def _profit_lock_account_curve(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        points = []
+        for row in rows:
+            equity = self._to_float(row.get("equity"))
+            last_equity = self._to_float(row.get("last_equity"))
+            day_change = (
+                round(equity - last_equity, 6)
+                if equity is not None and last_equity is not None
+                else None
+            )
+            day_change_pct = (
+                round((day_change / last_equity) * 100.0, 6)
+                if day_change is not None and last_equity
+                else None
+            )
+            points.append(
+                {
+                    "captured_at": self._fmt_optional_dt(row.get("captured_at")),
+                    "equity": equity,
+                    "last_equity": last_equity,
+                    "day_change": day_change,
+                    "day_change_pct": day_change_pct,
+                    "portfolio_value": self._to_float(row.get("portfolio_value")),
+                    "position_market_value": self._to_float(row.get("position_market_value")),
+                    "open_position_unrealized_pl": self._to_float(
+                        row.get("open_position_unrealized_pl")
+                    ),
+                }
+            )
+        raw_sampled = len(rows)
+        final_baseline = self._to_float(points[-1].get("last_equity")) if points else None
+        if final_baseline is not None:
+            points = [
+                point
+                for point in points
+                if (
+                    self._to_float(point.get("last_equity")) is not None
+                    and abs((self._to_float(point.get("last_equity")) or 0.0) - final_baseline)
+                    < 0.01
+                )
+            ]
+        valid_points = [
+            point for point in points if self._to_float(point.get("day_change")) is not None
+        ]
+        if not valid_points:
+            return {
+                "status": "no_account_curve",
+                "sampled": raw_sampled,
+                "displayed_points": 0,
+                "points": [],
+                "peak": None,
+                "final": None,
+                "giveback_usd": None,
+                "giveback_pct_of_peak": None,
+            }
+        peak = max(
+            valid_points,
+            key=lambda point: (
+                self._to_float(point.get("day_change")) or 0.0,
+                str(point.get("captured_at") or ""),
+            ),
+        )
+        final = valid_points[-1]
+        peak_change = self._to_float(peak.get("day_change")) or 0.0
+        final_change = self._to_float(final.get("day_change")) or 0.0
+        giveback = max(0.0, peak_change - final_change)
+        return {
+            "status": "ok",
+            "sampled": raw_sampled,
+            "displayed_points": len(points),
+            "baseline_last_equity": final_baseline,
+            "peak": peak,
+            "final": final,
+            "giveback_usd": round(giveback, 6),
+            "giveback_pct_of_peak": (
+                round((giveback / peak_change) * 100.0, 6)
+                if peak_change > 0
+                else None
+            ),
+            "points": points,
+        }
+
+    def _profit_lock_open_at_peak(
+        self,
+        *,
+        round_trips: list[dict[str, Any]],
+        peak_at: datetime,
+        window_start: datetime,
+    ) -> list[dict[str, Any]]:
+        rows = []
+        for row in round_trips:
+            entry_at = self._as_datetime(row.get("entry_at"))
+            exit_at = self._as_datetime(row.get("exit_at"))
+            if entry_at is None or exit_at is None:
+                continue
+            if entry_at <= peak_at <= exit_at:
+                rows.append(
+                    self._profit_lock_trade_row(
+                        row,
+                        peak_at=peak_at,
+                        window_start=window_start,
+                    )
+                )
+        return sorted(
+            rows,
+            key=lambda row: (
+                self._to_float(row.get("pnl_usd")) or 0.0,
+                str(row.get("exit_at") or ""),
+            ),
+        )
+
+    def _profit_lock_trade_row(
+        self,
+        row: dict[str, Any],
+        *,
+        peak_at: datetime | None,
+        window_start: datetime,
+    ) -> dict[str, Any]:
+        entry_at = self._as_datetime(row.get("entry_at"))
+        exit_at = self._as_datetime(row.get("exit_at"))
+        pnl = self._to_float(row.get("pnl_usd")) or 0.0
+        return_pct = self._to_float(row.get("return_pct")) or 0.0
+        hold_minutes = None
+        minutes_after_peak = None
+        if entry_at is not None and exit_at is not None:
+            hold_minutes = round((exit_at - entry_at).total_seconds() / 60.0, 2)
+        if peak_at is not None and exit_at is not None:
+            minutes_after_peak = round((exit_at - peak_at).total_seconds() / 60.0, 2)
+        profit_capture_pct = self.config.paper_execution_profit_capture_pct * 100.0
+        if pnl < 0:
+            outcome = "closed_red"
+        elif return_pct < profit_capture_pct:
+            outcome = "closed_green_below_profit_capture"
+        else:
+            outcome = "closed_green"
+        return {
+            "proposal_id": str(row.get("proposal_id") or ""),
+            "strategy_id": str(row.get("strategy_id") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "entry_at": self._fmt_optional_dt(row.get("entry_at")),
+            "exit_at": self._fmt_optional_dt(row.get("exit_at")),
+            "buy_value_usd": self._to_float(row.get("buy_value")),
+            "sell_value_usd": self._to_float(row.get("sell_value")),
+            "pnl_usd": round(pnl, 6),
+            "return_pct": round(return_pct, 6),
+            "hold_minutes": hold_minutes,
+            "minutes_after_peak": minutes_after_peak,
+            "carryover": bool(entry_at is not None and entry_at < window_start),
+            "outcome": outcome,
+            "profit_capture_pct": round(profit_capture_pct, 6),
+            "max_hold_review": bool(hold_minutes is not None and hold_minutes >= 60.0 and pnl < 0),
+        }
+
+    def _profit_lock_trade_summary(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        returns = [
+            value
+            for value in (self._to_float(row.get("return_pct")) for row in rows)
+            if value is not None
+        ]
+        wins = [value for value in returns if value > 0]
+        losses = [value for value in returns if value < 0]
+        return {
+            "count": len(rows),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(len(wins) / len(rows), 6) if rows else 0.0,
+            "realized_pnl_usd": round(
+                self._sum_float(row.get("pnl_usd") for row in rows),
+                6,
+            ),
+            "avg_return_pct": round(sum(returns) / len(returns), 6) if returns else 0.0,
+            "avg_win_pct": round(sum(wins) / len(wins), 6) if wins else 0.0,
+            "avg_loss_pct": round(abs(sum(losses) / len(losses)), 6) if losses else 0.0,
+        }
+
+    def _profit_floor_lock_counterfactuals(
+        self,
+        *,
+        peak: dict[str, Any],
+        final: dict[str, Any],
+        floors: tuple[float, ...],
+    ) -> list[dict[str, Any]]:
+        peak_change = self._to_float(peak.get("day_change")) or 0.0
+        final_change = self._to_float(final.get("day_change")) or 0.0
+        rows = []
+        for floor in floors:
+            would_trigger = peak_change >= floor
+            locked_change = floor if would_trigger else None
+            rows.append(
+                {
+                    "floor_usd": floor,
+                    "would_trigger": would_trigger,
+                    "locked_day_change_usd": locked_change,
+                    "saved_vs_final_usd": (
+                        round(max(0.0, floor - final_change), 6)
+                        if would_trigger
+                        else 0.0
+                    ),
+                    "note": "Advisory account-level floor, not an execution instruction.",
+                }
+            )
+        return rows
+
+    def _trailing_giveback_counterfactuals(
+        self,
+        *,
+        curve: list[dict[str, Any]],
+        peak_at: datetime | None,
+        final: dict[str, Any],
+        givebacks: tuple[float, ...],
+    ) -> list[dict[str, Any]]:
+        if peak_at is None:
+            return []
+        final_change = self._to_float(final.get("day_change")) or 0.0
+        peak_change = None
+        rows_after_peak = []
+        for point in curve:
+            point_at = self._as_datetime(point.get("captured_at"))
+            day_change = self._to_float(point.get("day_change"))
+            if point_at is None or day_change is None:
+                continue
+            if point_at == peak_at:
+                peak_change = day_change
+            if point_at >= peak_at:
+                rows_after_peak.append(point)
+        if peak_change is None:
+            peak_change = max(
+                (self._to_float(point.get("day_change")) or 0.0 for point in rows_after_peak),
+                default=0.0,
+            )
+        results = []
+        for giveback in givebacks:
+            trigger = None
+            for point in rows_after_peak:
+                day_change = self._to_float(point.get("day_change"))
+                if day_change is None:
+                    continue
+                if peak_change - day_change >= giveback:
+                    trigger = point
+                    break
+            trigger_change = self._to_float(trigger.get("day_change")) if trigger else None
+            results.append(
+                {
+                    "giveback_usd": giveback,
+                    "would_trigger": trigger is not None,
+                    "trigger_at": trigger.get("captured_at") if trigger else "",
+                    "trigger_day_change_usd": trigger_change,
+                    "saved_vs_final_usd": (
+                        round(max(0.0, (trigger_change or 0.0) - final_change), 6)
+                        if trigger is not None
+                        else 0.0
+                    ),
+                    "note": "Advisory account-level trailing giveback test.",
+                }
+            )
+        return results
+
+    def _profit_lock_diagnostics(
+        self,
+        *,
+        peak: dict[str, Any],
+        final: dict[str, Any],
+        account_giveback: float,
+        open_at_peak: list[dict[str, Any]],
+        red_after_peak: list[dict[str, Any]],
+        carryover_pnl: float,
+        same_window_pnl: float,
+    ) -> list[dict[str, Any]]:
+        diagnostics = []
+        peak_change = self._to_float(peak.get("day_change")) or 0.0
+        final_change = self._to_float(final.get("day_change")) or 0.0
+        if peak_change > 0 and account_giveback > 0:
+            diagnostics.append(
+                {
+                    "level": "review",
+                    "title": "Intraday profit was available",
+                    "detail": (
+                        f"Broker day P/L peaked near ${peak_change:.2f} and "
+                        f"finished near ${final_change:.2f}, giving back about "
+                        f"${account_giveback:.2f}."
+                    ),
+                }
+            )
+        if red_after_peak:
+            diagnostics.append(
+                {
+                    "level": "warning",
+                    "title": "Trades open at peak later closed red",
+                    "detail": (
+                        f"{len(red_after_peak)} peak-open trade(s) closed below "
+                        "their FIFO entry value."
+                    ),
+                }
+            )
+        if carryover_pnl < 0:
+            diagnostics.append(
+                {
+                    "level": "info",
+                    "title": "Carryover closes hurt the day",
+                    "detail": (
+                        f"Trades entered before the review window closed for "
+                        f"about ${carryover_pnl:.2f}."
+                    ),
+                }
+            )
+        if same_window_pnl > 0 and carryover_pnl < 0:
+            diagnostics.append(
+                {
+                    "level": "info",
+                    "title": "Fresh trades and carryovers disagree",
+                    "detail": (
+                        f"Same-window closes were about ${same_window_pnl:.2f}, "
+                        f"while carryover closes were about ${carryover_pnl:.2f}."
+                    ),
+                }
+            )
+        if not diagnostics:
+            diagnostics.append(
+                {
+                    "level": "ok",
+                    "title": "No obvious profit-lock issue",
+                    "detail": "The sampled account curve did not show a material positive peak giveback.",
+                }
+            )
+        return diagnostics
+
+    def _profit_lock_recommendations(
+        self,
+        *,
+        account_giveback: float,
+        peak: dict[str, Any],
+        final: dict[str, Any],
+        open_at_peak: list[dict[str, Any]],
+        red_after_peak: list[dict[str, Any]],
+        weak_after_peak: list[dict[str, Any]],
+        carryover_pnl: float,
+    ) -> list[dict[str, Any]]:
+        recommendations = []
+        peak_change = self._to_float(peak.get("day_change")) or 0.0
+        final_change = self._to_float(final.get("day_change")) or 0.0
+        if peak_change >= 0.40 and account_giveback >= 0.25:
+            recommendations.append(
+                {
+                    "action": "test_account_profit_lock",
+                    "status": "observe_only",
+                    "detail": (
+                        "Backtest an account-level paper lock that preserves "
+                        "$0.25-$0.40 once the day is materially green."
+                    ),
+                }
+            )
+        if red_after_peak:
+            recommendations.append(
+                {
+                    "action": "review_profit_capture_timing",
+                    "status": "operator_review",
+                    "detail": (
+                        "Inspect whether peak-open trades should lock sooner "
+                        "after the configured profit window instead of waiting "
+                        "for max hold or later exits."
+                    ),
+                }
+            )
+        if weak_after_peak:
+            recommendations.append(
+                {
+                    "action": "review_small_green_exits",
+                    "status": "operator_review",
+                    "detail": (
+                        f"{len(weak_after_peak)} peak-open trade(s) closed green "
+                        "but below the configured profit capture percentage."
+                    ),
+                }
+            )
+        if carryover_pnl < 0:
+            recommendations.append(
+                {
+                    "action": "separate_carryover_policy",
+                    "status": "operator_review",
+                    "detail": (
+                        "Keep carryover closes separate from fresh-entry scoring "
+                        "and review whether queued market-open exits need their "
+                        "own report threshold."
+                    ),
+                }
+            )
+        if final_change < peak_change and open_at_peak:
+            recommendations.append(
+                {
+                    "action": "persist_position_marks",
+                    "status": "evidence_gap",
+                    "detail": (
+                        "Add per-position mark-to-market snapshots at account "
+                        "high water so future reports can attribute exact trade "
+                        "giveback instead of only final FIFO outcome."
+                    ),
+                }
+            )
+        if not recommendations:
+            recommendations.append(
+                {
+                    "action": "hold_settings",
+                    "status": "observe_only",
+                    "detail": "No report-only evidence justifies changing exit settings yet.",
+                }
+            )
+        return recommendations
+
+    def _profit_lock_learning_advice(
+        self,
+        *,
+        account_giveback: float,
+        peak: dict[str, Any],
+        final: dict[str, Any],
+        same_window_pnl: float,
+        carryover_pnl: float,
+        open_at_peak: list[dict[str, Any]],
+        red_after_peak: list[dict[str, Any]],
+        weak_after_peak: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        peak_change = self._to_float(peak.get("day_change")) or 0.0
+        final_change = self._to_float(final.get("day_change")) or 0.0
+        current_profit_capture_pct = self.config.paper_execution_profit_capture_pct * 100.0
+        material_peak = peak_change >= 0.40
+        material_giveback = account_giveback >= 0.25
+        fresh_edge_positive = same_window_pnl > 0
+        peak_trades_deteriorated = bool(red_after_peak or weak_after_peak)
+        if material_peak and material_giveback and fresh_edge_positive:
+            action = "test_profit_lock"
+            confidence = "medium" if peak_trades_deteriorated else "low"
+            reason = (
+                "Fresh same-window trades were positive, but account high-water "
+                "profit was mostly given back before the final snapshot."
+            )
+        elif material_giveback:
+            action = "collect_more_exit_evidence"
+            confidence = "low"
+            reason = (
+                "Account giveback was material, but the fresh-trade edge was not "
+                "strong enough to advise a settings candidate yet."
+            )
+        else:
+            action = "hold"
+            confidence = "low"
+            reason = "No material profit-lock giveback signal in this review window."
+
+        candidate_profit_capture = current_profit_capture_pct
+        if weak_after_peak and current_profit_capture_pct > 1.25:
+            candidate_profit_capture = max(1.25, current_profit_capture_pct - 0.25)
+        return {
+            "status": "ok",
+            "mode": "recommendation_only_exit_learning",
+            "trade_authority": "none",
+            "execution_authority": "none",
+            "requires_human_approval": True,
+            "action": action,
+            "confidence": confidence,
+            "reason": reason,
+            "evidence": {
+                "peak_day_change_usd": round(peak_change, 6),
+                "final_day_change_usd": round(final_change, 6),
+                "account_giveback_usd": round(account_giveback, 6),
+                "same_window_pnl_usd": round(same_window_pnl, 6),
+                "carryover_pnl_usd": round(carryover_pnl, 6),
+                "open_at_peak_count": len(open_at_peak),
+                "red_after_peak_count": len(red_after_peak),
+                "weak_after_peak_count": len(weak_after_peak),
+            },
+            "current_settings": {
+                "paper_profit_capture_pct": round(current_profit_capture_pct, 6),
+                "paper_trailing_observer_giveback_usd": self.config.trailing_drawdown_observer_paper_giveback_usd,
+                "paper_daily_loss_guard_usd": self.config.paper_execution_max_daily_drawdown_usd,
+            },
+            "candidate_settings": {
+                "account_profit_floor_usd": 0.25 if peak_change < 0.60 else 0.40,
+                "account_trailing_giveback_usd": 0.20,
+                "paper_profit_capture_pct": round(candidate_profit_capture, 6),
+                "scope": "paper_observe_only_backtest_first",
+            },
+            "promotion_gates": [
+                "Observe at least 3 separate trading sessions with the same giveback pattern.",
+                "Require same-window closed P/L to be positive before blaming exits.",
+                "Keep carryover closes separated from fresh-entry scoring.",
+                "Do not widen notional, slots, broker scope, live gates, or daily loss guard.",
+                "Promote only after an operator explicitly approves the candidate settings.",
+            ],
+            "next_system_steps": [
+                "Persist per-position mark-to-market snapshots at account high water.",
+                "Backtest account-profit floors and trailing giveback thresholds across recent sessions.",
+                "Rank exits by avoidable giveback before changing any runtime knob.",
+            ],
+        }
+
+    def build_slot_dial_reality_report(
+        self,
+        *,
+        broker_id: str = "alpaca_paper",
+        window_hours: int = 168,
+        target_win_pct: float = 1.6,
+        loss_cap_pct: float = 0.8,
+        slot_size_usd: float = 10.0,
+        estimated_trades_per_day: float = 100.0,
+        estimated_losses_per_day: float = 50.0,
+    ) -> dict[str, Any]:
+        """Compare slot dials with stored exit-quality evidence only.
+
+        This answers the operator's "might these dial values have come true?"
+        question from persisted audit data. It deliberately has no authority to
+        change .env, risk gates, execution, live scope, slots, or notional.
+        """
+
+        checked_at = datetime.now().astimezone()
+        bounded_hours = max(1, min(int(window_hours or 168), 720))
+        window_start = checked_at - timedelta(hours=bounded_hours)
+        normalized_broker_id = str(broker_id or "alpaca_paper").strip().lower()
+        target_win_pct = max(0.01, min(float(target_win_pct or 0.0), 20.0))
+        loss_cap_pct = max(0.0, min(float(loss_cap_pct or 0.0), 20.0))
+        slot_size_usd = max(0.01, min(float(slot_size_usd or 0.0), 10_000.0))
+        estimated_trades_per_day = max(
+            0.1,
+            min(float(estimated_trades_per_day or 0.0), 1_000.0),
+        )
+        estimated_losses_per_day = max(
+            0.0,
+            min(float(estimated_losses_per_day or 0.0), estimated_trades_per_day),
+        )
+        estimated_wins_per_day = estimated_trades_per_day - estimated_losses_per_day
+
+        query = """
+            SELECT order_id, proposal_id, strategy_id, symbol, status,
+                   broker_id, COALESCE(submitted_at, captured_at) AS activity_at,
+                   raw_json
+            FROM paper_trade_orders
+            WHERE broker_id = ?
+              AND side = 'sell'
+              AND status = 'filled'
+              AND COALESCE(submitted_at, captured_at) >= ?
+              AND COALESCE(submitted_at, captured_at) <= ?
+            ORDER BY COALESCE(submitted_at, captured_at) DESC, order_id DESC
+            LIMIT 1000
+        """
+        try:
+            rows = self._query_rows(
+                query=query,
+                params=(normalized_broker_id, window_start, checked_at),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "mode": "audit_only_slot_dial_reality_check",
+                "broker_id": normalized_broker_id,
+                "reason": f"slot dial reality check unavailable: {exc}",
+            }
+
+        evidence_rows = []
+        missing_audit = 0
+        for row in rows:
+            raw = self._coerce_mapping(row.get("raw_json"))
+            audit = self._coerce_mapping(raw.get("exit_quality_audit"))
+            if not audit:
+                missing_audit += 1
+                continue
+            if str(audit.get("availability") or "") != "observed":
+                missing_audit += 1
+                continue
+            max_favorable = self._to_float(audit.get("max_favorable_return_pct"))
+            exit_return = self._to_float(audit.get("estimated_exit_return_pct"))
+            if max_favorable is None or exit_return is None:
+                missing_audit += 1
+                continue
+            touched_target = max_favorable >= target_win_pct
+            exited_at_target = exit_return >= target_win_pct
+            breached_loss_cap = exit_return <= -loss_cap_pct if loss_cap_pct > 0 else exit_return < 0
+            faded_after_touch = touched_target and not exited_at_target
+            evidence_rows.append(
+                {
+                    "order_id": str(row.get("order_id") or ""),
+                    "proposal_id": str(row.get("proposal_id") or ""),
+                    "strategy_id": str(row.get("strategy_id") or ""),
+                    "symbol": str(row.get("symbol") or ""),
+                    "activity_at": self._fmt_dt(self._as_datetime(row.get("activity_at"))),
+                    "max_favorable_return_pct": round(max_favorable, 4),
+                    "estimated_exit_return_pct": round(exit_return, 4),
+                    "faded_from_high_pct": self._to_float(audit.get("faded_from_high_pct")),
+                    "touched_target": touched_target,
+                    "exited_at_target": exited_at_target,
+                    "faded_after_touch": faded_after_touch,
+                    "breached_loss_cap": breached_loss_cap,
+                }
+            )
+
+        evidence_count = len(evidence_rows)
+        touched_count = sum(1 for row in evidence_rows if row["touched_target"])
+        exited_at_target_count = sum(1 for row in evidence_rows if row["exited_at_target"])
+        faded_after_touch_count = sum(1 for row in evidence_rows if row["faded_after_touch"])
+        loss_breach_count = sum(1 for row in evidence_rows if row["breached_loss_cap"])
+        target_touch_rate = touched_count / evidence_count if evidence_count else 0.0
+        exited_at_target_rate = exited_at_target_count / evidence_count if evidence_count else 0.0
+        loss_breach_rate = loss_breach_count / evidence_count if evidence_count else 0.0
+        desired_win_rate = (
+            estimated_wins_per_day / estimated_trades_per_day
+            if estimated_trades_per_day > 0
+            else 0.0
+        )
+        desired_loss_rate = (
+            estimated_losses_per_day / estimated_trades_per_day
+            if estimated_trades_per_day > 0
+            else 0.0
+        )
+
+        projected_target_touches = estimated_trades_per_day * target_touch_rate
+        projected_exit_wins = estimated_trades_per_day * exited_at_target_rate
+        projected_loss_breaches = estimated_trades_per_day * loss_breach_rate
+        rough_cost_usd = 0.03 + (slot_size_usd * 0.0008)
+        net_win_usd = (slot_size_usd * target_win_pct / 100.0) - rough_cost_usd
+        loss_with_cost_usd = (slot_size_usd * loss_cap_pct / 100.0) + rough_cost_usd
+        projected_pnl_usd = (
+            (projected_target_touches * net_win_usd)
+            - (projected_loss_breaches * loss_with_cost_usd)
+        )
+
+        if evidence_count < 10:
+            verdict = "not_enough_tracked_exits"
+            confidence = "low"
+            summary = "Not enough exit-quality audits are stored yet for this dial check."
+        elif target_touch_rate + 0.000001 < desired_win_rate:
+            verdict = "target_probably_too_high"
+            confidence = "medium"
+            summary = "The stored exits did not touch the target often enough for the requested win count."
+        elif loss_breach_rate > desired_loss_rate + 0.000001:
+            verdict = "loss_cap_or_exit_speed_needs_review"
+            confidence = "medium"
+            summary = "The stored exits breached the proposed loss cap more often than the dial assumes."
+        elif faded_after_touch_count > max(3, touched_count * 0.35):
+            verdict = "profit_capture_may_be_too_slow"
+            confidence = "medium"
+            summary = "Many trades touched the target but later exited below it."
+        else:
+            verdict = "plausible_on_tracked_evidence"
+            confidence = "medium"
+            summary = "The tracked exits are broadly compatible with the current dial values."
+
+        return {
+            "ok": True,
+            "status": "ok",
+            "mode": "audit_only_slot_dial_reality_check",
+            "broker_id": normalized_broker_id,
+            "checked_at": checked_at.isoformat(),
+            "window": {
+                "hours": bounded_hours,
+                "start_at": window_start.isoformat(),
+                "end_at": checked_at.isoformat(),
+            },
+            "inputs": {
+                "target_win_pct": round(target_win_pct, 4),
+                "loss_cap_pct": round(loss_cap_pct, 4),
+                "slot_size_usd": round(slot_size_usd, 4),
+                "estimated_trades_per_day": round(estimated_trades_per_day, 4),
+                "estimated_wins_per_day": round(estimated_wins_per_day, 4),
+                "estimated_losses_per_day": round(estimated_losses_per_day, 4),
+            },
+            "sample": {
+                "sell_orders_sampled": len(rows),
+                "tracked_exit_quality_count": evidence_count,
+                "missing_or_unobserved_audit_count": missing_audit,
+                "minimum_for_medium_confidence": 10,
+            },
+            "results": {
+                "target_touch_count": touched_count,
+                "target_touch_rate": round(target_touch_rate, 6),
+                "exited_at_or_above_target_count": exited_at_target_count,
+                "exited_at_or_above_target_rate": round(exited_at_target_rate, 6),
+                "faded_after_touch_count": faded_after_touch_count,
+                "loss_cap_breach_count": loss_breach_count,
+                "loss_cap_breach_rate": round(loss_breach_rate, 6),
+                "desired_win_rate": round(desired_win_rate, 6),
+                "desired_loss_rate": round(desired_loss_rate, 6),
+                "projected_target_touches_per_day": round(projected_target_touches, 4),
+                "projected_exit_wins_per_day": round(projected_exit_wins, 4),
+                "projected_loss_breaches_per_day": round(projected_loss_breaches, 4),
+                "rough_projected_pnl_usd": round(projected_pnl_usd, 6),
+            },
+            "verdict": {
+                "action": verdict,
+                "confidence": confidence,
+                "summary": summary,
+                "authority": "none",
+                "affects_execution": False,
+            },
+            "recent_examples": evidence_rows[:20],
+            "scope_note": (
+                "Audit-only comparison from persisted exit_quality_audit payloads. "
+                "It cannot prove intrabar fills, and it does not change .env, "
+                "risk, execution, slots, notional, broker scope, or live behaviour."
+            ),
+        }
+
+    def _recent_trade_reconciliation(
+        self,
+        *,
+        broker_account: dict[str, Any],
+        closed_realized_pnl: float,
+    ) -> dict[str, Any]:
+        broker_day_change = self._to_float(broker_account.get("day_change"))
+        unrealized_pl = self._to_float(broker_account.get("open_position_unrealized_pl"))
+        unexplained = None
+        if broker_day_change is not None:
+            unexplained = broker_day_change - closed_realized_pnl
+            if unrealized_pl is not None:
+                unexplained -= unrealized_pl
+        return {
+            "mode": "read_only_broker_vs_closed_trade_reconciliation",
+            "broker_day_change": broker_day_change,
+            "closed_trade_realized_pnl": round(closed_realized_pnl, 6),
+            "open_position_unrealized_pl": unrealized_pl,
+            "difference_after_open_unrealized": (
+                round(unexplained, 6) if unexplained is not None else None
+            ),
+            "note": (
+                "Broker day change is account/equity-ledger evidence. Closed-trade "
+                "P/L is FIFO sell-minus-buy evidence for completed round trips only."
+            ),
+        }
+
+    def _datetime_in_window(
+        self,
+        value: Any,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> bool:
+        parsed = self._as_datetime(value)
+        if parsed is None:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return start <= parsed <= end
+
+    def _sum_float(self, values: Any) -> float:
+        total = 0.0
+        for value in values:
+            numeric = self._to_float(value)
+            if numeric is not None:
+                total += numeric
+        return total
+
+    def _latest_fill(self, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not rows:
+            return None
+        return self._compact_fill(
+            max(rows, key=lambda row: str(row.get("activity_at") or ""))
+        )
+
+    def _compact_fill(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "order_id": str(row.get("order_id") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "side": str(row.get("side") or ""),
+            "strategy_id": str(row.get("strategy_id") or ""),
+            "activity_at": self._fmt_optional_dt(row.get("activity_at")),
+            "filled_qty": self._to_float(row.get("filled_qty")),
+            "filled_avg_price": self._to_float(row.get("filled_avg_price")),
+            "notional_usd": self._to_float(row.get("notional_value")),
+        }
+
+    def _compact_round_trip(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "proposal_id": str(row.get("proposal_id") or ""),
+            "strategy_id": str(row.get("strategy_id") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "entry_at": self._fmt_optional_dt(row.get("entry_at")),
+            "exit_at": self._fmt_optional_dt(row.get("exit_at")),
+            "buy_value_usd": self._to_float(row.get("buy_value")),
+            "sell_value_usd": self._to_float(row.get("sell_value")),
+            "pnl_usd": self._to_float(row.get("pnl_usd")),
+            "return_pct": self._to_float(row.get("return_pct")),
+        }
+
+    def _fmt_optional_dt(self, value: Any) -> str:
+        parsed = self._as_datetime(value)
+        if parsed is None:
+            return ""
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.isoformat()
+
+    def _recent_trade_session_diagnostics(
+        self,
+        *,
+        buy_fills: list[dict[str, Any]],
+        sell_fills: list[dict[str, Any]],
+        closed_trades: int,
+        win_rate: float,
+        loss_rate: float,
+        last_buy: dict[str, Any] | None,
+        last_sell: dict[str, Any] | None,
+        reconciliation: dict[str, Any],
+        checked_at: datetime,
+        window_hours: int,
+    ) -> list[dict[str, Any]]:
+        diagnostics: list[dict[str, Any]] = []
+        buy_count = len(buy_fills)
+        sell_count = len(sell_fills)
+        if buy_count > 0 and sell_count == 0:
+            diagnostics.append(
+                {
+                    "level": "warning",
+                    "title": "No sells in window",
+                    "detail": "There are filled buys but no filled sells in the latest window.",
+                }
+            )
+        elif buy_count >= 3 and sell_count / max(buy_count, 1) < 0.35:
+            diagnostics.append(
+                {
+                    "level": "warning",
+                    "title": "Sell count looks low",
+                    "detail": (
+                        f"Filled sells are {sell_count} versus {buy_count} buys "
+                        "in this window."
+                    ),
+                }
+            )
+
+        if closed_trades >= 5 and win_rate >= 0.85:
+            diagnostics.append(
+                {
+                    "level": "review",
+                    "title": "Win rate is unusually high",
+                    "detail": (
+                        f"Closed-trade win rate is {win_rate * 100:.1f}% from "
+                        f"{closed_trades} closed trades. Check that exits and "
+                        "losses are being captured."
+                    ),
+                }
+            )
+        elif 0 < closed_trades < 5 and win_rate >= 0.85:
+            diagnostics.append(
+                {
+                    "level": "info",
+                    "title": "High win rate, tiny sample",
+                    "detail": (
+                        f"Win rate is {win_rate * 100:.1f}%, but only "
+                        f"{closed_trades} trade(s) closed in the window."
+                    ),
+                }
+            )
+
+        if closed_trades >= 5 and loss_rate == 0:
+            diagnostics.append(
+                {
+                    "level": "review",
+                    "title": "No losses recorded",
+                    "detail": "Closed trades include no losses; verify sell-side matching and stop exits.",
+                }
+            )
+
+        broker_day_change = self._to_float(reconciliation.get("broker_day_change"))
+        closed_realized = self._to_float(
+            reconciliation.get("closed_trade_realized_pnl")
+        )
+        if broker_day_change is not None and closed_realized is not None:
+            if broker_day_change > 0 and closed_realized < 0:
+                diagnostics.append(
+                    {
+                        "level": "info",
+                        "title": "Broker is green while closed trades are red",
+                        "detail": (
+                            f"Broker day change is {broker_day_change:+.2f}, but "
+                            f"closed FIFO P/L is {closed_realized:+.2f}. This can "
+                            "happen when open/unrealized P/L or account-ledger timing "
+                            "offsets completed trade exits."
+                        ),
+                    }
+                )
+            elif broker_day_change < 0 and closed_realized > 0:
+                diagnostics.append(
+                    {
+                        "level": "review",
+                        "title": "Closed trades are green while broker day is red",
+                        "detail": (
+                            f"Broker day change is {broker_day_change:+.2f}, but "
+                            f"closed FIFO P/L is {closed_realized:+.2f}. Check open "
+                            "positions, ledger timing, and unsettled broker values."
+                        ),
+                    }
+                )
+
+        last_sell_at = self._as_datetime((last_sell or {}).get("activity_at"))
+        if buy_count > 0 and last_sell_at is None:
+            diagnostics.append(
+                {
+                    "level": "warning",
+                    "title": "Last sell unavailable",
+                    "detail": "The report cannot see a filled sell timestamp in this window.",
+                }
+            )
+        elif last_sell_at is not None:
+            if last_sell_at.tzinfo is None:
+                last_sell_at = last_sell_at.astimezone()
+            hours_since_sell = (checked_at - last_sell_at).total_seconds() / 3600.0
+            if hours_since_sell > min(12.0, max(float(window_hours) / 2.0, 1.0)):
+                diagnostics.append(
+                    {
+                        "level": "review",
+                        "title": "Last sell is getting old",
+                        "detail": f"Last filled sell was {hours_since_sell:.1f} hours ago.",
+                    }
+                )
+
+        if not diagnostics:
+            diagnostics.append(
+                {
+                    "level": "ok",
+                    "title": "No obvious imbalance",
+                    "detail": "Buy/sell counts and closed-trade outcomes do not trip the report thresholds.",
+                }
+            )
+        return diagnostics
+
+    def _recent_trade_groups(
+        self,
+        *,
+        window_fills: list[dict[str, Any]],
+        closed_trades: list[dict[str, Any]],
+        group_key: str,
+    ) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in window_fills:
+            key = str(row.get(group_key) or "unassigned").strip() or "unassigned"
+            item = grouped.setdefault(
+                key,
+                {
+                    group_key: key,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "buy_notional_usd": 0.0,
+                    "sell_notional_usd": 0.0,
+                    "closed_trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "realized_pnl_usd": 0.0,
+                },
+            )
+            side = str(row.get("side") or "").strip().lower()
+            notional = self._to_float(row.get("notional_value")) or 0.0
+            if side == "buy":
+                item["buy_count"] += 1
+                item["buy_notional_usd"] += notional
+            elif side == "sell":
+                item["sell_count"] += 1
+                item["sell_notional_usd"] += notional
+
+        for row in closed_trades:
+            key = str(row.get(group_key) or "unassigned").strip() or "unassigned"
+            item = grouped.setdefault(
+                key,
+                {
+                    group_key: key,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "buy_notional_usd": 0.0,
+                    "sell_notional_usd": 0.0,
+                    "closed_trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "realized_pnl_usd": 0.0,
+                },
+            )
+            return_pct = self._to_float(row.get("return_pct")) or 0.0
+            item["closed_trades"] += 1
+            if return_pct > 0:
+                item["wins"] += 1
+            elif return_pct < 0:
+                item["losses"] += 1
+            item["realized_pnl_usd"] += self._to_float(row.get("pnl_usd")) or 0.0
+
+        rows = []
+        for item in grouped.values():
+            closed_count = int(item["closed_trades"] or 0)
+            wins = int(item["wins"] or 0)
+            item["win_rate"] = round(wins / closed_count, 6) if closed_count else 0.0
+            for key in ("buy_notional_usd", "sell_notional_usd", "realized_pnl_usd"):
+                item[key] = round(float(item[key] or 0.0), 6)
+            rows.append(item)
+        return sorted(
+            rows,
+            key=lambda item: (
+                -int(item.get("buy_count", 0) or 0) - int(item.get("sell_count", 0) or 0),
+                str(item.get(group_key) or ""),
+            ),
+        )[:40]
+
     def _match_fifo_round_trips(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Build read-only realized P/L from broker fills even when proposal ids are absent.
 
@@ -645,6 +2117,7 @@ class StatusReporter:
         strategy_signals = self._as_dict(snapshot.get("strategy_signals"))
         shadow_proposals = self._as_dict(snapshot.get("shadow_trade_proposals"))
         risk_cfo = self._as_dict(snapshot.get("risk_cfo"))
+        live_risk_cfo = self._as_dict(snapshot.get("live_risk_cfo"))
         execution = self._as_dict(snapshot.get("execution"))
         strategy_fitness = self._as_dict(snapshot.get("strategy_fitness"))
         daily_protection = self._as_dict(snapshot.get("daily_protection"))
@@ -687,6 +2160,14 @@ class StatusReporter:
                 f"top_symbol={strategy_signals.get('top_symbol', '') or '-'} | "
                 f"top_strategy={strategy_signals.get('top_strategy', '') or '-'} | "
                 f"top_fitness_strategy={strategy_fitness.get('top_strategy', '') or '-'}"
+            ),
+            (
+                "Fitness evidence: "
+                f"paper={self._as_dict(strategy_fitness.get('fitness_evidence_mix')).get('paper_evidence_count', 0)} | "
+                f"live={self._as_dict(strategy_fitness.get('fitness_evidence_mix')).get('live_evidence_count', 0)} | "
+                f"backtest={self._as_dict(strategy_fitness.get('fitness_evidence_mix')).get('backtest_evidence_count', 0)} | "
+                f"simulator={self._as_dict(strategy_fitness.get('fitness_evidence_mix')).get('simulator_evidence_count', 0)} | "
+                f"included={','.join(strategy_fitness.get('fitness_included_sources', []) or []) or 'none'}"
             ),
             (
                 "Shadow: "
@@ -791,6 +2272,7 @@ class StatusReporter:
         strategy_signals = self._as_dict(snapshot.get("strategy_signals"))
         shadow_proposals = self._as_dict(snapshot.get("shadow_trade_proposals"))
         risk_cfo = self._as_dict(snapshot.get("risk_cfo"))
+        live_risk_cfo = self._as_dict(snapshot.get("live_risk_cfo"))
         execution = self._as_dict(snapshot.get("execution"))
         paper_exit_management = self._as_dict(snapshot.get("paper_exit_management"))
         daily_protection = self._as_dict(snapshot.get("daily_protection"))
@@ -802,7 +2284,7 @@ class StatusReporter:
         if decision == "submit_paper":
             primary_line = f"Paper CFO approved path | reason={reason}"
         else:
-            primary_line = f"Primary paper/live-follow blocker | reason={reason}"
+            primary_line = f"Primary paper blocker | reason={reason}"
 
         lines = [
             primary_line,
@@ -822,6 +2304,14 @@ class StatusReporter:
                 f" | crypto_ready={market_gate.get('crypto_scan_ready', False)}"
             ),
             self._render_broker_equity_markets_line(market_gate),
+            (
+                "Live CFO"
+                f" | decision={live_risk_cfo.get('decision', '-')}"
+                f" | reason={live_risk_cfo.get('reason', '-')}"
+                f" | policy={live_risk_cfo.get('decision_policy', '-')}"
+                f" | approved={int(live_risk_cfo.get('approved_trades', 0) or 0)}"
+                f" | rejected={int(live_risk_cfo.get('rejected_trades', 0) or 0)}"
+            ),
             (
                 "Flow"
                 f" | signals={strategy_signals.get('signals_generated', 0)}"
@@ -903,10 +2393,13 @@ class StatusReporter:
         snapshot = self._as_dict(latest_tick.get("state_snapshot_json"))
         market_scan = self._as_dict(snapshot.get("market_scan"))
         market_result = self._as_dict(market_scan.get("result"))
+        context_enrichment = self._as_dict(snapshot.get("context_enrichment"))
         strategy_signals = self._as_dict(snapshot.get("strategy_signals"))
         allocation = self._as_dict(strategy_signals.get("allocation"))
+        threshold_worker = self._as_dict(strategy_signals.get("threshold_advisor_worker"))
         shadow_proposals = self._as_dict(snapshot.get("shadow_trade_proposals"))
         risk_cfo = self._as_dict(snapshot.get("risk_cfo"))
+        slow_queue = self._as_dict(snapshot.get("slow_enrichment_queue"))
         tick_blockers = self._as_dict(snapshot.get("tick_blockers"))
 
         raw_preview = self._as_list(strategy_signals.get("raw_signal_preview"))
@@ -941,6 +2434,31 @@ class StatusReporter:
                 "proposals_created": shadow_proposals.get("proposals_created", 0),
                 "cfo_reason": risk_cfo.get("reason", "-"),
             },
+            "slow_enrichment_queue": {
+                "mode": slow_queue.get("mode", "-"),
+                "enqueued": slow_queue.get("enqueued", 0),
+                "refreshed": slow_queue.get("refreshed", 0),
+                "pending_after_estimate": slow_queue.get("pending_after_estimate", 0),
+                "repaired_expired": slow_queue.get("repaired_expired", 0),
+                "repaired_stale_processing": slow_queue.get("repaired_stale_processing", 0),
+                "worker_status": slow_queue.get("worker_status", "-"),
+                "worker_pid": slow_queue.get("worker_pid"),
+                "trade_authority": slow_queue.get("trade_authority", "none"),
+                "storage": slow_queue.get("storage", "-"),
+            },
+            "fast_enrichment": {
+                "mode": context_enrichment.get("mode", "-"),
+                "candidate_policy": context_enrichment.get("candidate_policy", "-"),
+                "candidates_enriched": context_enrichment.get("candidates_enriched", 0),
+                "technical_context_ready": context_enrichment.get("technical_context_ready", 0),
+            },
+            "threshold_advisor_worker": {
+                "mode": threshold_worker.get("mode", "-"),
+                "worker_status": threshold_worker.get("worker_status", "-"),
+                "worker_pid": threshold_worker.get("worker_pid"),
+                "storage": threshold_worker.get("storage", "-"),
+                "trade_authority": threshold_worker.get("trade_authority", "none"),
+            },
             "blockers": tick_blockers,
             "raw_signal_preview": raw_preview,
             "suppressed_signal_preview": suppressed_preview,
@@ -953,6 +2471,9 @@ class StatusReporter:
 
         scan = self._as_dict(activity.get("scan"))
         flow = self._as_dict(activity.get("flow"))
+        slow_queue = self._as_dict(activity.get("slow_enrichment_queue"))
+        fast_enrichment = self._as_dict(activity.get("fast_enrichment"))
+        threshold_worker = self._as_dict(activity.get("threshold_advisor_worker"))
         blockers = self._as_dict(activity.get("blockers"))
         lines = [
             (
@@ -974,6 +2495,40 @@ class StatusReporter:
                 f" | cfo={flow.get('cfo_reason', '-')}"
             ),
         ]
+        if slow_queue:
+            lines.append(
+                (
+                    "Slow enrichment queue"
+                    f" | mode={slow_queue.get('mode', '-')}"
+                    f" | enqueued={slow_queue.get('enqueued', 0)}"
+                    f" | refreshed={slow_queue.get('refreshed', 0)}"
+                    f" | pending={slow_queue.get('pending_after_estimate', 0)}"
+                    f" | repaired_expired={slow_queue.get('repaired_expired', 0)}"
+                    f" | worker={slow_queue.get('worker_status', '-')}"
+                    f" | storage={slow_queue.get('storage', '-')}"
+                    f" | trade_authority={slow_queue.get('trade_authority', 'none')}"
+                )
+            )
+        if fast_enrichment:
+            lines.append(
+                (
+                    "Fast enrichment"
+                    f" | mode={fast_enrichment.get('mode', '-')}"
+                    f" | policy={fast_enrichment.get('candidate_policy', '-')}"
+                    f" | enriched={fast_enrichment.get('candidates_enriched', 0)}"
+                    f" | technical_ready={fast_enrichment.get('technical_context_ready', 0)}"
+                )
+            )
+        if threshold_worker:
+            lines.append(
+                (
+                    "Threshold advisor worker"
+                    f" | mode={threshold_worker.get('mode', '-')}"
+                    f" | worker={threshold_worker.get('worker_status', '-')}"
+                    f" | storage={threshold_worker.get('storage', '-')}"
+                    f" | trade_authority={threshold_worker.get('trade_authority', 'none')}"
+                )
+            )
         if blockers:
             lines.append(
                 (
@@ -1586,12 +3141,12 @@ class StatusReporter:
             ):
                 roles.append("equity_exec_secondary")
             if broker_id == self.config.live_execution_equity_broker_id:
-                roles.append("live_equity_follower")
+                roles.append("live_equity_exec")
             if (
                 not self.config.live_execution_equity_only
                 and broker_id == self.config.live_execution_crypto_broker_id
             ):
-                roles.append("live_crypto_follower")
+                roles.append("live_crypto_exec")
 
             broker_label = self._broker_label(broker_id)
             if row is None:
@@ -1605,7 +3160,7 @@ class StatusReporter:
                     note = "live lane disabled; no account snapshot yet"
                     status = "disabled_live"
                 elif broker_id == "alpaca_live":
-                    note = "dormant live follower; no live account snapshot yet"
+                    note = "live lane has no account snapshot yet"
                     status = "dormant"
                 else:
                     note = "no recent account snapshot"
@@ -1661,7 +3216,7 @@ class StatusReporter:
         return accounts
 
     def _build_live_execution_overview(self) -> dict[str, Any]:
-        """Summarize live follower readiness without implying independent live strategy."""
+        """Summarize independent live-lane readiness and configured guardrails."""
         slot_size = float(self.config.live_execution_default_notional_usd)
         max_slots = int(self.config.live_execution_max_open_positions)
         envelope_max_usd = round(slot_size * max_slots, 6)
@@ -1720,13 +3275,13 @@ class StatusReporter:
         if blockers:
             note = (
                 "Live entries remain blocked until all activation gates clear; "
-                "even then, live can only follow same-tick paper orders that were submitted."
+                "when clear, live evaluates shared proposals with the active LIVE_* dials."
             )
         else:
             note = (
-                "Live follower is armed under the approved same-as-paper envelope. "
-                "It still cannot create independent live strategy decisions; entries must follow "
-                "same-tick submitted paper orders."
+                "Live lane is armed. It evaluates shared proposals independently "
+                "using LIVE_* dials, then the final LiveRiskGuard re-checks "
+                "real-money safety before broker mutation."
             )
 
         return {
@@ -1763,6 +3318,7 @@ class StatusReporter:
             "pdt_basis_equity_usd": pdt_basis_equity,
             "pdt_min_equity_usd": pdt_min_equity_usd,
             "note": note,
+            "decision_policy": "independent_live_env_dials",
         }
 
     def _build_live_execution_intelligence(
@@ -1771,11 +3327,12 @@ class StatusReporter:
         recent_orders: list[dict[str, Any]],
         live_execution_overview: dict[str, Any],
     ) -> dict[str, Any]:
-        """Compare future live follower entries with same-proposal paper entries.
+        """Compare live entries with paper entries when they share proposals.
 
-        This is deliberately read-only: strategy scoring remains shared shadow
-        fitness, while this surface watches for execution divergence such as
-        fill drift, status mismatch, or unmatched live orders.
+        This is deliberately read-only. Strategy scoring remains shared shadow
+        fitness, while the live lane has its own proposal/risk decision under
+        `LIVE_*` dials. The monitor watches fill drift, status mismatch, and
+        unmatched live orders so lane divergence stays visible.
         """
         paper_brokers = {
             str(self.config.paper_execution_equity_broker_id or "alpaca_paper").strip().lower(),
@@ -1851,7 +3408,9 @@ class StatusReporter:
         return {
             "mode": "read_only_execution_monitor",
             "strategy_intelligence": "shared_shadow_fitness",
+            "decision_policy": "independent_live_env_dials",
             "live_independent_strategy_fitness": False,
+            "live_independent_proposal_decision": True,
             "paper_entry_orders_sampled": len(paper_entries),
             "live_entry_orders_sampled": len(live_entries),
             "matched_live_followups": len(matched_pairs),
@@ -1861,9 +3420,9 @@ class StatusReporter:
             "latest_fill_drifts": fill_drifts[:5],
             "blockers": blockers,
             "note": (
-                "Live uses the shared shadow-fitness strategy brain. This monitor "
-                "checks future live execution quality against same-proposal paper "
-                "orders and remains read-only."
+                "Live uses the shared shadow-fitness strategy brain but makes "
+                "lane-specific proposal/risk decisions from LIVE_* dials. This "
+                "monitor remains read-only."
             ),
         }
 
@@ -2281,7 +3840,7 @@ class StatusReporter:
                 f"Asset scope={asset_scope} | allowed_strategies={strategies} | "
                 f"projected_gain=equity {float(overview.get('min_projected_gain_pct') or 0) * 100:.2f}%"
                 f"/crypto {float(overview.get('crypto_min_projected_gain_pct') or 0) * 100:.2f}% | "
-                f"score_to_trade={self._fmt_number(overview.get('min_signal_score_to_trade'), decimals=1)}+ | "
+                "decision_policy=fitness_only | "
                 f"limit_buffer=equity {self._fmt_number(overview.get('limit_buffer_bps'), decimals=1)}bps"
                 f"/crypto {self._fmt_number(overview.get('crypto_limit_buffer_bps'), decimals=1)}bps"
             ),
@@ -2299,12 +3858,14 @@ class StatusReporter:
             return ["No live execution intelligence available yet."]
 
         shared_brain = str(overview.get("strategy_intelligence", "unknown") or "unknown")
-        independent = "yes" if overview.get("live_independent_strategy_fitness") else "no"
+        independent_fitness = "yes" if overview.get("live_independent_strategy_fitness") else "no"
+        independent_decision = "yes" if overview.get("live_independent_proposal_decision") else "no"
         blockers = ", ".join(overview.get("blockers", []) or []) or "none"
         lines = [
             (
                 f"Mode={overview.get('mode', 'unknown')} | strategy_brain={shared_brain} | "
-                f"independent_live_strategy_fitness={independent}"
+                f"independent_live_strategy_fitness={independent_fitness} | "
+                f"independent_live_proposal_decision={independent_decision}"
             ),
             (
                 f"Recent order-ledger sample | paper={overview.get('paper_entry_orders_sampled', 0)} | "
@@ -2332,7 +3893,7 @@ class StatusReporter:
                     )
                 )
         else:
-            lines.append("No live/paper fill pairs yet; comparison becomes useful after live follower orders exist.")
+            lines.append("No same-proposal live/paper fill pairs yet; comparison becomes useful after live orders exist.")
         note = str(overview.get("note", "") or "").strip()
         if note:
             lines.append(note)
@@ -2757,6 +4318,17 @@ class StatusReporter:
 
     def _as_dict(self, value: Any) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
+
+    def _coerce_mapping(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            return decoded if isinstance(decoded, dict) else {}
+        return {}
 
     def _first_list_item(self, value: Any) -> str:
         if not isinstance(value, list) or not value:

@@ -12,6 +12,7 @@ from app.framework.engine.control_graph import (
     run_control_graph,
 )
 from app.framework.engine.pipelines import StepDefinition, build_default_pipeline
+import app.framework.runtime.control as control_module
 from app.framework.runtime.control import ControlPipelineRunner
 from app.framework.runtime.models import TickContext
 from app.heartbeat.graph import (
@@ -178,6 +179,54 @@ class ControlGraphTests(unittest.TestCase):
             report.state_snapshot["last_error"],
             {"step": "test.failing", "message": "graph halt"},
         )
+
+    def test_heartbeat_service_loop_builds_pipeline_that_calls_autonomous_learning(self) -> None:
+        original_build_default_pipeline = control_module.build_default_pipeline
+        original_load_runtime_config = control_module.load_runtime_config
+        original_usage_ledger = control_module.UsageLedger
+        calls: list[str] = []
+
+        def control_step(context: TickContext) -> dict[str, object]:
+            calls.append(context.tick_id)
+            context.state["heartbeat"] = {
+                "tick_id": context.tick_id,
+                "autonomous_learning": {
+                    "autonomous_learning_called": True,
+                    "research_cycle_enabled": True,
+                    "research_cycle_due": True,
+                    "research_cycle_started": True,
+                    "research_cycle_completed": True,
+                    "research_cycle_source": "real_heartbeat",
+                },
+            }
+            context.state["autonomous_learning"] = {"status": "ok", "triggered": True}
+            return {"status": "alive"}
+
+        control_module.build_default_pipeline = lambda: [
+            StepDefinition(name="control.heartbeat", runner=control_step)
+        ]
+        control_module.load_runtime_config = lambda: SimpleNamespace(
+            api_daily_cost_warning_usd=1.0,
+            api_daily_cost_limit_usd=2.0,
+        )
+        control_module.UsageLedger = lambda config: _UsageLedger()
+        try:
+            runner = ControlPipelineRunner(
+                steps=[],
+                logger=_Logger(),
+                config=SimpleNamespace(
+                    api_daily_cost_warning_usd=1.0,
+                    api_daily_cost_limit_usd=2.0,
+                ),
+                usage_ledger=_UsageLedger(),
+            )
+            runner.run_heartbeat_service_loop(interval_seconds=1, max_ticks=1)
+        finally:
+            control_module.build_default_pipeline = original_build_default_pipeline
+            control_module.load_runtime_config = original_load_runtime_config
+            control_module.UsageLedger = original_usage_ledger
+
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

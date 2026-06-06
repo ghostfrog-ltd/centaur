@@ -67,6 +67,9 @@ class RuntimeConfig:
     slack_request_timeout_seconds: int
     slack_hourly_status_enabled: bool
     slack_hourly_status_interval_minutes: int
+    slack_attention_repeat_enabled: bool
+    slack_attention_repeat_minutes: int
+    slack_attention_max_repeats: int
     live_equity_pdt_review_reminders_enabled: bool
     live_equity_pdt_review_reminder_start_date: str
     live_equity_pdt_review_reminder_interval_minutes: int
@@ -87,9 +90,32 @@ class RuntimeConfig:
     historical_replay_default_days: int
     historical_replay_default_timeframe: str
     historical_replay_max_timestamps: int
+    research_cycle_enabled: bool
+    research_cycle_enabled_raw_value: str
+    research_cycle_enabled_env_file_value: str
+    research_cycle_enabled_value_source: str
+    research_cycle_env_path: str
+    research_cycle_min_interval_minutes: int
+    research_replay_timeframe: str
+    research_replay_days: int
+    research_max_replay_timestamps: int
+    research_min_windows: int
+    research_min_proposals: int
+    research_min_net_return_pct: float
+    research_min_net_win_rate: float
+    research_allowed_strategies: tuple[str, ...]
     discovery_equity_symbols: tuple[str, ...]
     discovery_crypto_symbols: tuple[str, ...]
     discovery_target_count: int
+    max_bar_age_crypto_seconds: int
+    max_bar_age_equity_seconds: int
+    allow_stale_market_data_for_research: bool
+    slow_enrichment_queue_max_pending_items: int
+    slow_enrichment_queue_worker_batch_size: int
+    slow_enrichment_queue_worker_max_batches: int
+    slow_enrichment_queue_processing_timeout_seconds: int
+    slow_enrichment_queue_max_retries: int
+    slow_enrichment_queue_retry_backoff_seconds: int
     ecb_reference_rates_url: str
     ecb_request_timeout_seconds: int
     ecb_reference_cache_minutes: int
@@ -139,8 +165,13 @@ class RuntimeConfig:
     shadow_entry_slippage_bps: float
     shadow_exit_slippage_bps: float
     shadow_fixed_round_trip_cost_usd: float
+    simulated_crypto_fee_bps: float
+    simulated_crypto_slippage_bps: float
+    simulated_crypto_spread_bps: float
     strategy_fitness_lookback_days: int
     strategy_fitness_min_checkpoints: int
+    include_backtest_evidence_in_paper_fitness: bool
+    include_backtest_evidence_in_live_fitness: bool
     strategy_allocation_min_checkpoints: int
     strategy_allocation_favor_threshold: float
     strategy_allocation_suppress_threshold: float
@@ -259,6 +290,19 @@ class RuntimeConfig:
 
 def load_runtime_config() -> RuntimeConfig:
     load_dotenv(DEFAULT_ENV_PATH)
+    env_file_values = read_dotenv_values(DEFAULT_ENV_PATH)
+    research_cycle_raw_value = str(os.getenv("RESEARCH_CYCLE_ENABLED", "") or "").strip()
+    research_cycle_env_file_value = str(
+        env_file_values.get("RESEARCH_CYCLE_ENABLED", "") or ""
+    ).strip()
+    research_cycle_value_source = "process_env"
+    if (
+        research_cycle_env_file_value
+        and research_cycle_raw_value == research_cycle_env_file_value
+    ):
+        research_cycle_value_source = ".env"
+    elif not research_cycle_raw_value and research_cycle_env_file_value:
+        research_cycle_value_source = ".env_missing_after_load"
 
     usage_db_path = _resolve_project_path(
         os.getenv("USAGE_LEDGER_DB_PATH", ".runtime/centaur_usage.sqlite3")
@@ -432,6 +476,18 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("SLACK_HOURLY_STATUS_INTERVAL_MINUTES"),
             default=60,
         ),
+        slack_attention_repeat_enabled=_parse_bool(
+            os.getenv("SLACK_ATTENTION_REPEAT_ENABLED"),
+            default=True,
+        ),
+        slack_attention_repeat_minutes=_parse_int(
+            os.getenv("SLACK_ATTENTION_REPEAT_MINUTES"),
+            default=15,
+        ),
+        slack_attention_max_repeats=_parse_int(
+            os.getenv("SLACK_ATTENTION_MAX_REPEATS"),
+            default=0,
+        ),
         live_equity_pdt_review_reminders_enabled=_parse_bool(
             os.getenv("LIVE_EQUITY_PDT_REVIEW_REMINDERS_ENABLED"),
             default=True,
@@ -494,6 +550,51 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("HISTORICAL_REPLAY_MAX_TIMESTAMPS"),
             default=0,
         ),
+        research_cycle_enabled=_parse_bool(
+            research_cycle_raw_value,
+            default=False,
+        ),
+        research_cycle_enabled_raw_value=research_cycle_raw_value,
+        research_cycle_enabled_env_file_value=research_cycle_env_file_value,
+        research_cycle_enabled_value_source=research_cycle_value_source,
+        research_cycle_env_path=str(DEFAULT_ENV_PATH),
+        research_cycle_min_interval_minutes=_parse_int(
+            os.getenv("RESEARCH_CYCLE_MIN_INTERVAL_MINUTES"),
+            default=60,
+        ),
+        research_replay_timeframe=(
+            os.getenv("RESEARCH_REPLAY_TIMEFRAME", "15Min").strip() or "15Min"
+        ),
+        research_replay_days=_parse_int(
+            os.getenv("RESEARCH_REPLAY_DAYS"),
+            default=5,
+        ),
+        research_max_replay_timestamps=_parse_int(
+            os.getenv("RESEARCH_MAX_REPLAY_TIMESTAMPS"),
+            default=500,
+        ),
+        research_min_windows=_parse_int(
+            os.getenv("RESEARCH_MIN_WINDOWS"),
+            default=4,
+        ),
+        research_min_proposals=_parse_int(
+            os.getenv("RESEARCH_MIN_PROPOSALS"),
+            default=50,
+        ),
+        research_min_net_return_pct=_parse_float(
+            os.getenv("RESEARCH_MIN_NET_RETURN_PCT"),
+            default=0.10,
+        ),
+        research_min_net_win_rate=_parse_float(
+            os.getenv("RESEARCH_MIN_NET_WIN_RATE"),
+            default=0.55,
+        ),
+        research_allowed_strategies=_parse_identifier_csv(
+            os.getenv(
+                "RESEARCH_ALLOWED_STRATEGIES",
+                "crypto_pullback.downside_continuation_watch,crypto_pullback.extreme_drop_reversal_watch",
+            )
+        ),
         discovery_equity_symbols=_parse_csv(
             os.getenv(
                 "DISCOVERY_EQUITY_SYMBOLS",
@@ -509,6 +610,42 @@ def load_runtime_config() -> RuntimeConfig:
         discovery_target_count=_parse_int(
             os.getenv("DISCOVERY_TARGET_COUNT"),
             default=6,
+        ),
+        max_bar_age_crypto_seconds=_parse_int(
+            os.getenv("MAX_BAR_AGE_CRYPTO_SECONDS"),
+            default=600,
+        ),
+        max_bar_age_equity_seconds=_parse_int(
+            os.getenv("MAX_BAR_AGE_EQUITY_SECONDS"),
+            default=1800,
+        ),
+        allow_stale_market_data_for_research=_parse_bool(
+            os.getenv("ALLOW_STALE_MARKET_DATA_FOR_RESEARCH"),
+            default=False,
+        ),
+        slow_enrichment_queue_max_pending_items=_parse_int(
+            os.getenv("SLOW_ENRICHMENT_QUEUE_MAX_PENDING_ITEMS"),
+            default=500,
+        ),
+        slow_enrichment_queue_worker_batch_size=_parse_int(
+            os.getenv("SLOW_ENRICHMENT_QUEUE_WORKER_BATCH_SIZE"),
+            default=25,
+        ),
+        slow_enrichment_queue_worker_max_batches=_parse_int(
+            os.getenv("SLOW_ENRICHMENT_QUEUE_WORKER_MAX_BATCHES"),
+            default=4,
+        ),
+        slow_enrichment_queue_processing_timeout_seconds=_parse_int(
+            os.getenv("SLOW_ENRICHMENT_QUEUE_PROCESSING_TIMEOUT_SECONDS"),
+            default=900,
+        ),
+        slow_enrichment_queue_max_retries=_parse_int(
+            os.getenv("SLOW_ENRICHMENT_QUEUE_MAX_RETRIES"),
+            default=3,
+        ),
+        slow_enrichment_queue_retry_backoff_seconds=_parse_int(
+            os.getenv("SLOW_ENRICHMENT_QUEUE_RETRY_BACKOFF_SECONDS"),
+            default=120,
         ),
         ecb_reference_rates_url=os.getenv(
             "ECB_REFERENCE_RATES_URL",
@@ -654,6 +791,18 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("SHADOW_FIXED_ROUND_TRIP_COST_USD"),
             default=0.03,
         ),
+        simulated_crypto_fee_bps=_parse_float(
+            os.getenv("SIMULATED_CRYPTO_FEE_BPS"),
+            default=10.0,
+        ),
+        simulated_crypto_slippage_bps=_parse_float(
+            os.getenv("SIMULATED_CRYPTO_SLIPPAGE_BPS"),
+            default=8.0,
+        ),
+        simulated_crypto_spread_bps=_parse_float(
+            os.getenv("SIMULATED_CRYPTO_SPREAD_BPS"),
+            default=12.0,
+        ),
         strategy_fitness_lookback_days=_parse_int(
             os.getenv("STRATEGY_FITNESS_LOOKBACK_DAYS"),
             default=0,
@@ -661,6 +810,14 @@ def load_runtime_config() -> RuntimeConfig:
         strategy_fitness_min_checkpoints=_parse_int(
             os.getenv("STRATEGY_FITNESS_MIN_CHECKPOINTS"),
             default=1,
+        ),
+        include_backtest_evidence_in_paper_fitness=_parse_bool(
+            os.getenv("INCLUDE_BACKTEST_EVIDENCE_IN_PAPER_FITNESS"),
+            default=False,
+        ),
+        include_backtest_evidence_in_live_fitness=_parse_bool(
+            os.getenv("INCLUDE_BACKTEST_EVIDENCE_IN_LIVE_FITNESS"),
+            default=False,
         ),
         strategy_allocation_min_checkpoints=_parse_int(
             os.getenv("STRATEGY_ALLOCATION_MIN_CHECKPOINTS"),
@@ -888,7 +1045,7 @@ def load_runtime_config() -> RuntimeConfig:
         ),
         live_execution_high_score_override_enabled=_parse_bool(
             os.getenv("LIVE_EXECUTION_HIGH_SCORE_OVERRIDE_ENABLED"),
-            default=True,
+            default=False,
         ),
         live_execution_high_score_override_min_score=live_min_signal_score_to_trade,
         live_execution_high_score_override_fitness_margin=_parse_float(
@@ -1086,19 +1243,12 @@ def load_runtime_config() -> RuntimeConfig:
         postgres_configured=bool(database_url),
         provider_pricing=_load_provider_pricing(),
     )
-    _validate_live_same_as_paper_config(config)
+    _validate_live_lane_config(config)
     return config
 
 
-def _validate_live_same_as_paper_config(config: RuntimeConfig) -> None:
-    """Fail closed when the armed live follower drifts from paper risk levers."""
-    if not (
-        config.live_execution_enabled
-        or config.live_execution_activation_ack
-        or config.centaur_mode in {"live", "live_dry"}
-    ):
-        return
-
+def _validate_live_lane_config(config: RuntimeConfig) -> None:
+    """Validate live-lane config names without forcing live to mirror paper."""
     mirrored_fields = (
         ("execution_require_market_open", "paper_execution_require_market_open", "live_execution_require_market_open"),
         ("execution_equity_only", "paper_execution_equity_only", "live_execution_equity_only"),
@@ -1186,23 +1336,22 @@ def _validate_live_same_as_paper_config(config: RuntimeConfig) -> None:
     unknown_differences = sorted(allowed_differences - known_difference_names)
     if unknown_differences:
         joined = ", ".join(unknown_differences)
-        raise ValueError(f"live_same_as_paper_unknown_allowed_difference: {joined}")
-
-    mismatches = [
-        name
-        for name, paper_attr, live_attr in mirrored_fields
-        if getattr(config, paper_attr) != getattr(config, live_attr)
-        and name not in allowed_differences
-    ]
-    if mismatches:
-        joined = ", ".join(mismatches)
-        raise ValueError(f"live_same_as_paper_config_mismatch: {joined}")
+        raise ValueError(f"live_lane_unknown_allowed_difference: {joined}")
 
 
 def load_dotenv(path: Path) -> None:
     if not path.exists():
         return
 
+    for key, value in read_dotenv_values(path).items():
+        os.environ.setdefault(key, value)
+
+
+def read_dotenv_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    loaded: dict[str, str] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -1211,7 +1360,8 @@ def load_dotenv(path: Path) -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        loaded[key] = value
+    return loaded
 
 
 def _load_provider_pricing() -> dict[str, SourcePricing]:
@@ -1368,9 +1518,9 @@ def _resolve_centaur_mode() -> str:
     if configured is not None and configured.strip():
         return _normalize_centaur_mode(configured)
 
-    # Transition helper for the existing same-as-paper live follower lane: older
-    # .env files predate CENTAUR_MODE, so reflect an already-armed live lane
-    # honestly in status/metadata without changing any live activation gates.
+    # Transition helper for older .env files that predate CENTAUR_MODE: reflect
+    # an already-armed live lane honestly in status/metadata without changing
+    # any live activation gates.
     if (
         _parse_bool(os.getenv("LIVE_EXECUTION_ENABLED"), default=False)
         and not _parse_bool(os.getenv("LIVE_EXECUTION_KILL_SWITCH"), default=True)

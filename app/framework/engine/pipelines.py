@@ -79,16 +79,17 @@ live_exit_management = _step_runner("20_execution_live_exits")
 shadow_trade_outcomes = _step_runner("21_shadow_outcomes")
 strategy_fitness = _step_runner("22_strategy_fitness")
 market_scan = _step_runner("23_market_scan")
-context_enrichment = _step_runner("24_context_enrichment")
-strategy_signals = _step_runner("25_strategy_signals")
-gemini_analysis = _step_runner("26_analysis_gemini")
-shadow_trade_proposals = _step_runner("27_shadow_proposals")
-risk_cfo_gate = _step_runner("28_risk_cfo")
-execution_paper = _step_runner("29_execution_paper")
-live_risk_cfo_gate = _step_runner("30_risk_live_cfo")
-execution_live = _step_runner("31_execution_live")
-post_trade_evaluation = _step_runner("32_evaluation_post_trade")
-slack_notifications = _step_runner("33_notifications_slack")
+slow_enrichment_queue = _step_runner("24_slow_enrichment_queue")
+context_enrichment = _step_runner("25_context_enrichment")
+strategy_signals = _step_runner("26_strategy_signals")
+gemini_analysis = _step_runner("27_analysis_gemini")
+shadow_trade_proposals = _step_runner("28_shadow_proposals")
+risk_cfo_gate = _step_runner("29_risk_cfo")
+execution_paper = _step_runner("30_execution_paper")
+live_risk_cfo_gate = _step_runner("31_risk_live_cfo")
+execution_live = _step_runner("32_execution_live")
+post_trade_evaluation = _step_runner("33_evaluation_post_trade")
+slack_notifications = _step_runner("34_notifications_slack")
 
 def build_default_pipeline():
     from app.heartbeat.pipeline import build_heartbeat_cron_pipeline
@@ -110,4 +111,3 @@ def _build_live_trade_approval(*args: Any, **kwargs: Any):
     import app.heartbeat.support as support
 
     return support._build_live_trade_approval(*args, **kwargs)
-

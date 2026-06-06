@@ -343,6 +343,7 @@ def run_implementation(context: TickContext) -> PipelineResult:
                         "planned_trailing_stop_mode"
                     ),
                     "exit_reason": exit_request["exit_reason"],
+                    "exit_quality_audit": exit_request.get("exit_quality_audit"),
                     "linked_order_id": exit_request.get("linked_order_id", ""),
                     "unmanaged_flatten": exit_request.get("unmanaged_flatten", False),
                     "refreshed_exit_order_id": exit_request.get(

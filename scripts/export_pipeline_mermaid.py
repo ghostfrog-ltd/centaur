@@ -83,7 +83,7 @@ PIPELINE_LANES: tuple[PipelineLane, ...] = (
         key="research",
         title="Research, evidence, and analysis / app.heartbeat.steps + app.framework.engine",
         class_name="research",
-        prefixes=("shadow.", "strategy.", "analysis.", "evaluation."),
+        prefixes=("shadow.", "strategy.", "analysis.", "evaluation.", "slow."),
     ),
     PipelineLane(
         key="notifications",

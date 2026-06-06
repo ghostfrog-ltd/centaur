@@ -21,6 +21,12 @@ from app.framework.runtime.mode_context import mode_context_from_config
 from app.framework.adapters.alpaca import summarize_latest_bars
 from app.framework.adapters.brokers import BrokerAdapterError, get_broker_adapter
 from app.framework.core.fx import EcbReferenceRateClient, rate_is_stale
+from app.framework.runtime.attention_alerts import (
+    approval_request_id as _approval_request_id,
+    build_event_id as _build_attention_event_id,
+    create_attention_alert as _create_attention_alert,
+)
+from app.framework.reporting.promotion_gate import PromotionGateReport
 from app.framework.reporting.threshold_advisor import ThresholdAdvisor
 from app.framework.runtime.models import TickContext
 from app.framework.runtime.slack import SlackNotificationError, SlackWebhookClient
@@ -42,6 +48,7 @@ PipelineRunner = Callable[[TickContext], PipelineResult]
 # FINRA PDT minimum for US equity day-trading. Live equity entries fail closed
 # below this until observed broker/API behaviour and human approval say otherwise.
 ALPACA_PDT_MIN_EQUITY_USD = 25_000.0
+EXIT_QUALITY_TARGET_PCTS = (1.25, 1.5, 1.75, 2.0)
 
 
 def _paper_min_projected_gain_pct(config: Any, asset_class: str) -> float:
@@ -165,6 +172,11 @@ def _equity_no_overnight_carry_enabled(config: Any) -> bool:
         getattr(config, "paper_execution_equity_no_weekend_carry_enabled", False)
     )
 
+def _is_equity_asset_class(asset_class: str) -> bool:
+    """Normalize broker equity labels before applying no-overnight exits."""
+    normalized = str(asset_class).strip().lower()
+    return normalized in {"equity", "us_equity", "etf"}
+
 def _market_session_minutes(
     as_of: datetime,
     market_timezone: str,
@@ -224,7 +236,7 @@ def _equity_flatten_due(
     next_close: Any = None,
 ) -> bool:
     """Return true when an equity managed exit should avoid overnight carry."""
-    if str(asset_class).strip().lower() != "equity":
+    if not _is_equity_asset_class(asset_class):
         return False
     if not _equity_no_overnight_carry_enabled(config):
         return False
@@ -797,6 +809,88 @@ def _format_slack_alert(alert: dict[str, Any]) -> str:
         return f"[Project Centaur] {level}: {summary}\n{detail}"
     return f"[Project Centaur] {level}: {summary}"
 
+def _sync_attention_alerts(context: TickContext) -> list[dict[str, Any]]:
+    alerts: list[dict[str, Any]] = []
+    risk_cfo = context.state.get("risk_cfo", {})
+    if isinstance(risk_cfo, dict):
+        for item in risk_cfo.get("rejected_candidates", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("reason", "")) == "paper_promotion_required":
+                strategy_id = str(item.get("strategy_id", "") or "")
+                profile_id = str(item.get("profile_id", "") or "")
+                approval_id = _approval_request_id(
+                    strategy_id=strategy_id,
+                    profile_id=profile_id,
+                )
+                alerts.append(
+                    _create_attention_alert(
+                        usage_ledger=context.usage_ledger,
+                        now=context.started_at,
+                        event_id=_build_attention_event_id(
+                            event_type="paper_approval_missing",
+                            strategy_id=strategy_id,
+                            profile_id=profile_id,
+                            approval_id=approval_id,
+                        ),
+                        severity="warning",
+                        event_type="paper_approval_missing",
+                        title="Broker paper blocked by missing manual approval",
+                        message=(
+                            f"{strategy_id}/{profile_id} is blocked from broker paper execution "
+                            "until manual approval exists."
+                        ),
+                        evidence_summary={
+                            "stage": "paper_candidate",
+                            "approval_command": (
+                                "python main.py --promotion-approve-paper "
+                                f"--strategy-id {strategy_id} --profile-id {profile_id} "
+                                "--max-paper-notional 10 --max-open-trades 1 "
+                                "--cooldown-minutes 60 --confirm-promotion-approval"
+                            ),
+                            "reject_command": (
+                                "python main.py --promotion-reject "
+                                f"--strategy-id {strategy_id} --profile-id {profile_id} "
+                                '--reason "manual review rejected"'
+                            ),
+                        },
+                        recommended_action="Approve or reject this request.",
+                        requires_attention=True,
+                        strategy_id=strategy_id,
+                        profile_id=profile_id,
+                        approval_request_id_value=approval_id,
+                        source="real_heartbeat",
+                    )
+                )
+                break
+    live_risk = context.state.get("live_risk_cfo", {})
+    if isinstance(live_risk, dict):
+        live_reason = str(live_risk.get("reason", "") or "")
+        if live_reason in {
+            "live_execution_disabled",
+            "live_kill_switch_on",
+            "activation_ack_missing",
+        } and int(live_risk.get("watch_candidates", 0) or 0) > 0:
+            alerts.append(
+                _create_attention_alert(
+                    usage_ledger=context.usage_ledger,
+                    now=context.started_at,
+                    event_id=_build_attention_event_id(event_type="live_execution_requested_while_disabled"),
+                    severity="critical",
+                    event_type="live_execution_requested_while_disabled",
+                    title="Live execution requested while disabled",
+                    message=(
+                        "Live proposals were present, but live execution remains disabled. "
+                        "No live trading was enabled."
+                    ),
+                    evidence_summary={"stage": "live_blocked", "reason": live_reason},
+                    recommended_action="Review live request source; keep live disabled unless explicitly approved.",
+                    requires_attention=True,
+                    source="real_heartbeat",
+                )
+            )
+    return alerts
+
 def _live_alpaca_pdt_basis_equity(context: TickContext) -> float | None:
     account_state = context.state.get("alpaca_live_account", {})
     if not isinstance(account_state, dict):
@@ -924,9 +1018,74 @@ def _build_paper_trade_approval(
             "reason": "projected_gain_too_thin",
         }
 
+    promotion = PromotionGateReport(
+        config=config,
+        usage_ledger=context.usage_ledger,
+    ).get_paper_approval(
+        strategy_id=strategy_id,
+        profile_id=str(proposal.get("profile_id", "")),
+    )
+    if promotion is None or not promotion.paper_approved:
+        return None, {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "reason": "paper_promotion_required",
+        }
+    if promotion.research_only_profile and not promotion.paper_execution_profile:
+        return None, {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "reason": "research_only_profile_not_converted_for_paper_execution",
+        }
+
     notional_usd = _notional_usd_for_broker(context, broker_id)
     if notional_usd <= 0:
         return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "qty_too_small"}
+    if (
+        promotion.max_paper_notional_usd > 0
+        and notional_usd > promotion.max_paper_notional_usd
+    ):
+        return None, {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "reason": "promotion_max_notional_exceeded",
+        }
+
+    recent_strategy_orders = [
+        item
+        for item in context.usage_ledger.list_recent_paper_trade_orders(limit=250)
+        if str(item.get("strategy_id", "")) == strategy_id
+        and str(item.get("profile_id", "")) == str(proposal.get("profile_id", ""))
+        and str(item.get("broker_id", "")).strip().lower() == broker_id
+    ]
+    latest_submitted_at = None
+    active_order_like_count = 0
+    for item in recent_strategy_orders:
+        status = str(item.get("status", "") or "").strip().lower()
+        side = str(item.get("side", "buy") or "buy").strip().lower()
+        submitted_at = _coerce_datetime(item.get("submitted_at")) or _coerce_datetime(
+            item.get("captured_at")
+        )
+        if latest_submitted_at is None or (
+            submitted_at is not None and submitted_at > latest_submitted_at
+        ):
+            latest_submitted_at = submitted_at
+        if side == "buy" and status not in {"canceled", "cancelled", "rejected"}:
+            active_order_like_count += 1
+    if promotion.cooldown_minutes > 0 and latest_submitted_at is not None:
+        minutes_since_last = (context.started_at - latest_submitted_at).total_seconds() / 60.0
+        if minutes_since_last < promotion.cooldown_minutes:
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "promotion_cooldown_active",
+            }
+    if promotion.max_open_trades > 0 and active_order_like_count >= promotion.max_open_trades:
+        return None, {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "reason": "promotion_max_open_trades_reached",
+        }
 
     try:
         adapter = get_execution_adapter(context, broker_id)
@@ -1074,12 +1233,13 @@ def _build_live_trade_approval(
     position_symbols: set[str],
     open_order_symbols: set[str],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Apply live follower entry checks without creating an independent strategy.
+    """Apply live-lane entry checks from shared proposals and `LIVE_*` dials.
 
-    Live approvals mirror paper economics but remain gated by the live broker,
-    live daily protection, activation acknowledgement, and same-paper-order
-    follower rule handled upstream. This helper only builds a candidate request
-    after those capital-preservation assumptions are still true.
+    Live approvals use the shared strategy evidence stream but are governed by
+    the live broker, live daily protection, activation acknowledgement, account
+    readiness, configured live dials, and final router guard. This helper only
+    builds a candidate request after those capital-preservation assumptions are
+    still true.
     """
     symbol = str(proposal.get("symbol", "")).upper()
     strategy_id = str(proposal.get("strategy_id", ""))
@@ -1268,7 +1428,7 @@ def _live_equity_pdt_entry_rejection(
 
     Alpaca Live can reject same-day equity exits under pattern-day-trading
     protection when prior closing equity is below the regulatory threshold.
-    Centaur's live follower must not enter an equity position unless it can
+    Centaur's live lane must not enter an equity position unless it can
     prove the account is above that threshold; existing exits still route so the
     operator can reduce exposure whenever the broker permits it.
     """
@@ -1972,6 +2132,138 @@ def _order_activity_timestamp(order: dict[str, Any]) -> float:
     except (OverflowError, OSError, ValueError):
         return 0.0
 
+def _datetime_epoch(value: datetime | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return value.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+def _bar_high_value(bar: dict[str, Any]) -> float | None:
+    return (
+        _as_float(bar.get("high_price"))
+        or _as_float(bar.get("h"))
+        or _as_float(bar.get("high"))
+    )
+
+def _bar_close_value(bar: dict[str, Any]) -> float | None:
+    return (
+        _as_float(bar.get("close_price"))
+        or _as_float(bar.get("c"))
+        or _as_float(bar.get("close"))
+    )
+
+def _bar_observed_at(bar: dict[str, Any]) -> datetime | None:
+    return _coerce_datetime(
+        bar.get("bar_timestamp")
+        or bar.get("captured_at")
+        or bar.get("timestamp")
+        or bar.get("t")
+    )
+
+def _build_exit_quality_audit(
+    *,
+    entry_reference_price: float | None,
+    exit_reference_price: float | None,
+    latest_bar: dict[str, Any],
+    bar_history: list[dict[str, Any]],
+    entry_submitted_at: datetime | None,
+    as_of: datetime,
+    exit_reason: str,
+) -> dict[str, Any]:
+    """Capture read-only exit quality evidence; never feeds the sell decision."""
+    latest_close = _bar_close_value(latest_bar)
+    latest_high = _bar_high_value(latest_bar)
+    audit: dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "audit_only_exit_quality_evidence",
+        "affects_execution": False,
+        "entry_price": entry_reference_price,
+        "exit_reference_price": exit_reference_price,
+        "latest_bar_high": latest_high,
+        "latest_bar_close": latest_close,
+        "entry_submitted_at": entry_submitted_at.isoformat() if entry_submitted_at else None,
+        "exit_evaluated_at": as_of.isoformat(),
+        "exit_reason": exit_reason,
+        "targets_pct": list(EXIT_QUALITY_TARGET_PCTS),
+        "target_touch_flags": {
+            f"{target:.2f}": False for target in EXIT_QUALITY_TARGET_PCTS
+        },
+        "quality_source": "latest_bar_and_persisted_bar_history",
+    }
+    if entry_reference_price is None or entry_reference_price <= 0:
+        audit["availability"] = "missing_entry_reference_price"
+        return audit
+
+    entry_epoch = _datetime_epoch(entry_submitted_at)
+    exit_epoch = _datetime_epoch(as_of)
+    observed: list[dict[str, Any]] = []
+    for bar in [*bar_history, latest_bar]:
+        if not isinstance(bar, dict):
+            continue
+        high = _bar_high_value(bar)
+        if high is None or high <= 0:
+            continue
+        observed_at = _bar_observed_at(bar)
+        observed_epoch = _datetime_epoch(observed_at)
+        if entry_epoch is not None and observed_epoch is not None and observed_epoch < entry_epoch:
+            continue
+        if exit_epoch is not None and observed_epoch is not None and observed_epoch > exit_epoch + 120:
+            continue
+        observed.append(
+            {
+                "high_price": high,
+                "observed_at": observed_at.isoformat() if observed_at else None,
+            }
+        )
+
+    if not observed:
+        audit["availability"] = "no_high_prices_observed"
+        return audit
+
+    best = max(observed, key=lambda item: float(item["high_price"]))
+    highest_price = float(best["high_price"])
+    max_favorable_return_pct = (
+        (highest_price - entry_reference_price) / entry_reference_price
+    ) * 100.0
+    estimated_exit_return_pct = None
+    if exit_reference_price is not None and exit_reference_price > 0:
+        estimated_exit_return_pct = (
+            (exit_reference_price - entry_reference_price) / entry_reference_price
+        ) * 100.0
+    faded_from_high_pct = None
+    if estimated_exit_return_pct is not None:
+        faded_from_high_pct = max(0.0, max_favorable_return_pct - estimated_exit_return_pct)
+
+    audit.update(
+        {
+            "availability": "observed",
+            "bars_observed": len(observed),
+            "highest_price_seen": round(highest_price, 8),
+            "highest_price_seen_at": best.get("observed_at"),
+            "max_favorable_return_pct": round(max_favorable_return_pct, 4),
+            "estimated_exit_return_pct": (
+                round(estimated_exit_return_pct, 4)
+                if estimated_exit_return_pct is not None
+                else None
+            ),
+            "faded_from_high_pct": (
+                round(faded_from_high_pct, 4)
+                if faded_from_high_pct is not None
+                else None
+            ),
+            "faded_before_exit": bool(
+                faded_from_high_pct is not None and faded_from_high_pct >= 0.05
+            ),
+            "target_touch_flags": {
+                f"{target:.2f}": bool(max_favorable_return_pct >= target)
+                for target in EXIT_QUALITY_TARGET_PCTS
+            },
+        }
+    )
+    return audit
+
 def _build_exit_order_request(
     *,
     context: TickContext,
@@ -2243,6 +2535,15 @@ def _build_exit_order_request(
         )
     except ExecutionAdapterError:
         return None, "broker_order_build_failed"
+    exit_quality_audit = _build_exit_quality_audit(
+        entry_reference_price=entry_reference_price,
+        exit_reference_price=reference_exit_price,
+        latest_bar=latest_bar,
+        bar_history=bar_history,
+        entry_submitted_at=entry_submitted_at,
+        as_of=as_of,
+        exit_reason=exit_reason,
+    )
     return (
         {
             "broker_id": broker_id,
@@ -2266,6 +2567,7 @@ def _build_exit_order_request(
             "planned_break_even_trigger_price": break_even_trigger_price,
             "planned_trailing_stop_mode": trailing_stop_mode,
             "exit_reason": exit_reason,
+            "exit_quality_audit": exit_quality_audit,
             "latest_close_price": close_price,
             "order_request": order_request,
         },

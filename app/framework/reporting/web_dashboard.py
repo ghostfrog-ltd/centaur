@@ -85,6 +85,100 @@ def run_web_dashboard(
                 )
                 return
 
+            if parsed.path == "/api/fitness-explainer":
+                self._send_json(
+                    _json_safe(
+                        _build_fitness_explainer_report(
+                            reporter=reporter,
+                        )
+                    )
+                )
+                return
+
+            if parsed.path == "/api/recent-trades":
+                hours = _bounded_int(
+                    _first_query_value(query_params, "hours"),
+                    default=24,
+                    minimum=1,
+                    maximum=168,
+                )
+                broker_id = _first_query_value(query_params, "broker_id") or "alpaca_paper"
+                self._send_json(
+                    _json_safe(
+                        reporter.build_recent_trade_session_report(
+                            broker_id=broker_id,
+                            window_hours=hours,
+                        )
+                    )
+                )
+                return
+
+            if parsed.path == "/api/profit-lock-review":
+                hours = _bounded_int(
+                    _first_query_value(query_params, "hours"),
+                    default=24,
+                    minimum=1,
+                    maximum=168,
+                )
+                broker_id = _first_query_value(query_params, "broker_id") or "alpaca_paper"
+                self._send_json(
+                    _json_safe(
+                        reporter.build_profit_lock_review_report(
+                            broker_id=broker_id,
+                            window_hours=hours,
+                        )
+                    )
+                )
+                return
+
+            if parsed.path == "/api/slot-dial-reality":
+                hours = _bounded_int(
+                    _first_query_value(query_params, "hours"),
+                    default=168,
+                    minimum=1,
+                    maximum=720,
+                )
+                broker_id = _first_query_value(query_params, "broker_id") or "alpaca_paper"
+                self._send_json(
+                    _json_safe(
+                        reporter.build_slot_dial_reality_report(
+                            broker_id=broker_id,
+                            window_hours=hours,
+                            target_win_pct=_bounded_float(
+                                _first_query_value(query_params, "target_win_pct"),
+                                default=1.6,
+                                minimum=0.01,
+                                maximum=20.0,
+                            ),
+                            loss_cap_pct=_bounded_float(
+                                _first_query_value(query_params, "loss_cap_pct"),
+                                default=0.8,
+                                minimum=0.0,
+                                maximum=20.0,
+                            ),
+                            slot_size_usd=_bounded_float(
+                                _first_query_value(query_params, "slot_size_usd"),
+                                default=10.0,
+                                minimum=0.01,
+                                maximum=10_000.0,
+                            ),
+                            estimated_trades_per_day=_bounded_float(
+                                _first_query_value(query_params, "trades_per_day"),
+                                default=100.0,
+                                minimum=0.1,
+                                maximum=1_000.0,
+                            ),
+                            estimated_losses_per_day=_bounded_float(
+                                _first_query_value(query_params, "losses_per_day"),
+                                default=50.0,
+                                minimum=0.0,
+                                maximum=1_000.0,
+                            ),
+                        )
+                    )
+                )
+                return
+
             if parsed.path == "/healthz":
                 self._send_json(
                     {
@@ -150,6 +244,20 @@ def _bounded_int(
 ) -> int:
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _bounded_float(
+    value: str,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
@@ -237,7 +345,7 @@ def _build_score_impact_report(
             "paper": _compact_protection(_as_dict(tick_state.get("daily_protection"))),
             "live": _compact_protection(_as_dict(tick_state.get("live_daily_protection"))),
             "paper_cfo": _compact_cfo(_as_dict(tick_state.get("risk_cfo"))),
-            "live_cfo": _compact_cfo(_as_dict(tick_state.get("risk_live_cfo"))),
+            "live_cfo": _compact_cfo(_as_dict(tick_state.get("live_risk_cfo"))),
         },
         "health": health,
         "observed": {
@@ -259,6 +367,178 @@ def _build_score_impact_report(
             "Suppressed near-miss signals are available only in bounded tick diagnostics, "
             "so historical counts do not claim to reconstruct every suppressed signal."
         ),
+    }
+
+
+def _build_fitness_explainer_report(
+    *,
+    reporter: StatusReporter,
+) -> dict[str, Any]:
+    ledger = reporter.usage_ledger
+    latest_tick = _as_dict(ledger.get_latest_tick_run())
+    tick_state = _as_dict(latest_tick.get("state_snapshot_json"))
+    strategy_state = _as_dict(tick_state.get("strategy_signals"))
+    allocation_state = _as_dict(strategy_state.get("allocation"))
+    threshold_state = _as_dict(strategy_state.get("threshold_adaptive"))
+    raw_signals = _as_list(strategy_state.get("raw_signal_preview"))
+    suppressed_signals = _as_list(strategy_state.get("suppressed_signal_preview"))
+    latest_fitness = ledger.list_latest_strategy_fitness_snapshots(limit=24)
+    min_checkpoints = int(reporter.config.strategy_allocation_min_checkpoints)
+    favor_threshold = float(reporter.config.strategy_allocation_favor_threshold)
+    equity_suppress_threshold = float(
+        threshold_state.get(
+            "effective_threshold",
+            reporter.config.strategy_allocation_suppress_threshold,
+        )
+        or reporter.config.strategy_allocation_suppress_threshold
+    )
+    crypto_suppress_threshold = float(
+        reporter.config.strategy_allocation_crypto_suppress_threshold
+    )
+    explained_rows = [
+        _explain_fitness_row(
+            row=dict(row),
+            min_checkpoints=min_checkpoints,
+            favor_threshold=favor_threshold,
+            equity_suppress_threshold=equity_suppress_threshold,
+            crypto_suppress_threshold=crypto_suppress_threshold,
+        )
+        for row in latest_fitness
+    ]
+    suppressed_count = sum(1 for row in explained_rows if row.get("fitness_band") == "suppressed")
+    favored_count = sum(1 for row in explained_rows if row.get("fitness_band") == "favored")
+    weighted_count = sum(1 for row in explained_rows if row.get("fitness_band") == "weighted")
+    unproven_count = sum(1 for row in explained_rows if row.get("fitness_band") == "unproven")
+    return {
+        "ok": True,
+        "checked_at": datetime.now().astimezone().isoformat(),
+        "backend": ledger.backend,
+        "backend_detail": ledger.backend_detail,
+        "runtime": {
+            "mode": reporter.config.centaur_mode,
+            "environment": reporter.config.centaur_environment,
+        },
+        "config": {
+            "strategy_fitness_lookback_days": reporter.config.strategy_fitness_lookback_days,
+            "strategy_fitness_min_checkpoints": reporter.config.strategy_fitness_min_checkpoints,
+            "strategy_allocation_min_checkpoints": min_checkpoints,
+            "strategy_allocation_favor_threshold": favor_threshold,
+            "strategy_allocation_suppress_threshold": equity_suppress_threshold,
+            "strategy_allocation_crypto_suppress_threshold": crypto_suppress_threshold,
+            "paper_min_signal_score_to_trade": reporter.config.paper_min_signal_score_to_trade,
+            "live_min_signal_score_to_trade": reporter.config.live_min_signal_score_to_trade,
+            "paper_allowed_strategies": reporter.config.paper_execution_allowed_strategies,
+            "live_allowed_strategies": reporter.config.live_execution_allowed_strategies,
+        },
+        "formula": {
+            "checkpoint_fitness": "realized_return_pct / effective_risk_pct * 50, clipped to -100..100; ambiguous same-bar outcomes score 0",
+            "composite_fitness": "((avg_checkpoint_fitness * 0.65) + (((win_rate * 100) - 50) * 0.6) + (avg_realized_return_pct * 4)) * sample_weight",
+            "sample_weight": "min(1.0, checkpoints_evaluated / 12); small samples are deliberately damped",
+            "allocation_bonus": "composite fitness only nudges display ranking by at most +/-8 points; it cannot create a trade",
+        },
+        "evidence_chain": [
+            {
+                "stage": "Market bars",
+                "data": "stored historical/latest bars with source, symbol, timestamp, movement, volume, and price",
+                "role": "forms candidate discovery and technical context",
+            },
+            {
+                "stage": "Strategy signals",
+                "data": "deterministic strategy score, confidence, stop, target, holding window, asset class",
+                "role": "creates a candidate proposal shape; no Gemini needed",
+            },
+            {
+                "stage": "Shadow outcomes",
+                "data": "15m/1h/1d/7d checkpoint returns, target hits, stop hits, max favorable/adverse movement",
+                "role": "turns old/current observations into evidence about similar strategy/window setups",
+            },
+            {
+                "stage": "Fitness summary",
+                "data": "aggregated shadow outcomes by strategy, asset class, and holding-window checkpoint",
+                "role": "computes composite fitness and sample weight",
+            },
+            {
+                "stage": "Allocation gate",
+                "data": "current signal plus matching strategy/window fitness summary and configured thresholds",
+                "role": "marks the signal unproven, weighted, favored, suppressed, or score-to-trade",
+            },
+            {
+                "stage": "CFO/risk/execution",
+                "data": "market hours, drawdown, slots, open orders, projected gain, broker constraints",
+                "role": "final capital-preservation gates; fitness alone is never enough",
+            },
+        ],
+        "latest_tick": {
+            "tick_id": latest_tick.get("tick_id"),
+            "started_at": latest_tick.get("started_at"),
+            "ended_at": latest_tick.get("ended_at"),
+            "signals_in": allocation_state.get("signals_in"),
+            "signals_out": allocation_state.get("signals_out"),
+            "suppressed": allocation_state.get("suppressed"),
+            "favored": allocation_state.get("favored"),
+            "weighted": allocation_state.get("weighted"),
+            "unproven": allocation_state.get("unproven"),
+            "score_to_trade": allocation_state.get("high_score_overrides"),
+            "threshold_state": threshold_state,
+            "raw_signal_preview": raw_signals[:12],
+            "suppressed_signal_preview": suppressed_signals[:12],
+        },
+        "latest_fitness": {
+            "rows": explained_rows,
+            "summary": {
+                "rows": len(explained_rows),
+                "suppressed": suppressed_count,
+                "weighted": weighted_count,
+                "favored": favored_count,
+                "unproven": unproven_count,
+            },
+        },
+        "decision_rule": (
+            "A setup is fit enough for allocation only when it has enough matching checkpoints "
+            "and its composite fitness is above the active asset suppress threshold. It is favored "
+            "only above the favor threshold. It still must pass score, CFO, risk, broker, slot, "
+            "market-hours, drawdown, and execution gates."
+        ),
+    }
+
+
+def _explain_fitness_row(
+    *,
+    row: dict[str, Any],
+    min_checkpoints: int,
+    favor_threshold: float,
+    equity_suppress_threshold: float,
+    crypto_suppress_threshold: float,
+) -> dict[str, Any]:
+    row = {
+        key: value
+        for key, value in row.items()
+        if key not in {"raw_json"}
+    }
+    asset_class = str(row.get("asset_class") or "").strip().lower()
+    composite = _to_float(row.get("composite_fitness_score"))
+    checkpoints = int(row.get("checkpoints_evaluated", 0) or 0)
+    threshold = crypto_suppress_threshold if asset_class == "crypto" else equity_suppress_threshold
+    if checkpoints < min_checkpoints:
+        band = "unproven"
+        reason = f"Only {checkpoints} checkpoints; allocation needs at least {min_checkpoints}."
+    elif composite is None:
+        band = "unproven"
+        reason = "No composite fitness score was available for this row."
+    elif composite <= threshold:
+        band = "suppressed"
+        reason = f"Composite {composite:.2f} is at or below the {asset_class or 'equity'} suppress threshold {threshold:.2f}."
+    elif composite >= favor_threshold:
+        band = "favored"
+        reason = f"Composite {composite:.2f} is at or above the favor threshold {favor_threshold:.2f}."
+    else:
+        band = "weighted"
+        reason = f"Composite {composite:.2f} is above suppress threshold {threshold:.2f} but below favor threshold {favor_threshold:.2f}."
+    return {
+        **row,
+        "active_suppress_threshold": threshold,
+        "fitness_band": band,
+        "fitness_reason": reason,
     }
 
 
@@ -1004,6 +1284,7 @@ def _render_live_execution_intelligence(overview: dict[str, Any]) -> list[str]:
             f"mode={overview.get('mode', 'unknown')}"
             f" | strategy_brain={overview.get('strategy_intelligence', 'unknown')}"
             f" | independent_live_strategy_fitness={'yes' if overview.get('live_independent_strategy_fitness') else 'no'}"
+            f" | independent_live_proposal_decision={'yes' if overview.get('live_independent_proposal_decision') else 'no'}"
         ),
         (
             "recent order-ledger sample"

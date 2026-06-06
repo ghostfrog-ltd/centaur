@@ -115,8 +115,8 @@ def _adapter_records(*, config: RuntimeConfig | None = None) -> list[AdapterReco
             provider_id="alpaca_live",
             status="active_bridge",
             implementation="BrokerExecutionAdapter -> AlpacaLiveBrokerAdapter",
-            behavior="same-as-paper live follower order planning, submit, cancel",
-            activation_rule="explicit 2026-05-29 go-live envelope plus LiveRiskGuard",
+            behavior="independent LIVE_* lane order planning, submit, cancel",
+            activation_rule="live proposal/risk gates plus LiveRiskGuard",
         ),
         AdapterRecord(
             adapter_type="broker_account",

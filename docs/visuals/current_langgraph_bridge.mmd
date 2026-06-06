@@ -46,27 +46,29 @@ flowchart TD
   n21 --> n22
   n23["market.scan"]
   n22 --> n23
-  n24["context.enrichment"]
+  n24["slow.enrichment_queue"]
   n23 --> n24
-  n25["strategy.signals"]
+  n25["context.enrichment"]
   n24 --> n25
-  n26["analysis.gemini"]
+  n26["strategy.signals"]
   n25 --> n26
-  n27["shadow.proposals"]
+  n27["analysis.gemini"]
   n26 --> n27
-  n28["risk.cfo"]
+  n28["shadow.proposals"]
   n27 --> n28
-  n29["execution.paper"]
+  n29["risk.cfo"]
   n28 --> n29
-  n30["risk.live_cfo"]
+  n30["execution.paper"]
   n29 --> n30
-  n31["execution.live"]
+  n31["risk.live_cfo"]
   n30 --> n31
-  n32["evaluation.post_trade"]
+  n32["execution.live"]
   n31 --> n32
-  n33["notifications.slack"]
+  n33["evaluation.post_trade"]
   n32 --> n33
+  n34["notifications.slack"]
+  n33 --> n34
   done(["heartbeat complete"])
-  n33 --> done
+  n34 --> done
   classDef typed fill:#eef7f4,stroke:#28705f,color:#10231f
-  class n01,n02,n03,n04,n05,n06,n07,n08,n09,n10,n11,n12,n13,n14,n15,n16,n17,n18,n19,n20,n21,n22,n23,n24,n25,n26,n27,n28,n29,n30,n31,n32,n33 typed
+  class n01,n02,n03,n04,n05,n06,n07,n08,n09,n10,n11,n12,n13,n14,n15,n16,n17,n18,n19,n20,n21,n22,n23,n24,n25,n26,n27,n28,n29,n30,n31,n32,n33,n34 typed

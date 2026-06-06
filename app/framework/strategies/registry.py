@@ -11,6 +11,8 @@ from .base import (
     StrategySignal,
 )
 from .crypto_momentum import CryptoMomentumStrategy
+from .crypto_pullback import CryptoPullbackStrategy
+from .crypto_research import CryptoResearchStrategy
 from .liquidity_probe import LiquidityProbeStrategy
 from .mean_reversion import MeanReversionStrategy
 from .momentum import MomentumStrategy
@@ -33,6 +35,24 @@ def evaluate_strategies(
         profiles = strategy.build_profiles(config)
         profile_count += len(profiles)
         for profile in profiles:
+            if _profile_should_report_no_fresh_market_data(
+                profile=profile,
+                market_context=evaluation_context,
+            ):
+                rejection_events.append(
+                    {
+                        "strategy_id": profile.strategy_id,
+                        "strategy_family": profile.family,
+                        "profile_id": profile.profile_id,
+                        "reason": "strategy.skipped_no_fresh_market_data",
+                        "symbol": "",
+                        "asset_class": ",".join(profile.asset_classes),
+                        "canonical_instrument_id": "",
+                        "metrics": {
+                            "required_asset_classes": list(profile.asset_classes),
+                        },
+                    }
+                )
             signals.extend(
                 strategy.evaluate_profile(
                     profile=profile,
@@ -60,8 +80,30 @@ def build_strategy_registry() -> list[StrategyDefinition]:
         MomentumVolatilityBreakoutStrategy(),
         MeanReversionStrategy(),
         CryptoMomentumStrategy(),
+        CryptoPullbackStrategy(),
+        CryptoResearchStrategy(),
         LiquidityProbeStrategy(),
     ]
+
+
+def _profile_should_report_no_fresh_market_data(
+    *,
+    profile: StrategyProfile,
+    market_context: dict[str, Any],
+) -> bool:
+    fresh_sources = market_context.get("market_data_source_used_for_strategy", {})
+    if not isinstance(fresh_sources, dict):
+        fresh_sources = {}
+    stale_exclusions = market_context.get("candidates_excluded_due_to_stale_source_by_asset_class", {})
+    if not isinstance(stale_exclusions, dict):
+        stale_exclusions = {}
+    any_required_asset_is_fresh = any(
+        str(fresh_sources.get(asset_class, "")).strip()
+        for asset_class in profile.asset_classes
+    )
+    if any_required_asset_is_fresh:
+        return False
+    return any(int(stale_exclusions.get(asset_class, 0) or 0) > 0 for asset_class in profile.asset_classes)
 
 
 def _summarize_rejections(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -113,6 +155,8 @@ def _summarize_rejections(events: list[dict[str, Any]]) -> dict[str, Any]:
 
 __all__ = [
     "CryptoMomentumStrategy",
+    "CryptoPullbackStrategy",
+    "CryptoResearchStrategy",
     "LiquidityProbeStrategy",
     "MeanReversionStrategy",
     "MomentumStrategy",

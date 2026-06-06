@@ -68,7 +68,7 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
         self.assertEqual(result["orders_submitted"], 0)
         self.assertEqual(result["intended_orders"], 1)
 
-    def test_live_entry_follow_blocks_when_existing_live_position_lacks_plan(self) -> None:
+    def test_independent_live_entry_blocks_when_existing_live_position_lacks_plan(self) -> None:
         context = TickContext(
             tick_id="test",
             started_at=datetime.now().astimezone(),
@@ -154,6 +154,115 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
         self.assertEqual(result["reason"], "unmanaged_live_positions_present")
         self.assertEqual(result["approved_trades"], 0)
         self.assertEqual(result["unmanaged_live_positions"], ["AMZN"])
+
+    def test_live_crypto_entry_uses_live_dials_without_submitted_paper_order(self) -> None:
+        class FakeExecutionAdapter:
+            def validate_entry_constraints(self, **_kwargs):
+                return None
+
+            def build_entry_order_request(self, **kwargs):
+                proposal = kwargs["proposal"]
+                return {
+                    "symbol": proposal["symbol"],
+                    "side": "buy",
+                    "type": "limit",
+                    "time_in_force": "ioc",
+                    "notional": str(kwargs["notional_usd"]),
+                    "client_order_id": kwargs["client_order_id"],
+                }
+
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime.now().astimezone(),
+            config=SimpleNamespace(
+                centaur_mode="live",
+                centaur_environment="live",
+                live_execution_enabled=True,
+                live_execution_kill_switch=False,
+                alpaca_live_api_configured=True,
+                live_execution_activation_ack="LIVE_TRADING_APPROVED",
+                live_execution_allowed_strategies=("crypto_momentum.trend",),
+                live_execution_max_open_positions=10,
+                live_execution_default_notional_usd=10.0,
+                live_execution_max_orders_per_tick=1,
+                live_execution_equity_only=False,
+                live_execution_require_market_open=True,
+                live_execution_equity_broker_id="alpaca_live",
+                live_execution_crypto_broker_id="alpaca_live",
+                live_execution_min_projected_gain_pct=0.015,
+                live_execution_crypto_min_projected_gain_pct=0.02,
+                live_execution_limit_buffer_bps=5.0,
+                live_execution_crypto_limit_buffer_bps=25.0,
+            ),
+            usage_ledger=SimpleNamespace(
+                get_first_paper_trade_order=lambda **_kwargs: None,
+                list_recent_execution_lane_trade_orders=lambda **_kwargs: [],
+            ),
+            state={
+                "market_gate": {
+                    "account_trade_ready": True,
+                    "reason": "crypto_open",
+                    "market_open": False,
+                    "crypto_scan_ready": True,
+                },
+                "live_daily_protection": {"system_status": "active"},
+                "risk_cfo": {"approved_order_requests": []},
+                "execution": {"orders": []},
+                "shadow_trade_proposals": {
+                    "proposals": [
+                        {
+                            "proposal_id": "crypto-proposal-1",
+                            "symbol": "BTC/USD",
+                            "asset_class": "crypto",
+                            "direction": "long",
+                            "strategy_id": "crypto_momentum.trend",
+                            "strategy_family": "crypto_momentum",
+                            "profile_id": "crypto_momentum.trend",
+                            "source": "shadow",
+                            "entry_price": 100.0,
+                            "stop_loss_price": 99.0,
+                            "target_price": 103.0,
+                        }
+                    ]
+                },
+                "alpaca_live_account": {
+                    "summary": {
+                        "status": "ACTIVE",
+                        "equity": 131.0,
+                        "trading_blocked": False,
+                        "account_blocked": False,
+                        "trade_suspended_by_user": False,
+                    },
+                    "raw": {},
+                },
+                "alpaca_live_positions": {
+                    "summary": {"open_positions": 0, "symbols": []},
+                    "raw": [],
+                },
+                "alpaca_live_orders": {
+                    "summary": {"open_orders": 0, "open_order_symbols": []},
+                    "raw": [],
+                },
+                "fx_gbp_reference": {"usd_to_gbp": 0.75},
+            },
+        )
+        original = pipelines.get_execution_adapter
+        pipelines.get_execution_adapter = lambda _context, _broker_id: FakeExecutionAdapter()
+        try:
+            result = pipelines.live_risk_cfo_gate(context)
+        finally:
+            pipelines.get_execution_adapter = original
+
+        self.assertEqual(result["decision"], "submit_live")
+        self.assertEqual(result["reason"], "live_trade_approved")
+        self.assertEqual(result["decision_policy"], "independent_live_env_dials")
+        self.assertEqual(result["watch_candidates"], 1)
+        self.assertEqual(result["submitted_paper_follow_candidates"], 0)
+        self.assertEqual(result["approved_trades"], 1)
+        approval = context.state["live_risk_cfo"]["approved_order_requests"][0]
+        self.assertEqual(approval["broker_id"], "alpaca_live")
+        self.assertEqual(approval["asset_class"], "crypto")
+        self.assertEqual(approval["notional_usd"], 10.0)
 
     def test_trading212_paper_sync_skips_without_credentials(self) -> None:
         context = TickContext(
@@ -345,6 +454,26 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
                     "client_order_id": kwargs["client_order_id"],
                 }
 
+        class FakeUsageLedger:
+            def get_strategy_promotion(self, *, strategy_id: str, profile_id: str):
+                if strategy_id != "mean_reversion.snapback" or profile_id != "":
+                    return None
+                return {
+                    "strategy_id": strategy_id,
+                    "profile_id": profile_id,
+                    "stage": "paper_approved",
+                    "paper_approved": True,
+                    "live_approved": False,
+                    "max_paper_notional_usd": 50.0,
+                    "max_open_trades": 2,
+                    "cooldown_minutes": 0,
+                    "paper_execution_profile": True,
+                    "research_only_profile": False,
+                }
+
+            def list_recent_paper_trade_orders(self, *, limit: int = 250):
+                return []
+
         context = TickContext(
             tick_id="test",
             started_at=datetime(2026, 6, 2, 12, 0, tzinfo=ZoneInfo("Europe/London")),
@@ -357,7 +486,7 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
                 trading212_paper_default_notional_native=10.0,
                 paper_execution_equity_broker_id="alpaca_paper",
             ),
-            usage_ledger=SimpleNamespace(),
+            usage_ledger=FakeUsageLedger(),
             state={"fx_gbp_reference": {"usd_to_gbp": 0.8}},
         )
         proposal = {
@@ -529,6 +658,79 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
 
         self.assertIsNone(skip_reason)
         self.assertIsNotNone(exit_request)
+        self.assertEqual(exit_request["exit_reason"], "equity_no_overnight_carry")
+
+    def test_equity_flatten_normalizes_alpaca_us_equity_asset_class(self) -> None:
+        class FakeExecutionAdapter:
+            def build_exit_order_request(self, **kwargs):
+                return {
+                    "symbol": kwargs["symbol"],
+                    "side": "sell",
+                    "qty": kwargs["qty"],
+                    "client_order_id": kwargs["client_order_id"],
+                }
+
+        context = TickContext(
+            tick_id="test",
+            started_at=datetime(2026, 6, 2, 15, 58, tzinfo=ZoneInfo("America/New_York")),
+            config=SimpleNamespace(
+                market_timezone="America/New_York",
+                paper_execution_equity_no_weekend_carry_enabled=True,
+                paper_execution_equity_friday_flatten_minutes_before_close=5,
+                paper_execution_profit_capture_pct=0.0125,
+            ),
+            usage_ledger=SimpleNamespace(),
+            state={
+                "market_gate": {"next_close": "2026-06-02T16:00:00-04:00"},
+                "fx_gbp_reference": {},
+            },
+        )
+        original = heartbeat_support.get_execution_adapter
+        heartbeat_support.get_execution_adapter = lambda _context, _broker_id: FakeExecutionAdapter()
+        try:
+            exit_request, skip_reason = heartbeat_support._build_exit_order_request(
+                context=context,
+                tick_id="test",
+                position={"symbol": "AMD", "qty": "0.1", "current_price": "99"},
+                entry_order={
+                    "order_id": "entry-1",
+                    "broker_id": "alpaca_paper",
+                    "symbol": "AMD",
+                    "asset_class": "us_equity",
+                    "strategy_id": "mean_reversion.snapback",
+                    "submitted_at": datetime(
+                        2026,
+                        6,
+                        2,
+                        15,
+                        0,
+                        tzinfo=ZoneInfo("America/New_York"),
+                    ),
+                    "filled_avg_price": 100.0,
+                    "raw_json": {
+                        "planned_stop_loss_price": 95.0,
+                        "planned_take_profit_price": 110.0,
+                        "planned_managed_exit_policy": "profit_after_1h_else_1d",
+                        "planned_profit_exit_window_minutes": 60,
+                        "planned_max_hold_window_minutes": 1440,
+                    },
+                },
+                latest_bar={
+                    "t": "2026-06-02T15:58:00-04:00",
+                    "l": 98.0,
+                    "h": 100.0,
+                    "c": 99.0,
+                },
+                bar_history=[],
+                as_of=context.started_at,
+                limit_buffer_bps=5.0,
+            )
+        finally:
+            heartbeat_support.get_execution_adapter = original
+
+        self.assertIsNone(skip_reason)
+        self.assertIsNotNone(exit_request)
+        self.assertEqual(exit_request["asset_class"], "us_equity")
         self.assertEqual(exit_request["exit_reason"], "equity_no_overnight_carry")
 
     def test_paper_exit_management_flattens_unmanaged_equity_near_close(self) -> None:
@@ -1015,7 +1217,15 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
                     "h": 100.6,
                     "c": 100.5,
                 },
-                bar_history=[],
+                bar_history=[
+                    {
+                        "bar_timestamp": (
+                            started_at - timedelta(minutes=5)
+                        ).isoformat(),
+                        "high_price": 101.8,
+                        "close_price": 101.2,
+                    }
+                ],
                 as_of=started_at,
                 limit_buffer_bps=5.0,
             )
@@ -1027,6 +1237,15 @@ class RuntimeLiveBoundaryTests(unittest.TestCase):
         self.assertEqual(exit_request["exit_reason"], "profit_capture_hit")
         self.assertEqual(exit_request["planned_profit_capture_pct"], 0.005)
         self.assertEqual(exit_request["planned_profit_capture_price"], 100.5)
+        audit = exit_request["exit_quality_audit"]
+        self.assertFalse(audit["affects_execution"])
+        self.assertEqual(audit["availability"], "observed")
+        self.assertEqual(audit["highest_price_seen"], 101.8)
+        self.assertEqual(audit["max_favorable_return_pct"], 1.8)
+        self.assertEqual(audit["estimated_exit_return_pct"], 0.5)
+        self.assertEqual(audit["faded_from_high_pct"], 1.3)
+        self.assertTrue(audit["target_touch_flags"]["1.75"])
+        self.assertFalse(audit["target_touch_flags"]["2.00"])
 
     def test_current_profit_capture_overrides_stale_entry_target(self) -> None:
         class FakeExecutionAdapter:

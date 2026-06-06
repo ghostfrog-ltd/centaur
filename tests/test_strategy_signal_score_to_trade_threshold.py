@@ -18,10 +18,14 @@ class StrategySignalScoreToTradeThresholdTests(unittest.TestCase):
                 strategy_allocation_suppress_threshold=-8.9,
                 paper_execution_enabled=True,
                 paper_execution_kill_switch=False,
+                live_execution_enabled=True,
+                live_execution_kill_switch=False,
                 paper_min_signal_score_to_trade=91.0,
                 live_min_signal_score_to_trade=97.0,
                 paper_execution_high_score_override_fitness_margin=0.25,
-                paper_execution_allowed_strategies=("mean_reversion.snapback",),
+                live_execution_high_score_override_fitness_margin=0.75,
+                paper_execution_allowed_strategies=("paper.strategy",),
+                live_execution_allowed_strategies=("live.strategy",),
             ),
             state={
                 "context_enrichment": {"candidates": [{"symbol": "AAPL"}]},
@@ -34,15 +38,15 @@ class StrategySignalScoreToTradeThresholdTests(unittest.TestCase):
             ),
         )
 
-    def test_paper_and_live_thresholds_are_selected_from_their_own_env_knobs(self) -> None:
+    def test_paper_and_live_disable_score_override_even_when_knobs_exist(self) -> None:
         module = importlib.import_module(
-            "app.heartbeat.steps.25_strategy_signals.implementation.main"
+            "app.heartbeat.steps.26_strategy_signals.implementation.main"
         )
         original_evaluate = module.evaluate_strategies
         original_allocate = module.allocate_strategy_signals
         original_advisor = module.ThresholdAdvisor
         original_thresholds = module._paper_allocation_suppress_thresholds
-        thresholds: list[float | None] = []
+        score_to_trade_calls: list[dict[str, object]] = []
 
         class Signal:
             def as_dict(self, *, tick_id: str) -> dict[str, object]:
@@ -71,7 +75,19 @@ class StrategySignalScoreToTradeThresholdTests(unittest.TestCase):
             )
 
         def allocate_strategy_signals(**kwargs: object) -> tuple[list[dict[str, object]], dict[str, object]]:
-            thresholds.append(kwargs.get("high_score_override_min_score"))
+            if "high_score_override_min_score" in kwargs:
+                score_to_trade_calls.append(
+                    {
+                        "enabled": kwargs.get("high_score_override_enabled"),
+                        "min_score": kwargs.get("high_score_override_min_score"),
+                        "fitness_margin": kwargs.get(
+                            "high_score_override_fitness_margin"
+                        ),
+                        "allowed_strategies": kwargs.get(
+                            "high_score_override_allowed_strategies"
+                        ),
+                    }
+                )
             return (
                 list(kwargs["signals"]),
                 {
@@ -97,7 +113,23 @@ class StrategySignalScoreToTradeThresholdTests(unittest.TestCase):
             module.ThresholdAdvisor = original_advisor
             module._paper_allocation_suppress_thresholds = original_thresholds
 
-        self.assertEqual(thresholds, [None, 91.0, None, 97.0])
+        self.assertEqual(
+            score_to_trade_calls,
+            [
+                {
+                    "enabled": False,
+                    "min_score": 91.0,
+                    "fitness_margin": 0.25,
+                    "allowed_strategies": set(),
+                },
+                {
+                    "enabled": False,
+                    "min_score": 97.0,
+                    "fitness_margin": 0.75,
+                    "allowed_strategies": set(),
+                },
+            ],
+        )
 
 
 if __name__ == "__main__":

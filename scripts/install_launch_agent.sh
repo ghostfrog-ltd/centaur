@@ -10,6 +10,7 @@ WRAPPER_DIR="$HOME/.centaur"
 WRAPPER_TARGET="$WRAPPER_DIR/run_control_tick.sh"
 WRAPPER_LOG="$HOME/centaur_control_wrapper.log"
 RUNTIME_DIR="$WRAPPER_DIR/runtime"
+HEARTBEAT_INTERVAL_SECONDS="${CENTAUR_HEARTBEAT_INTERVAL_SECONDS:-10}"
 
 mkdir -p "$LAUNCH_AGENTS_DIR"
 mkdir -p "$WRAPPER_DIR"
@@ -24,8 +25,11 @@ echo "[$(date)] Wrapper starting..." >> "$LOGFILE"
 
 PROJECT_ROOT="/Volumes/Bob/www/ghostfrog-centaur"
 RUNTIME_DIR="$HOME/.centaur/runtime"
+HEARTBEAT_INTERVAL_SECONDS="${CENTAUR_HEARTBEAT_INTERVAL_SECONDS:-10}"
 PROJECT_LOG="$RUNTIME_DIR/control_tick.log"
+PROJECT_ENV_FILE="$PROJECT_ROOT/.env"
 LOCK_DIR="/tmp/ghostfrog-centaur-control.lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
 WAIT_RETRIES=30
 WAIT_SECONDS=2
 
@@ -93,22 +97,33 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "[$(date)] Skip: previous control tick is still running." >> "$LOGFILE"
-  exit 0
+  if [ -r "$LOCK_PID_FILE" ]; then
+    existing_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+      echo "[$(date)] Existing Centaur heartbeat service is still running with pid $existing_pid." >> "$LOGFILE"
+      exit 0
+    fi
+  fi
+  echo "[$(date)] Removing stale Centaur heartbeat lock at $LOCK_DIR." >> "$LOGFILE"
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR"
 fi
+echo "$$" > "$LOCK_PID_FILE"
 
 cleanup() {
-  rmdir "$LOCK_DIR"
+  rm -f "$LOCK_PID_FILE"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM
 
-echo "[$(date)] Found $TARGET, executing Centaur control tick with runtime log $PROJECT_LOG..." >> "$LOGFILE"
+echo "[$(date)] Found $TARGET, starting Centaur heartbeat service interval=${HEARTBEAT_INTERVAL_SECONDS}s with runtime log $PROJECT_LOG..." >> "$LOGFILE"
+echo "[$(date)] Working directory=$PROJECT_ROOT | dotenv_path=$PROJECT_ENV_FILE | dotenv_loaded_by=python_startup" >> "$LOGFILE"
 set +e
-"$TARGET" "$PROJECT_ROOT/main.py" >> "$PROJECT_LOG" 2>> "$LOGFILE"
+"$TARGET" "$PROJECT_ROOT/main.py" --heartbeat-service --interval-seconds "$HEARTBEAT_INTERVAL_SECONDS" >> "$PROJECT_LOG" 2>> "$LOGFILE"
 status=$?
 set -e
-echo "[$(date)] Centaur control tick exited with status $status" >> "$LOGFILE"
+echo "[$(date)] Centaur heartbeat service exited with status $status" >> "$LOGFILE"
 exit "$status"
 EOF
 chmod +x "$WRAPPER_TARGET"
@@ -122,5 +137,6 @@ launchctl kickstart -k "gui/$(id -u)/com.ghostfrog.centaur.control"
 
 echo "Installed launch agent: $PLIST_TARGET"
 echo "Installed wrapper: $WRAPPER_TARGET"
+echo "Heartbeat interval: ${HEARTBEAT_INTERVAL_SECONDS}s"
 echo "Wrapper log: $WRAPPER_LOG"
 echo "Runtime log: $RUNTIME_DIR/control_tick.log"

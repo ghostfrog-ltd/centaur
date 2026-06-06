@@ -163,6 +163,18 @@ class EvidenceReport:
                 "action_rule": "no managed-exit change without explicit override",
             },
             {
+                "name": "Profit-lock learning advice",
+                "mode": "recommendation_only_exit_learning",
+                "source": "/profit-lock-review.php and /api/profit_lock_review.php",
+                "action_rule": "machine-readable advice has no execution authority until explicitly approved",
+            },
+            {
+                "name": "Exit-quality audit trail",
+                "mode": "audit_only_exit_learning",
+                "source": "paper_trade_orders.raw_json.exit_quality_audit",
+                "action_rule": "review max favorable return and target touches before changing profit capture",
+            },
+            {
                 "name": "Threshold GA advice",
                 "mode": "recommendation_or_guarded_paper_rails",
                 "source": "--threshold-advice and adaptive threshold state",
@@ -189,8 +201,8 @@ class EvidenceReport:
             {
                 "name": "Live execution intelligence",
                 "mode": "read_only_monitor",
-                "source": "status/dashboard live-vs-paper follower diagnostics",
-                "action_rule": "live still follows same-tick submitted paper orders only",
+                "source": "status/dashboard live lane diagnostics",
+                "action_rule": "live decisions must cite LIVE_* dials and final guard outcomes",
             },
             {
                 "name": "Execution router intents",

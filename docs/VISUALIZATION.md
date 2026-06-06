@@ -22,11 +22,9 @@ node ownership surface.
 
 - `docs/visuals/entry_decision_funnel.mmd`
   - Hand-authored conceptual graph.
-  - Shows the current entry path from configured symbols to candidates, signals,
-    fitness allocation, CFO approval, paper execution, and the same-as-paper
-    live follower gate. This should be updated when the 2026-06-04 target
-    design is implemented: shared evidence/signals feeding independent paper
-    and live lanes that obey `PAPER_*` and `LIVE_*` `.env` dials respectively.
+  - Shows the entry path from configured symbols to candidates, signals,
+    fitness allocation, paper execution, and the independent live lane. Paper
+    obeys `PAPER_*`; live obeys `LIVE_*`.
 
 - `TICK_DECISION_FLOW.md`
   - Plain-English guide with inline Mermaid diagrams and code references.

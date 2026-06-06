@@ -2,16 +2,98 @@
 
 This file records important decisions so the project does not depend on chat memory alone.
 
-Last updated: 2026-06-04
+Last updated: 2026-06-05
+
+## 2026-06-05
+
+### Add Shadow-Only Crypto Research Profiles
+Decision:
+- add `crypto_research.dip_rebound` and `crypto_research.range_breakout` to the strategy registry for evidence collection
+- keep both profiles out of `PAPER_EXECUTION_ALLOWED_STRATEGIES` and `LIVE_EXECUTION_ALLOWED_STRATEGIES`
+- reuse existing strategy signal, proposal, fitness, and reporting surfaces rather than creating a separate execution lane
+
+Why:
+- the current approved crypto execution strategy has produced very little and weak paper evidence
+- additional crypto patterns can be studied without silently widening broker routing, notional, slots, daily protection, or live behaviour
+
+Safety:
+- the profiles are crypto-only, long-only, identity-gated, and use volume/spread/spike-style controls from existing crypto settings
+- they are observe-only until a separate review explicitly approves execution
 
 ## 2026-06-04
 
-### Set independent live lane as the target design
+### Use Lane-Specific Score-To-Trade Controls
 Decision:
-- by operator clarification, set the target live architecture to follow the active `.env` live dials exactly rather than blindly copying paper
+- keep shared strategy-fitness evidence, but choose score-to-trade override inputs from the active lane before fitness suppression removes signals
+- paper allocation uses paper execution enable/kill-switch state, `PAPER_MIN_SIGNAL_SCORE_TO_TRADE`, paper override margin, and `PAPER_EXECUTION_ALLOWED_STRATEGIES`
+- live/live-dry allocation uses live execution enable/kill-switch state, `LIVE_MIN_SIGNAL_SCORE_TO_TRADE`, live override margin, and `LIVE_EXECUTION_ALLOWED_STRATEGIES`
+- update current documentation to reflect the active `.env` score-to-trade dials: paper `96`, live `96`
+
+Why:
+- live is now an independent lane over shared evidence/signals, so pre-CFO score-to-trade admission must not borrow paper allowlists or paper execution state
+- the score-to-trade path exists only to let high-scoring approved setups reach the lane CFO/risk gates; it is not a replacement for CFO, broker, live-guard, or capital-protection checks
+
+Safety:
+- no notional, broker routing, strategy generation, projected-gain floor, slot, daily-protector, long-only, or final live-guard behaviour changed
+- low-scoring signals can still be suppressed by poor fitness; score-to-trade survivors keep fitness as ranking/reporting evidence
+
+### Narrow Equity Flatten Window
+Decision:
+- keep the equity entry cutoff at the final `15` minutes before close
+- change the forced equity sell-off/flatten window to the final `5` minutes before close for paper and Alpaca Live dials
+- keep crypto unchanged
+
+Why:
+- the operator explicitly requested the Centaur equity sell-off/flatten window start at 3:55pm New York / 8:55pm UK on a regular US equity session
+- this keeps the no-overnight-carry protection while leaving more time for normal managed exits before the close
+
+Safety:
+- notional, slots, strategy allowlists, broker routing, daily protection, entry cutoff, long-only policy, and live activation gates are unchanged
+- close-flattening still uses the audited managed/unmanaged exit paths and broker position-price fallback when latest bars are unavailable
+
+### Convert the control scheduler to a supervised heartbeat service
+Decision:
+- replace the one-shot `launchd StartInterval=30` control trigger with a `KeepAlive` launchd service that runs `main.py --heartbeat-service --interval-seconds 10`
+- run ticks sequentially inside the service; if a tick takes longer than the interval, the next tick starts immediately after the previous one finishes rather than overlapping
+- reload `.env`/runtime storage before every tick so paper/live dials remain live without restarting the process
+- keep a wrapper process lock with stale-lock cleanup to prevent duplicate heartbeat services
+
+Why:
+- the fast tick is now generally below the former 30-second target, so fixed one-shot scheduling wastes available throughput
+- a supervised process avoids cron-style sub-minute hacks while preserving one-at-a-time tick execution
+- launchd can restart the heartbeat if it exits, while the service loop itself controls cadence
+
+Safety:
+- no broker, risk, notional, threshold, strategy allowlist, daily protection, or live-readiness dials changed
+- the heartbeat interval changes observation/execution cadence only; every proposed order still has to pass the same market, strategy, proposal, CFO, execution-router, and live-guard checks
+
+### Plan fast candidate path plus slow enrichment queue
+Decision:
+- keep the bar-based market scan as the quick ranker over all available candidates
+- make the intended fast trading path enrich and strategy-evaluate only the selected `DISCOVERY_TARGET_COUNT` candidates needed for immediate proposals
+- move the remaining ranked candidates into a slow enrichment queue for evidence, reporting, fitness review, and future selector improvement
+- allow the control tick to start the slow queue worker only when it is not already running; if it is already running, skip the start instead of stacking workers
+- implementation promoted: add an advisory `slow.enrichment_queue` heartbeat node after `market.scan`, then make `context.enrichment` enrich only the selected `DISCOVERY_TARGET_COUNT` candidates for the fast path
+- throughput hardening: keep heavy GA/adaptive-threshold advice out of `strategy.signals`; fast ticks use cached persisted threshold state or configured fallback, then start a skip-if-running threshold-advisor worker to refresh that state outside the hot path with `trade_authority=none`
+
+Why:
+- previous runtime selected a top shortlist but still enriched/evaluated the full ranked set, which broadened coverage but was the dominant tick bottleneck
+- live/paper entry decisions need fresh, same-tick evidence more than they need a full-universe research pass on every heartbeat
+- the leftover ranked candidates still have value for learning and reports, but they should not slow the immediate "can we trade now?" path
+
+Implementation notes:
+- slow queue results are advisory/evidence-only and must be timestamped with TTL/staleness handling
+- the queue currently writes to operations-store tables `slow_enrichment_jobs` and `slow_enrichment_results` for testing the parallel worker before promoting any fast-path behavior
+- a queued candidate cannot directly place an order; it must be rechecked through fresh fast-path enrichment, strategy signal creation, shadow proposal generation, paper/live CFO gates, and final live guard where applicable
+- if the slow queue falls behind, stale work should be dropped or superseded rather than forcing the fast tick to catch up
+- this is now active runtime behavior for the fast path; the slow queue remains advisory evidence only
+
+### Activate independent Alpaca Live proposal lane
+Decision:
+- by operator clarification, set and implement the live architecture to follow the active `.env` live dials exactly rather than blindly copying paper
 - shared market evidence, strategy signals, instrument identity, and fitness evidence should feed separate paper and live proposal/risk/execution lanes
 - paper applies `PAPER_*` dials; live applies `LIVE_*` dials; each lane independently records trade, skip, and block decisions with the dial/gate reasons that produced them
-- current Alpaca Live runtime remains the 2026-05-29 same-as-paper follower until the independent live lane is implemented, tested, reported, and explicitly activated
+- Alpaca Live no longer requires a same-tick submitted paper order before considering a live entry
 
 Why:
 - a live lane that only follows paper is safe as a first-live step, but it is not the intended intelligent architecture
@@ -19,10 +101,26 @@ Why:
 - separating lanes lets live be more selective, crypto-first where appropriate, and honest about account/broker constraints such as the live equity PDT guard
 
 Implementation notes:
-- this decision is documentation/design direction only in this commit; it does not change live order submission yet
 - live independence must not widen risk outside config: no unapproved notional, slots, broker routing, strategy allowlists, projected-gain floors, daily protection, direction, or execution-provider changes
 - the migration needs bounded status/reporting for live proposal counts, approvals, rejections, skipped paper-only trades, live-only approvals, final `LiveRiskGuard` outcomes, and broker-order provenance
 - any live entry still requires enablement, kill switch off, credentials, activation acknowledgement, live account/sync readiness, managed-exit plan safety, supported broker/instrument, and final `LiveRiskGuard`
+- focused runtime tests cover live crypto approval without submitted paper order and the existing unmanaged live-position block
+
+## 2026-06-05
+
+### Raise paper daily drawdown protector to $10.00
+Decision:
+- by explicit operator override, raise `PAPER_EXECUTION_MAX_DAILY_DRAWDOWN_USD` from `$2.00` to `$10.00`
+- keep `LIVE_EXECUTION_MAX_DAILY_DRAWDOWN_USD` unchanged at its separate live setting
+- apply the paper setting to all paper execution lanes that read the shared paper protector, including Alpaca Paper and Trading 212 Paper
+
+Why:
+- the operator explicitly requested a higher paper-only daily loss cap for continued paper testing
+
+Implementation notes:
+- this widens only the paper daily entry-protection latch
+- it does not widen per-trade notional, slot count, broker routing, live behaviour, strategy allowlists, projected-gain floors, order frequency, stale-order rules, or long-only policy
+- existing positions and managed exits remain governed by their current stop/target/exit rules
 
 ## 2026-06-03
 
@@ -499,7 +597,7 @@ Implementation notes:
 Decision:
 - keep Friday equity trading available for most of the regular session
 - block new equity paper entries in the final `60` minutes of the regular Friday session
-- flatten managed equity paper positions in the final `15` minutes of the regular Friday session with exit reason `friday_no_weekend_carry`
+- flatten managed equity paper positions in the final `15` minutes of the regular Friday session with exit reason `friday_no_weekend_carry` at initial approval; this was later superseded on 2026-06-04 by a final `5` minute flatten window
 - leave crypto unchanged because crypto can trade through the weekend
 - keep `$10` notional, broker routing, strategy allowlist, stop loss, profit capture, projected-gain floors, one-order-per-tick discipline, slot caps, and daily drawdown protection unchanged
 
@@ -509,7 +607,7 @@ Why:
 - a Friday intraday/no-weekend-carry rule reduces weekend gap exposure while preserving most Friday opportunity
 
 Implementation notes:
-- config flags: `PAPER_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED=true`, `PAPER_EXECUTION_EQUITY_FRIDAY_ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE=60`, and `PAPER_EXECUTION_EQUITY_FRIDAY_FLATTEN_MINUTES_BEFORE_CLOSE=15`
+- initial config flags: `PAPER_EXECUTION_EQUITY_NO_WEEKEND_CARRY_ENABLED=true`, `PAPER_EXECUTION_EQUITY_FRIDAY_ENTRY_CUTOFF_MINUTES_BEFORE_CLOSE=60`, and `PAPER_EXECUTION_EQUITY_FRIDAY_FLATTEN_MINUTES_BEFORE_CLOSE=15`; current dials are documented in the 2026-06-04 updates above
 - the CFO gate rejects late-Friday equity entries with `friday_entry_cutoff_no_weekend_carry`
 - managed exits check stop loss, profit capture, and take profit before the Friday flatten reason, so protective/profit exits keep their more specific audit reason when they trigger
 - live follower entry selection inherits the same late-Friday equity entry cutoff because live can only follow paper-approved/submitted orders; live managed exits use the same managed-exit helper and therefore share the flatten reason after activation gates

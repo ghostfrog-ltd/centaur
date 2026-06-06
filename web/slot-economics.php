@@ -330,6 +330,79 @@ function slotNumbersInitialSnapshotJson(): string
       margin-top: 18px;
     }
 
+    .reality-panel {
+      margin-top: 18px;
+    }
+
+    .reality-actions {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.76);
+    }
+
+    .reality-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      padding: 16px;
+    }
+
+    .mini-result {
+      min-width: 0;
+      min-height: 106px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdfc;
+      padding: 12px;
+    }
+
+    .mini-value {
+      margin-top: 10px;
+      color: var(--ink);
+      font-size: 28px;
+      font-weight: 950;
+      line-height: 1;
+      overflow-wrap: anywhere;
+    }
+
+    .mini-detail {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .reality-verdict {
+      margin: 0 16px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+      padding: 14px;
+      color: var(--ink);
+      font-weight: 800;
+      line-height: 1.4;
+    }
+
+    .reality-verdict.good {
+      border-color: rgba(37, 139, 87, 0.35);
+      background: rgba(37, 139, 87, 0.08);
+    }
+
+    .reality-verdict.warn {
+      border-color: rgba(201, 143, 19, 0.38);
+      background: rgba(201, 143, 19, 0.09);
+    }
+
+    .reality-verdict.bad {
+      border-color: rgba(201, 75, 95, 0.38);
+      background: rgba(201, 75, 95, 0.08);
+    }
+
     .env-actions {
       display: flex;
       flex-wrap: wrap;
@@ -428,6 +501,10 @@ function slotNumbersInitialSnapshotJson(): string
       .results {
         grid-template-columns: 1fr;
       }
+
+      .reality-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -479,23 +556,23 @@ function slotNumbersInitialSnapshotJson(): string
               <span id="slots-per-day-readout" class="readout">10</span>
             </div>
             <div class="number-row">
-              <input id="slots-per-day" type="range" min="1" max="50" step="0.1" value="10">
-              <input id="slots-per-day-number" type="number" min="1" max="500" step="0.1" value="10">
+              <input id="slots-per-day" type="range" min="1" max="200" step="1" value="10">
+              <input id="slots-per-day-number" type="number" min="1" max="500" step="1" value="10">
             </div>
           </div>
 
           <div class="control">
             <div class="control-top">
-              <label for="losing-slots-per-day">Estimated Losses Per Day</label>
+              <label for="losing-slots-per-day">Estimated Losing Trades Per Day</label>
               <span id="losing-slots-per-day-readout" class="readout">1</span>
             </div>
             <div class="number-row">
-              <input id="losing-slots-per-day" type="range" min="0" max="20" step="0.1" value="1">
-              <input id="losing-slots-per-day-number" type="number" min="0" max="500" step="0.1" value="1">
+              <input id="losing-slots-per-day" type="range" min="0" max="200" step="1" value="1">
+              <input id="losing-slots-per-day-number" type="number" min="0" max="500" step="1" value="1">
             </div>
           </div>
         </div>
-        <p class="rule">Simple rule used here: sell winners at the slider value, and cap losses at half that value. The day estimate starts from actual paper trades/day and losses/day when snapshot data is available, then subtracts rough costs.</p>
+        <p class="rule">Simple rule used here: sell winners at the slider value, and cap losses at half that value. The day estimate starts from actual paper fills, rounds any broker-ledger loss-equivalent fit to whole trades, then subtracts rough costs.</p>
       </aside>
 
       <section>
@@ -554,6 +631,35 @@ function slotNumbersInitialSnapshotJson(): string
           <div id="one-for-one-note" class="muted">One win covers one loss from about 1.52% on a $10 slot.</div>
           <div id="cost-note" class="muted">At this size, rough costs are large compared with the target.</div>
         </div>
+
+        <section class="panel reality-panel" aria-label="Dial evidence check">
+          <div class="panel-head">
+            <div class="panel-title">Dial Reality Check</div>
+            <span class="badge">audit-only</span>
+          </div>
+          <div class="reality-actions">
+            <button id="check-dials" class="button primary" type="button">Check Dials Against Evidence</button>
+            <span id="dial-check-status" class="save-status">Uses stored exit-quality audits from future exits.</span>
+          </div>
+          <div class="reality-grid">
+            <article class="mini-result">
+              <div class="result-label">Touched Profit Target</div>
+              <div id="target-touch-rate" class="mini-value">-</div>
+              <div id="target-touch-detail" class="mini-detail">waiting for check</div>
+            </article>
+            <article class="mini-result">
+              <div class="result-label">Sold At Target</div>
+              <div id="target-exit-rate" class="mini-value">-</div>
+              <div id="target-exit-detail" class="mini-detail">waiting for check</div>
+            </article>
+            <article class="mini-result">
+              <div class="result-label">Loss Cap Breached</div>
+              <div id="loss-breach-rate" class="mini-value">-</div>
+              <div id="loss-breach-detail" class="mini-detail">waiting for check</div>
+            </article>
+          </div>
+          <div id="dial-check-verdict" class="reality-verdict">Change the sliders, then run the check.</div>
+        </section>
 
         <section class="panel env-table" aria-label="Environment values to set">
           <div class="panel-head">
@@ -618,10 +724,22 @@ function slotNumbersInitialSnapshotJson(): string
       costNote: document.getElementById("cost-note"),
       envBody: document.getElementById("env-body"),
       saveEnv: document.getElementById("save-env"),
-      saveStatus: document.getElementById("save-status")
+      saveStatus: document.getElementById("save-status"),
+      checkDials: document.getElementById("check-dials"),
+      dialCheckStatus: document.getElementById("dial-check-status"),
+      targetTouchRate: document.getElementById("target-touch-rate"),
+      targetTouchDetail: document.getElementById("target-touch-detail"),
+      targetExitRate: document.getElementById("target-exit-rate"),
+      targetExitDetail: document.getElementById("target-exit-detail"),
+      lossBreachRate: document.getElementById("loss-breach-rate"),
+      lossBreachDetail: document.getElementById("loss-breach-detail"),
+      dialCheckVerdict: document.getElementById("dial-check-verdict")
     };
 
     let pendingEnvValues = {};
+    let dayShapeSource = "historical closed-trade average";
+    let lastDayTradeModel = null;
+    let autoFitDayShape = true;
 
     function bindNumber(id) {
       return {
@@ -640,7 +758,23 @@ function slotNumbersInitialSnapshotJson(): string
       const field = fields[fieldName];
       const sourceNode = field[source];
       const targetNode = source === "range" ? field.number : field.range;
-      targetNode.value = String(clamp(sourceNode.value, Number(targetNode.min), Number(targetNode.max)));
+      const next = normalizeFieldValue(
+        fieldName,
+        clamp(sourceNode.value, Number(sourceNode.min), Number(sourceNode.max))
+      );
+      sourceNode.value = String(next);
+      targetNode.value = String(clamp(next, Number(targetNode.min), Number(targetNode.max)));
+    }
+
+    function normalizeFieldValue(fieldName, value) {
+      const source = Number(value);
+      if (!Number.isFinite(source)) {
+        return 0;
+      }
+      if (fieldName === "slotsPerDay" || fieldName === "losingSlotsPerDay") {
+        return Math.round(source);
+      }
+      return source;
     }
 
     function valueOf(fieldName) {
@@ -664,10 +798,10 @@ function slotNumbersInitialSnapshotJson(): string
     function render() {
       const avgWinPct = Math.max(0.01, valueOf("avgWin"));
       const slotSize = Math.max(0.01, valueOf("slotSize"));
-      const slotsPerDay = Math.max(0.1, valueOf("slotsPerDay"));
+      const slotsPerDay = Math.max(1, Math.round(valueOf("slotsPerDay")));
       const losingSlotsPerDay = Math.min(
         slotsPerDay,
-        Math.max(0, valueOf("losingSlotsPerDay"))
+        Math.round(Math.max(0, valueOf("losingSlotsPerDay")))
       );
       const winningSlotsPerDay = slotsPerDay - losingSlotsPerDay;
       const lossPct = avgWinPct / 2;
@@ -701,14 +835,14 @@ function slotNumbersInitialSnapshotJson(): string
 
       nodes.avgWinReadout.textContent = fmtPct(avgWinPct);
       nodes.slotSizeReadout.textContent = fmtCurrency(slotSize);
-      nodes.slotsPerDayReadout.textContent = fmtNumber(slotsPerDay, 1);
-      nodes.losingSlotsPerDayReadout.textContent = fmtNumber(losingSlotsPerDay, 1);
+      nodes.slotsPerDayReadout.textContent = fmtNumber(slotsPerDay, 0);
+      nodes.losingSlotsPerDayReadout.textContent = fmtNumber(losingSlotsPerDay, 0);
       nodes.dailyProfit.textContent = fmtCurrency(estimatedDailyProfitUsd);
-      nodes.dailyProfitDetail.textContent = `${fmtNumber(winningSlotsPerDay, 1)} ${plural(winningSlotsPerDay, "winner")} x ${fmtCurrency(netWinUsd)} net - ${fmtNumber(losingSlotsPerDay, 1)} ${plural(losingSlotsPerDay, "loser")} x ${fmtCurrency(lossWithCostUsd)} drag`;
+      nodes.dailyProfitDetail.textContent = `${fmtNumber(winningSlotsPerDay, 0)} ${plural(winningSlotsPerDay, "winner")} x ${fmtCurrency(netWinUsd)} net - ${fmtNumber(losingSlotsPerDay, 0)} ${plural(losingSlotsPerDay, "loser")} x ${fmtCurrency(lossWithCostUsd)} drag`;
       nodes.dailyTargetWin.textContent = Number.isFinite(dailyTargetWinPct) ? fmtPct(dailyTargetWinPct) : "-";
       nodes.dailyTargetDetail.textContent = `for ${fmtCurrency(dailyTargetUsd)}/day; one-win-covers-one-loss starts around ${fmtPct(oneForOneWinPct)}`;
-      nodes.estimatedDayShape.textContent = `${fmtNumber(winningSlotsPerDay, 1)} / ${fmtNumber(losingSlotsPerDay, 1)}`;
-      nodes.estimatedDayDetail.textContent = `${fmtNumber(slotsPerDay, 1)} total estimated trades/day`;
+      nodes.estimatedDayShape.textContent = `${fmtNumber(winningSlotsPerDay, 0)} / ${fmtNumber(losingSlotsPerDay, 0)}`;
+      nodes.estimatedDayDetail.textContent = `${fmtNumber(slotsPerDay, 0)} total estimated trades/day; ${dayShapeSource}`;
       nodes.profitSell.textContent = fmtPct(avgWinPct);
       nodes.profitDetail.textContent = `${fmtCurrency(winUsd)} gross on a ${fmtCurrency(slotSize)} slot`;
       nodes.lossSell.textContent = fmtPct(lossPct);
@@ -801,15 +935,28 @@ function slotNumbersInitialSnapshotJson(): string
     Object.entries(fields).forEach(([fieldName, field]) => {
       field.range.addEventListener("input", () => {
         syncField(fieldName, "range");
-        render();
+        handleFieldInput(fieldName);
       });
       field.number.addEventListener("input", () => {
         syncField(fieldName, "number");
-        render();
+        handleFieldInput(fieldName);
       });
     });
 
     nodes.saveEnv.addEventListener("click", saveEnvValues);
+    nodes.checkDials.addEventListener("click", checkDialReality);
+
+    function handleFieldInput(fieldName) {
+      if ((fieldName === "avgWin" || fieldName === "slotSize") && autoFitDayShape) {
+        applyLastDayTradeModel();
+        return;
+      }
+      if (fieldName === "slotsPerDay" || fieldName === "losingSlotsPerDay") {
+        autoFitDayShape = false;
+        dayShapeSource = "manual day shape; not broker-P/L fitted";
+      }
+      render();
+    }
 
     function applyActualDefaults() {
       const metrics = embeddedSnapshot && typeof embeddedSnapshot === "object"
@@ -826,8 +973,9 @@ function slotNumbersInitialSnapshotJson(): string
 
       const tradesPerDay = (wins + losses + flats) / days;
       const lossesPerDay = losses / days;
-      setField("slotsPerDay", Number(tradesPerDay.toFixed(1)));
-      setField("losingSlotsPerDay", Number(lossesPerDay.toFixed(1)));
+      setField("slotsPerDay", Math.round(tradesPerDay));
+      setField("losingSlotsPerDay", Math.round(lossesPerDay));
+      dayShapeSource = `historical closed-trade average; rounded from ${fmtNumber(tradesPerDay, 1)} trades/day and ${fmtNumber(lossesPerDay, 1)} losses/day`;
     }
 
     async function loadEnvDefaults() {
@@ -854,6 +1002,125 @@ function slotNumbersInitialSnapshotJson(): string
       } catch (error) {
         setSaveStatus(error instanceof Error ? error.message : "Could not load .env values.", "bad");
       }
+    }
+
+    async function loadLastDayTradeDefaults() {
+      try {
+        const response = await fetch("/api/recent_trades.php?hours=24&broker_id=alpaca_paper", {
+          cache: "no-store",
+          headers: { "Accept": "application/json" }
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.detail || "Could not load last-day trades.");
+        }
+        const profitLockPayload = await loadProfitLockReviewPayload();
+        const dayFit = resolveDayFit(payload, profitLockPayload);
+
+        const fills = Number(payload.fills?.sampled);
+        const closedWins = Number(payload.closed_trades?.wins);
+        const closedLosses = Number(payload.closed_trades?.losses);
+        const lossRate = Number(payload.closed_trades?.loss_rate);
+        const brokerDayChange = Number(payload.broker_account?.day_change);
+        if (!Number.isFinite(fills) || fills <= 0) {
+          return;
+        }
+
+        lastDayTradeModel = {
+          fills,
+          closedWins,
+          closedLosses,
+          lossRate,
+          brokerDayChange,
+          fitDayChange: dayFit.dayChange,
+          fitLabel: dayFit.label
+        };
+        autoFitDayShape = true;
+        applyLastDayTradeModel();
+      } catch (error) {
+        dayShapeSource = "historical closed-trade average";
+      }
+    }
+
+    async function loadProfitLockReviewPayload() {
+      try {
+        const response = await fetch("/api/profit_lock_review.php?hours=24&broker_id=alpaca_paper", {
+          cache: "no-store",
+          headers: { "Accept": "application/json" }
+        });
+        const payload = await response.json();
+        return response.ok && payload.ok ? payload : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function resolveDayFit(recentPayload, profitLockPayload) {
+      const brokerDayChange = Number(recentPayload?.broker_account?.day_change);
+      const finalDayChange = Number(profitLockPayload?.account_curve?.final?.day_change);
+      const carryoverPnl = Number(profitLockPayload?.trade_review?.carryover_closes?.realized_pnl_usd);
+      if (Number.isFinite(finalDayChange) && Number.isFinite(carryoverPnl)) {
+        const freshDayChange = finalDayChange - carryoverPnl;
+        return {
+          dayChange: freshDayChange,
+          label: `carryover-adjusted fresh P/L ${fmtCurrency(freshDayChange)} (broker ${fmtCurrency(finalDayChange)}, carryover ${fmtCurrency(carryoverPnl)})`
+        };
+      }
+      if (Number.isFinite(brokerDayChange)) {
+        return {
+          dayChange: brokerDayChange,
+          label: `broker day P/L ${fmtCurrency(brokerDayChange)}`
+        };
+      }
+      return {
+        dayChange: null,
+        label: ""
+      };
+    }
+
+    function applyLastDayTradeModel() {
+      if (!lastDayTradeModel) {
+        render();
+        return;
+      }
+      const {
+        fills,
+        closedWins,
+        closedLosses,
+        lossRate,
+        brokerDayChange,
+        fitDayChange,
+        fitLabel
+      } = lastDayTradeModel;
+      const dayChangeForFit = Number.isFinite(fitDayChange) ? fitDayChange : brokerDayChange;
+      const avgWinPct = Math.max(0.01, valueOf("avgWin"));
+      const slotSize = Math.max(0.01, valueOf("slotSize"));
+      const lossPct = avgWinPct / 2;
+      const winUsd = slotSize * avgWinPct / 100;
+      const lossUsd = slotSize * lossPct / 100;
+      const costUsd = 0.03 + (slotSize * 0.0008);
+      const netWinUsd = winUsd - costUsd;
+      const lossWithCostUsd = lossUsd + costUsd;
+      const lossEquivalent = (
+        Number.isFinite(dayChangeForFit) && netWinUsd + lossWithCostUsd > 0
+          ? clamp(
+              ((fills * netWinUsd) - dayChangeForFit) / (netWinUsd + lossWithCostUsd),
+              0,
+              fills
+            )
+          : fills * (Number.isFinite(lossRate) ? lossRate : 0.5)
+      );
+      setField("slotsPerDay", Math.round(fills));
+      setField("losingSlotsPerDay", Math.round(lossEquivalent));
+      dayShapeSource = Number.isFinite(dayChangeForFit)
+        ? `last 24h fill model rounded from ${fmtNumber(lossEquivalent, 1)} loss-equivalent fills to ${fitLabel}`
+        : `last 24h fill model rounded from ${fmtNumber(lossEquivalent, 1)} losses (${fmtNumber(fills, 0)} fills x ${fmtNumber((lossRate || 0.5) * 100, 1)}% closed loss rate)`;
+
+      if (Number.isFinite(closedWins) && Number.isFinite(closedLosses)) {
+        nodes.actualDayShape.textContent = `${fmtNumber(closedWins, 0)} / ${fmtNumber(closedLosses, 0)}`;
+        nodes.actualDayDetail.textContent = `${fmtNumber(fills, 0)} fills; actual closed wins/losses, model rounds loss-equivalent fit`;
+      }
+      render();
     }
 
     function envPercentToDisplay(value) {
@@ -902,17 +1169,84 @@ function slotNumbersInitialSnapshotJson(): string
       }
     }
 
+    async function checkDialReality() {
+      const avgWinPct = Math.max(0.01, valueOf("avgWin"));
+      const slotSize = Math.max(0.01, valueOf("slotSize"));
+      const tradesPerDay = Math.max(1, Math.round(valueOf("slotsPerDay")));
+      const lossesPerDay = Math.min(tradesPerDay, Math.round(Math.max(0, valueOf("losingSlotsPerDay"))));
+      const lossCapPct = avgWinPct / 2;
+      const params = new URLSearchParams({
+        hours: "168",
+        broker_id: "alpaca_paper",
+        target_win_pct: String(avgWinPct),
+        loss_cap_pct: String(lossCapPct),
+        slot_size_usd: String(slotSize),
+        trades_per_day: String(tradesPerDay),
+        losses_per_day: String(lossesPerDay)
+      });
+
+      nodes.checkDials.disabled = true;
+      setDialCheckStatus("Checking stored exit evidence...", "");
+      try {
+        const response = await fetch(`/api/slot_dial_reality.php?${params.toString()}`, {
+          cache: "no-store",
+          headers: { "Accept": "application/json" }
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.detail || payload.reason || "Could not check dials.");
+        }
+        renderDialReality(payload);
+      } catch (error) {
+        setDialCheckStatus(error instanceof Error ? error.message : "Could not check dials.", "bad");
+      } finally {
+        nodes.checkDials.disabled = false;
+      }
+    }
+
+    function renderDialReality(payload) {
+      const sample = payload.sample || {};
+      const results = payload.results || {};
+      const verdict = payload.verdict || {};
+      const tracked = Number(sample.tracked_exit_quality_count) || 0;
+      const sampled = Number(sample.sell_orders_sampled) || 0;
+      const missing = Number(sample.missing_or_unobserved_audit_count) || 0;
+
+      nodes.targetTouchRate.textContent = fmtPct((Number(results.target_touch_rate) || 0) * 100);
+      nodes.targetTouchDetail.textContent = `${fmtNumber(Number(results.target_touch_count) || 0, 0)} of ${fmtNumber(tracked, 0)} tracked exits; projected ${fmtNumber(Number(results.projected_target_touches_per_day) || 0, 1)}/day`;
+      nodes.targetExitRate.textContent = fmtPct((Number(results.exited_at_or_above_target_rate) || 0) * 100);
+      nodes.targetExitDetail.textContent = `${fmtNumber(Number(results.exited_at_or_above_target_count) || 0, 0)} sold at/above target; ${fmtNumber(Number(results.faded_after_touch_count) || 0, 0)} faded after touching`;
+      nodes.lossBreachRate.textContent = fmtPct((Number(results.loss_cap_breach_rate) || 0) * 100);
+      nodes.lossBreachDetail.textContent = `${fmtNumber(Number(results.loss_cap_breach_count) || 0, 0)} breached; projected ${fmtNumber(Number(results.projected_loss_breaches_per_day) || 0, 1)}/day`;
+
+      const action = String(verdict.action || "");
+      const tone = action.includes("plausible")
+        ? "good"
+        : (action.includes("not_enough") ? "warn" : "bad");
+      nodes.dialCheckVerdict.classList.toggle("good", tone === "good");
+      nodes.dialCheckVerdict.classList.toggle("warn", tone === "warn");
+      nodes.dialCheckVerdict.classList.toggle("bad", tone === "bad");
+      nodes.dialCheckVerdict.textContent = `${verdict.summary || "Reality check complete."} Rough model P/L: ${fmtCurrency(Number(results.rough_projected_pnl_usd) || 0)}. Authority: ${verdict.authority || "none"}.`;
+      setDialCheckStatus(`${fmtNumber(sampled, 0)} sells sampled, ${fmtNumber(tracked, 0)} tracked audits, ${fmtNumber(missing, 0)} not yet trackable.`, tone === "bad" ? "bad" : "good");
+    }
+
     function setSaveStatus(message, tone) {
       nodes.saveStatus.textContent = message;
       nodes.saveStatus.classList.toggle("good", tone === "good");
       nodes.saveStatus.classList.toggle("bad", tone === "bad");
     }
 
+    function setDialCheckStatus(message, tone) {
+      nodes.dialCheckStatus.textContent = message;
+      nodes.dialCheckStatus.classList.toggle("good", tone === "good");
+      nodes.dialCheckStatus.classList.toggle("bad", tone === "bad");
+    }
+
     function setField(fieldName, value) {
       const field = fields[fieldName];
       const numberMin = Number(field.number.min);
       const numberMax = Number(field.number.max);
-      const next = clamp(value, numberMin, numberMax);
+      const next = normalizeFieldValue(fieldName, clamp(value, numberMin, numberMax));
       field.number.value = String(next);
       field.range.value = String(clamp(next, Number(field.range.min), Number(field.range.max)));
     }
@@ -949,10 +1283,15 @@ function slotNumbersInitialSnapshotJson(): string
       return count === 1 ? word : `${word}s`;
     }
 
-    applyActualDefaults();
-    renderActualDayShape();
-    render();
-    loadEnvDefaults();
+    async function initialize() {
+      applyActualDefaults();
+      renderActualDayShape();
+      render();
+      await loadEnvDefaults();
+      await loadLastDayTradeDefaults();
+    }
+
+    initialize();
   </script>
 </body>
 </html>

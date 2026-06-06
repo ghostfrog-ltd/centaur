@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -9,7 +10,12 @@ from typing import Any
 
 from app.framework.core.instruments import default_instrument_registry
 from app.framework.runtime.models import ApiUsageSummary, TickReport
-from app.framework.runtime.settings import RuntimeConfig, SourcePricing
+from app.framework.runtime.settings import (
+    DEFAULT_ENV_PATH,
+    PROJECT_ROOT,
+    RuntimeConfig,
+    SourcePricing,
+)
 
 try:
     import psycopg2
@@ -49,15 +55,11 @@ class UsageLedger:
             except Exception as exc:  # pragma: no cover
                 if self._postgres_required():
                     raise RuntimeError(
-                        "PostgreSQL operations store is required but unavailable; "
-                        "refusing SQLite fallback for live operation/monitoring."
+                        self._build_postgres_required_error(exc=exc)
                     ) from exc
                 self.fallback_reason = f"{type(exc).__name__}: {exc}"
         elif self._postgres_required():
-            raise RuntimeError(
-                "PostgreSQL operations store is required but not available; "
-                "check DATABASE_URL/POSTGRES_* settings and psycopg2 installation."
-            )
+            raise RuntimeError(self._build_postgres_missing_config_error())
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_sqlite_schema()
@@ -518,6 +520,71 @@ class UsageLedger:
                 candidates=candidates,
             )
 
+    def enqueue_slow_enrichment_jobs(
+        self,
+        *,
+        jobs: list[dict[str, Any]],
+        max_pending_items: int,
+        queued_at: datetime | None = None,
+    ) -> dict[str, int]:
+        if self.backend == "postgres":
+            return self._enqueue_slow_enrichment_jobs_postgres(
+                jobs=jobs,
+                max_pending_items=max_pending_items,
+                queued_at=queued_at,
+            )
+        return self._enqueue_slow_enrichment_jobs_sqlite(
+            jobs=jobs,
+            max_pending_items=max_pending_items,
+            queued_at=queued_at,
+        )
+
+    def count_slow_enrichment_jobs(self, *, statuses: tuple[str, ...]) -> int:
+        if self.backend == "postgres":
+            return self._count_slow_enrichment_jobs_postgres(statuses=statuses)
+        return self._count_slow_enrichment_jobs_sqlite(statuses=statuses)
+
+    def claim_slow_enrichment_jobs(
+        self,
+        *,
+        limit: int,
+        claimed_at: datetime,
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            return self._claim_slow_enrichment_jobs_postgres(
+                limit=limit,
+                claimed_at=claimed_at,
+            )
+        return self._claim_slow_enrichment_jobs_sqlite(
+            limit=limit,
+            claimed_at=claimed_at,
+        )
+
+    def complete_slow_enrichment_jobs(
+        self,
+        *,
+        processed: list[dict[str, Any]],
+        errors: list[dict[str, Any]],
+        completed_at: datetime | None = None,
+    ) -> None:
+        if self.backend == "postgres":
+            self._complete_slow_enrichment_jobs_postgres(
+                processed=processed,
+                errors=errors,
+                completed_at=completed_at,
+            )
+        else:
+            self._complete_slow_enrichment_jobs_sqlite(
+                processed=processed,
+                errors=errors,
+                completed_at=completed_at,
+            )
+
+    def repair_slow_enrichment_jobs(self, *, repaired_at: datetime) -> dict[str, int]:
+        if self.backend == "postgres":
+            return self._repair_slow_enrichment_jobs_postgres(repaired_at=repaired_at)
+        return self._repair_slow_enrichment_jobs_sqlite(repaired_at=repaired_at)
+
     def record_gemini_analyses(
         self,
         *,
@@ -878,6 +945,11 @@ class UsageLedger:
         *,
         as_of: datetime,
         lookback_days: int = 0,
+        source_environments: tuple[str, ...] = tuple(),
+        execution_providers: tuple[str, ...] = tuple(),
+        strategy_ids: tuple[str, ...] = tuple(),
+        profile_ids: tuple[str, ...] = tuple(),
+        note_prefix: str = "",
     ) -> list[dict[str, Any]]:
         """Return raw aggregate rows that feed strategy-fitness scoring.
 
@@ -890,11 +962,21 @@ class UsageLedger:
             rows = self._list_strategy_fitness_rows_postgres(
                 as_of=as_of,
                 lookback_days=lookback_days,
+                source_environments=source_environments,
+                execution_providers=execution_providers,
+                strategy_ids=strategy_ids,
+                profile_ids=profile_ids,
+                note_prefix=note_prefix,
             )
         else:
             rows = self._list_strategy_fitness_rows_sqlite(
                 as_of=as_of,
                 lookback_days=lookback_days,
+                source_environments=source_environments,
+                execution_providers=execution_providers,
+                strategy_ids=strategy_ids,
+                profile_ids=profile_ids,
+                note_prefix=note_prefix,
             )
 
         normalized_rows: list[dict[str, Any]] = []
@@ -903,6 +985,123 @@ class UsageLedger:
             for key in ("first_proposed_at", "last_evaluated_at"):
                 if key in normalized:
                     normalized[key] = self._normalize_db_datetime_value(normalized[key])
+            normalized_rows.append(normalized)
+        return normalized_rows
+
+    def list_strategy_fitness_evidence_mix(
+        self,
+        *,
+        as_of: datetime,
+        lookback_days: int = 0,
+        source_environments: tuple[str, ...] = tuple(),
+        execution_providers: tuple[str, ...] = tuple(),
+        strategy_ids: tuple[str, ...] = tuple(),
+        profile_ids: tuple[str, ...] = tuple(),
+    ) -> dict[str, Any]:
+        if self.backend == "postgres":
+            rows = self._list_strategy_fitness_evidence_mix_postgres(
+                as_of=as_of,
+                lookback_days=lookback_days,
+                source_environments=source_environments,
+                execution_providers=execution_providers,
+                strategy_ids=strategy_ids,
+                profile_ids=profile_ids,
+            )
+        else:
+            rows = self._list_strategy_fitness_evidence_mix_sqlite(
+                as_of=as_of,
+                lookback_days=lookback_days,
+                source_environments=source_environments,
+                execution_providers=execution_providers,
+                strategy_ids=strategy_ids,
+                profile_ids=profile_ids,
+            )
+        normalized_rows = [dict(row) for row in rows]
+        environment_counts: dict[str, int] = {"live": 0, "paper": 0}
+        source_environment_counts: dict[str, int] = {"backtest": 0}
+        execution_provider_counts: dict[str, int] = {"simulator": 0}
+        for row in normalized_rows:
+            environment = str(row.get("environment", "") or "").strip().lower()
+            source_environment = str(row.get("source_environment", "") or "").strip().lower()
+            execution_provider = str(row.get("execution_provider", "") or "").strip().lower()
+            count = int(row.get("evaluated_proposals", 0) or 0)
+            if environment:
+                environment_counts[environment] = environment_counts.get(environment, 0) + count
+            if source_environment:
+                source_environment_counts[source_environment] = (
+                    source_environment_counts.get(source_environment, 0) + count
+                )
+            if execution_provider:
+                execution_provider_counts[execution_provider] = (
+                    execution_provider_counts.get(execution_provider, 0) + count
+                )
+        return {
+            "rows": normalized_rows,
+            "live_evidence_count": int(environment_counts.get("live", 0) or 0),
+            "paper_evidence_count": int(environment_counts.get("paper", 0) or 0),
+            "backtest_evidence_count": int(source_environment_counts.get("backtest", 0) or 0),
+            "simulator_evidence_count": int(execution_provider_counts.get("simulator", 0) or 0),
+        }
+
+    def get_tick_run(self, *, tick_id: str) -> dict[str, Any] | None:
+        if self.backend == "postgres":
+            row = self._get_tick_run_postgres(tick_id=tick_id)
+        else:
+            row = self._get_tick_run_sqlite(tick_id=tick_id)
+        if row is None:
+            return None
+        normalized = dict(row)
+        for key in ("started_at", "ended_at"):
+            if key in normalized:
+                normalized[key] = self._normalize_db_datetime_value(normalized[key])
+        if "state_snapshot_json" in normalized:
+            normalized["state_snapshot_json"] = self._from_json(
+                normalized["state_snapshot_json"],
+                default={},
+            )
+        if "step_profiles_json" in normalized:
+            normalized["step_profiles_json"] = self._from_json(
+                normalized["step_profiles_json"],
+                default=[],
+            )
+        return normalized
+
+    def list_shadow_trade_proposals_by_note_prefix(
+        self,
+        *,
+        note_prefix: str,
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_shadow_trade_proposals_by_note_prefix_postgres(note_prefix=note_prefix)
+        else:
+            rows = self._list_shadow_trade_proposals_by_note_prefix_sqlite(note_prefix=note_prefix)
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized = dict(row)
+            if "proposed_at" in normalized:
+                normalized["proposed_at"] = self._normalize_db_datetime_value(normalized["proposed_at"])
+            if "raw_json" in normalized:
+                normalized["raw_json"] = self._from_json(normalized["raw_json"], default={})
+            normalized_rows.append(normalized)
+        return normalized_rows
+
+    def list_shadow_trade_outcomes_by_note_prefix(
+        self,
+        *,
+        note_prefix: str,
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_shadow_trade_outcomes_by_note_prefix_postgres(note_prefix=note_prefix)
+        else:
+            rows = self._list_shadow_trade_outcomes_by_note_prefix_sqlite(note_prefix=note_prefix)
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized = dict(row)
+            for key in ("proposed_at", "due_at", "evaluated_at"):
+                if key in normalized:
+                    normalized[key] = self._normalize_db_datetime_value(normalized[key])
+            if "raw_json" in normalized:
+                normalized["raw_json"] = self._from_json(normalized["raw_json"], default={})
             normalized_rows.append(normalized)
         return normalized_rows
 
@@ -1062,18 +1261,37 @@ class UsageLedger:
             normalized_rows.append(normalized)
         return normalized_rows
 
+    def summarize_historical_bars(
+        self,
+        *,
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        if self.backend == "postgres":
+            return self._summarize_historical_bars_postgres(
+                as_of=as_of or datetime.now().astimezone()
+            )
+        return self._summarize_historical_bars_sqlite(
+            as_of=as_of or datetime.now().astimezone()
+        )
+
     def get_previous_bars(
         self,
         *,
         tick_id: str,
         symbol_keys: list[tuple[str, str]],
+        current_rows: list[dict[str, Any]] | None = None,
     ) -> dict[tuple[str, str], dict[str, Any]]:
         if self.backend == "postgres":
             return self._get_previous_bars_postgres(
                 tick_id=tick_id,
                 symbol_keys=symbol_keys,
+                current_rows=current_rows or [],
             )
-        return self._get_previous_bars_sqlite(tick_id=tick_id, symbol_keys=symbol_keys)
+        return self._get_previous_bars_sqlite(
+            tick_id=tick_id,
+            symbol_keys=symbol_keys,
+            current_rows=current_rows or [],
+        )
 
     def list_daily_usage(self, *, usage_date: date) -> list[ApiUsageSummary]:
         if self.backend == "postgres":
@@ -1221,6 +1439,552 @@ class UsageLedger:
                 normalized["raw_json"] = self._from_json(normalized["raw_json"], default={})
             normalized_rows.append(normalized)
         return normalized_rows
+
+    def get_latest_strategy_fitness_summary(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+    ) -> dict[str, Any] | None:
+        normalized_strategy_id = str(strategy_id or "").strip()
+        normalized_profile_id = str(profile_id or "").strip()
+        if not normalized_strategy_id or not normalized_profile_id:
+            return None
+        if self.backend == "postgres":
+            row = self._get_latest_strategy_fitness_summary_postgres(
+                strategy_id=normalized_strategy_id,
+                profile_id=normalized_profile_id,
+            )
+        else:
+            row = self._get_latest_strategy_fitness_summary_sqlite(
+                strategy_id=normalized_strategy_id,
+                profile_id=normalized_profile_id,
+            )
+        if row is None:
+            return None
+        normalized = dict(row)
+        for key in ("captured_at", "first_proposed_at", "last_evaluated_at"):
+            if key in normalized:
+                normalized[key] = self._normalize_db_datetime_value(normalized[key])
+        if "raw_json" in normalized:
+            normalized["raw_json"] = self._from_json(normalized["raw_json"], default={})
+        return normalized
+
+    def list_strategy_promotions(self) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_strategy_promotions_postgres()
+        else:
+            rows = self._list_strategy_promotions_sqlite()
+        return self._normalize_strategy_promotion_rows(rows)
+
+    def get_strategy_promotion(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+    ) -> dict[str, Any] | None:
+        normalized_strategy_id = str(strategy_id or "").strip()
+        normalized_profile_id = str(profile_id or "").strip()
+        if not normalized_strategy_id or not normalized_profile_id:
+            return None
+        if self.backend == "postgres":
+            row = self._get_strategy_promotion_postgres(
+                strategy_id=normalized_strategy_id,
+                profile_id=normalized_profile_id,
+            )
+        else:
+            row = self._get_strategy_promotion_sqlite(
+                strategy_id=normalized_strategy_id,
+                profile_id=normalized_profile_id,
+            )
+        if row is None:
+            return None
+        return self._normalize_strategy_promotion_rows([row])[0]
+
+    def record_strategy_promotion_evaluation(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+        stage: str,
+        research_only_profile: bool,
+        recommendation: str,
+        blocker_reasons: list[str],
+        replay_summary: dict[str, Any],
+        paper_sim_summary: dict[str, Any],
+        data_integrity: dict[str, Any],
+    ) -> None:
+        current = self.get_strategy_promotion(strategy_id=strategy_id, profile_id=profile_id) or {}
+        row = {
+            "strategy_id": str(strategy_id),
+            "profile_id": str(profile_id),
+            "stage": str(stage),
+            "research_only_profile": 1 if research_only_profile else 0,
+            "paper_execution_profile": 1 if bool(current.get("paper_execution_profile")) else 0,
+            "paper_approved": 1 if bool(current.get("paper_approved")) else 0,
+            "live_approved": 1 if bool(current.get("live_approved")) else 0,
+            "rejected": 1 if str(stage) == "rejected" or bool(current.get("rejected")) else 0,
+            "max_paper_notional_usd": float(current.get("max_paper_notional_usd", 0.0) or 0.0),
+            "max_open_trades": int(current.get("max_open_trades", 0) or 0),
+            "cooldown_minutes": int(current.get("cooldown_minutes", 0) or 0),
+            "recommendation": str(recommendation),
+            "rejection_reason": str(current.get("rejection_reason", "") or ""),
+            "blocker_reasons_json": self._to_json(blocker_reasons),
+            "replay_summary_json": self._to_json(replay_summary),
+            "paper_sim_summary_json": self._to_json(paper_sim_summary),
+            "data_integrity_json": self._to_json(data_integrity),
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "approved_at": current.get("approved_at").isoformat()
+            if isinstance(current.get("approved_at"), datetime)
+            else current.get("approved_at"),
+            "rejected_at": current.get("rejected_at").isoformat()
+            if isinstance(current.get("rejected_at"), datetime)
+            else current.get("rejected_at"),
+        }
+        self._upsert_strategy_promotion(row=row)
+
+    def approve_strategy_for_paper(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+        research_only_profile: bool,
+        max_paper_notional_usd: float,
+        max_open_trades: int,
+        cooldown_minutes: int,
+        recommendation: str,
+        blocker_reasons: list[str],
+    ) -> None:
+        current = self.get_strategy_promotion(strategy_id=strategy_id, profile_id=profile_id) or {}
+        row = {
+            "strategy_id": str(strategy_id),
+            "profile_id": str(profile_id),
+            "stage": "paper_approved",
+            "research_only_profile": 1 if research_only_profile else 0,
+            "paper_execution_profile": 1,
+            "paper_approved": 1,
+            "live_approved": 1 if bool(current.get("live_approved")) else 0,
+            "rejected": 0,
+            "max_paper_notional_usd": float(max_paper_notional_usd),
+            "max_open_trades": int(max_open_trades),
+            "cooldown_minutes": int(cooldown_minutes),
+            "recommendation": str(recommendation),
+            "rejection_reason": "",
+            "blocker_reasons_json": self._to_json(blocker_reasons),
+            "replay_summary_json": self._to_json(current.get("replay_summary_json", {})),
+            "paper_sim_summary_json": self._to_json(current.get("paper_sim_summary_json", {})),
+            "data_integrity_json": self._to_json(current.get("data_integrity_json", {})),
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "approved_at": datetime.now().astimezone().isoformat(),
+            "rejected_at": None,
+        }
+        self._upsert_strategy_promotion(row=row)
+
+    def reject_strategy_promotion(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+        research_only_profile: bool,
+        reason: str,
+    ) -> None:
+        current = self.get_strategy_promotion(strategy_id=strategy_id, profile_id=profile_id) or {}
+        row = {
+            "strategy_id": str(strategy_id),
+            "profile_id": str(profile_id),
+            "stage": "rejected",
+            "research_only_profile": 1 if research_only_profile else 0,
+            "paper_execution_profile": 1 if bool(current.get("paper_execution_profile")) else 0,
+            "paper_approved": 0,
+            "live_approved": 0,
+            "rejected": 1,
+            "max_paper_notional_usd": float(current.get("max_paper_notional_usd", 0.0) or 0.0),
+            "max_open_trades": int(current.get("max_open_trades", 0) or 0),
+            "cooldown_minutes": int(current.get("cooldown_minutes", 0) or 0),
+            "recommendation": "manually_rejected",
+            "rejection_reason": str(reason),
+            "blocker_reasons_json": self._to_json([str(reason)]),
+            "replay_summary_json": self._to_json(current.get("replay_summary_json", {})),
+            "paper_sim_summary_json": self._to_json(current.get("paper_sim_summary_json", {})),
+            "data_integrity_json": self._to_json(current.get("data_integrity_json", {})),
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "approved_at": current.get("approved_at").isoformat()
+            if isinstance(current.get("approved_at"), datetime)
+            else current.get("approved_at"),
+            "rejected_at": datetime.now().astimezone().isoformat(),
+        }
+        self._upsert_strategy_promotion(row=row)
+
+    def _normalize_strategy_promotion_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized = dict(row)
+            for key in ("updated_at", "approved_at", "rejected_at"):
+                if key in normalized:
+                    normalized[key] = self._normalize_db_datetime_value(normalized[key])
+            for key in (
+                "replay_summary_json",
+                "paper_sim_summary_json",
+                "data_integrity_json",
+            ):
+                if key in normalized:
+                    normalized[key] = self._from_json(normalized[key], default={})
+            if "blocker_reasons_json" in normalized:
+                normalized["blocker_reasons_json"] = self._from_json(
+                    normalized["blocker_reasons_json"],
+                    default=[],
+                )
+            normalized_rows.append(normalized)
+        return normalized_rows
+
+    def _upsert_strategy_promotion(self, *, row: dict[str, Any]) -> None:
+        if self.backend == "postgres":
+            self._upsert_strategy_promotion_postgres(row=row)
+        else:
+            self._upsert_strategy_promotion_sqlite(row=row)
+
+    def record_research_cycle_decisions(
+        self,
+        *,
+        decisions: list[dict[str, Any]],
+    ) -> int:
+        if not decisions:
+            return 0
+        rows = [
+            {
+                "cycle_id": str(item.get("cycle_id", "")),
+                "created_at": (
+                    item.get("created_at").isoformat()
+                    if isinstance(item.get("created_at"), datetime)
+                    else str(item.get("created_at", ""))
+                ),
+                "strategy_id": str(item.get("strategy_id", "")),
+                "profile_id": str(item.get("profile_id", "")),
+                "asset_class": str(item.get("asset_class", "")),
+                "symbol_universe_json": self._to_json(item.get("symbol_universe", [])),
+                "timeframe": str(item.get("timeframe", "")),
+                "replay_window_start": (
+                    item.get("replay_window_start").isoformat()
+                    if isinstance(item.get("replay_window_start"), datetime)
+                    else str(item.get("replay_window_start", ""))
+                ),
+                "replay_window_end": (
+                    item.get("replay_window_end").isoformat()
+                    if isinstance(item.get("replay_window_end"), datetime)
+                    else str(item.get("replay_window_end", ""))
+                ),
+                "windows_tested_count": int(item.get("windows_tested_count", 0) or 0),
+                "candidates_evaluated": int(item.get("candidates_evaluated", 0) or 0),
+                "signals_generated": int(item.get("signals_generated", 0) or 0),
+                "proposals_created": int(item.get("proposals_created", 0) or 0),
+                "outcomes_recorded": int(item.get("outcomes_recorded", 0) or 0),
+                "gross_return_summary_json": self._to_json(
+                    item.get("gross_return_summary", {})
+                ),
+                "estimated_cost_assumptions_json": self._to_json(
+                    item.get("estimated_cost_assumptions", {})
+                ),
+                "net_return_summary_json": self._to_json(item.get("net_return_summary", {})),
+                "win_rate_summary_json": self._to_json(item.get("win_rate_summary", {})),
+                "sample_size_status": str(item.get("sample_size_status", "")),
+                "data_integrity_status": str(item.get("data_integrity_status", "")),
+                "recommendation": str(item.get("recommendation", "")),
+                "blocker_reasons_json": self._to_json(item.get("blocker_reasons", [])),
+                "source_environment": str(item.get("source_environment", "backtest")),
+                "execution_provider": str(item.get("execution_provider", "simulator")),
+                "windows_used_json": self._to_json(item.get("windows_used", [])),
+                "timeframes_used_json": self._to_json(item.get("timeframes_used", [])),
+                "timeframes_skipped_json": self._to_json(item.get("timeframes_skipped", [])),
+                "paper_fitness_includes_backtest": 1
+                if bool(item.get("paper_fitness_includes_backtest"))
+                else 0,
+                "live_fitness_includes_backtest": 1
+                if bool(item.get("live_fitness_includes_backtest"))
+                else 0,
+                "raw_json": self._to_json(item),
+            }
+            for item in decisions
+        ]
+        if self.backend == "postgres":
+            self._record_research_cycle_decisions_postgres(rows=rows)
+        else:
+            self._record_research_cycle_decisions_sqlite(rows=rows)
+        return len(rows)
+
+    def list_research_cycle_decisions(
+        self,
+        *,
+        cycle_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_research_cycle_decisions_postgres(
+                cycle_id=str(cycle_id or "").strip(),
+                limit=limit,
+            )
+        else:
+            rows = self._list_research_cycle_decisions_sqlite(
+                cycle_id=str(cycle_id or "").strip(),
+                limit=limit,
+            )
+        return self._normalize_research_cycle_decision_rows(rows)
+
+    def list_latest_research_cycle_decisions(self) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_latest_research_cycle_decisions_postgres()
+        else:
+            rows = self._list_latest_research_cycle_decisions_sqlite()
+        return self._normalize_research_cycle_decision_rows(rows)
+
+    def upsert_attention_alert(
+        self,
+        *,
+        alert: dict[str, Any],
+    ) -> None:
+        row = {
+            "event_id": str(alert.get("event_id", "")).strip(),
+            "created_at": self._serialize_datetime(alert.get("created_at")),
+            "updated_at": self._serialize_datetime(alert.get("updated_at")),
+            "severity": str(alert.get("severity", "warning")).strip().lower(),
+            "event_type": str(alert.get("event_type", "")).strip(),
+            "strategy_id": str(alert.get("strategy_id", "")).strip(),
+            "profile_id": str(alert.get("profile_id", "")).strip(),
+            "title": str(alert.get("title", "")).strip(),
+            "message": str(alert.get("message", "")).strip(),
+            "evidence_summary_json": self._to_json(alert.get("evidence_summary", {})),
+            "recommended_action": str(alert.get("recommended_action", "")).strip(),
+            "approval_request_id": str(alert.get("approval_request_id", "")).strip(),
+            "requires_attention": 1 if bool(alert.get("requires_attention")) else 0,
+            "attention_status": str(alert.get("attention_status", "open")).strip().lower(),
+            "first_slack_sent_at": self._serialize_datetime(alert.get("first_slack_sent_at")),
+            "last_slack_sent_at": self._serialize_datetime(alert.get("last_slack_sent_at")),
+            "next_slack_due_at": self._serialize_datetime(alert.get("next_slack_due_at")),
+            "slack_send_count": int(alert.get("slack_send_count", 0) or 0),
+            "slack_sent": 1 if bool(alert.get("slack_sent")) else 0,
+            "slack_error": str(alert.get("slack_error", "")).strip(),
+            "resolved_at": self._serialize_datetime(alert.get("resolved_at")),
+            "resolved_reason": str(alert.get("resolved_reason", "")).strip(),
+        }
+        if self.backend == "postgres":
+            self._upsert_attention_alert_postgres(row=row)
+        else:
+            self._upsert_attention_alert_sqlite(row=row)
+
+    def list_due_attention_alerts(
+        self,
+        *,
+        due_at: datetime,
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_due_attention_alerts_postgres(due_at=due_at)
+        else:
+            rows = self._list_due_attention_alerts_sqlite(due_at=due_at)
+        return self._normalize_attention_alert_rows(rows)
+
+    def list_open_attention_alerts(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_open_attention_alerts_postgres(limit=limit)
+        else:
+            rows = self._list_open_attention_alerts_sqlite(limit=limit)
+        return self._normalize_attention_alert_rows(rows)
+
+    def get_attention_alert(self, *, event_id: str) -> dict[str, Any] | None:
+        normalized_event_id = str(event_id or "").strip()
+        if not normalized_event_id:
+            return None
+        if self.backend == "postgres":
+            row = self._get_attention_alert_postgres(event_id=normalized_event_id)
+        else:
+            row = self._get_attention_alert_sqlite(event_id=normalized_event_id)
+        if row is None:
+            return None
+        return self._normalize_attention_alert_rows([row])[0]
+
+    def resolve_attention_alert(
+        self,
+        *,
+        event_id: str,
+        status: str,
+        reason: str,
+        resolved_at: datetime | None = None,
+    ) -> None:
+        normalized_event_id = str(event_id or "").strip()
+        if not normalized_event_id:
+            return
+        if self.backend == "postgres":
+            self._resolve_attention_alert_postgres(
+                event_id=normalized_event_id,
+                status=status,
+                reason=reason,
+                resolved_at=resolved_at or datetime.now().astimezone(),
+            )
+        else:
+            self._resolve_attention_alert_sqlite(
+                event_id=normalized_event_id,
+                status=status,
+                reason=reason,
+                resolved_at=resolved_at or datetime.now().astimezone(),
+            )
+
+    def resolve_attention_alerts_for_approval_request(
+        self,
+        *,
+        approval_request_id: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        normalized = str(approval_request_id or "").strip()
+        if not normalized:
+            return
+        if self.backend == "postgres":
+            self._resolve_attention_alerts_for_approval_request_postgres(
+                approval_request_id=normalized,
+                status=status,
+                reason=reason,
+                resolved_at=datetime.now().astimezone(),
+            )
+        else:
+            self._resolve_attention_alerts_for_approval_request_sqlite(
+                approval_request_id=normalized,
+                status=status,
+                reason=reason,
+                resolved_at=datetime.now().astimezone(),
+            )
+
+    def mark_attention_alert_sent(
+        self,
+        *,
+        event_id: str,
+        sent_at: datetime,
+        next_due_at: datetime | None,
+        slack_send_count: int,
+        slack_error: str = "",
+    ) -> None:
+        if self.backend == "postgres":
+            self._mark_attention_alert_sent_postgres(
+                event_id=event_id,
+                sent_at=sent_at,
+                next_due_at=next_due_at,
+                slack_send_count=slack_send_count,
+                slack_error=slack_error,
+            )
+        else:
+            self._mark_attention_alert_sent_sqlite(
+                event_id=event_id,
+                sent_at=sent_at,
+                next_due_at=next_due_at,
+                slack_send_count=slack_send_count,
+                slack_error=slack_error,
+            )
+
+    def _normalize_research_cycle_decision_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized = dict(row)
+            for key in ("created_at", "replay_window_start", "replay_window_end"):
+                if key in normalized:
+                    normalized[key] = self._normalize_db_datetime_value(normalized[key])
+            for key, default in (
+                ("symbol_universe_json", []),
+                ("gross_return_summary_json", {}),
+                ("estimated_cost_assumptions_json", {}),
+                ("net_return_summary_json", {}),
+                ("win_rate_summary_json", {}),
+                ("blocker_reasons_json", []),
+                ("windows_used_json", []),
+                ("timeframes_used_json", []),
+                ("timeframes_skipped_json", []),
+                ("raw_json", {}),
+            ):
+                if key in normalized:
+                    normalized[key] = self._from_json(normalized[key], default=default)
+            normalized_rows.append(normalized)
+        return normalized_rows
+
+    def _normalize_attention_alert_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized = dict(row)
+            for key in (
+                "created_at",
+                "updated_at",
+                "first_slack_sent_at",
+                "last_slack_sent_at",
+                "next_slack_due_at",
+                "resolved_at",
+            ):
+                if key in normalized:
+                    normalized[key] = self._normalize_db_datetime_value(normalized[key])
+            if "evidence_summary_json" in normalized:
+                normalized["evidence_summary_json"] = self._from_json(
+                    normalized["evidence_summary_json"],
+                    default={},
+                )
+            normalized_rows.append(normalized)
+        return normalized_rows
+
+    def _serialize_datetime(self, value: Any) -> str | None:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        text = str(value or "").strip()
+        return text or None
+
+    def latest_real_heartbeat_research_cycle_summary(self) -> dict[str, Any]:
+        for row in self.list_recent_tick_runs(limit=200):
+            snapshot = row.get("state_snapshot_json", {}) if isinstance(row, dict) else {}
+            run = snapshot.get("run", {}) if isinstance(snapshot, dict) else {}
+            state = snapshot.get("research_cycle", {}) if isinstance(snapshot, dict) else {}
+            if (
+                str(run.get("pipeline", "") or "") == "research_cycle"
+                and str(run.get("source", "") or "") == "real_heartbeat"
+            ):
+                return {
+                    "latest_real_heartbeat_tick_id": str(run.get("parent_tick_id", "") or ""),
+                    "latest_real_research_cycle_id": str(run.get("research_cycle_id", "") or row.get("tick_id", "")),
+                    "source": str(run.get("source", "") or ""),
+                    "latest_real_research_cycle_started_at": self._serialize_datetime(
+                        row.get("started_at")
+                    )
+                    or "",
+                    "strategy_profiles_discovered": int(
+                        state.get("strategy_profiles_discovered", 0) or 0
+                    ),
+                    "strategy_profiles_evaluated": int(
+                        state.get("strategy_profiles_evaluated", 0) or 0
+                    ),
+                    "usable_decisions_count": int(
+                        state.get("usable_decisions_count", 0) or 0
+                    ),
+                    "historical_windows_selected": int(
+                        state.get("historical_windows_selected", 0) or 0
+                    ),
+                    "replay_windows_accepted_count": int(
+                        state.get("replay_windows_accepted_count", 0) or 0
+                    ),
+                    "replay_windows_rejected_count": int(
+                        state.get("replay_windows_rejected_count", 0) or 0
+                    ),
+                    "latest_valid_replay_window_end": str(
+                        state.get("latest_valid_replay_window_end", "") or ""
+                    ),
+                    "paper_candidates_created": int(
+                        state.get("paper_candidates_created", 0) or 0
+                    ),
+                    "paper_removal_candidates_created": int(
+                        state.get("paper_removal_candidates_created", 0) or 0
+                    ),
+                    "blockers": list(state.get("blockers", []) or []),
+                }
+        return {}
 
     def list_recent_broker_account_snapshots(self, *, limit: int = 20) -> list[dict[str, Any]]:
         if self.backend == "postgres":
@@ -1554,6 +2318,76 @@ class UsageLedger:
         if preference == "sqlite":
             return False
         return bool(self.config.postgres_configured)
+
+    def _build_postgres_missing_config_error(self) -> str:
+        reasons = self._postgres_missing_configuration_reasons()
+        detail = "; ".join(reasons) if reasons else "unknown configuration problem"
+        return (
+            "PostgreSQL operations store is required but not available; "
+            f"{detail}. Refusing SQLite fallback for live operation/monitoring."
+        )
+
+    def _build_postgres_required_error(self, exc: Exception) -> str:
+        detail = self._classify_postgres_connection_error(exc)
+        return (
+            "PostgreSQL operations store is required but unavailable; "
+            f"{detail}. Refusing SQLite fallback for live operation/monitoring."
+        )
+
+    def _postgres_missing_configuration_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not str(os.getenv("DATABASE_URL", "") or "").strip():
+            reasons.append("DATABASE_URL not set")
+        if not str(os.getenv("POSTGRES_HOST", "") or "").strip():
+            reasons.append("POSTGRES_HOST not set")
+        if not str(os.getenv("POSTGRES_PORT", "") or "").strip():
+            reasons.append("POSTGRES_PORT not set")
+        if not str(os.getenv("POSTGRES_DB", "") or "").strip():
+            reasons.append("POSTGRES_DB not set")
+        if not str(os.getenv("POSTGRES_USER", "") or "").strip():
+            reasons.append("POSTGRES_USER not set")
+        if not str(os.getenv("POSTGRES_PASSWORD", "") or "").strip():
+            reasons.append("POSTGRES_PASSWORD not set")
+        if not DEFAULT_ENV_PATH.exists():
+            reasons.append(f".env not found at {DEFAULT_ENV_PATH}")
+        if Path.cwd() != PROJECT_ROOT:
+            reasons.append(
+                f"current working directory is {Path.cwd()} (expected {PROJECT_ROOT})"
+            )
+        if psycopg2 is None:
+            reasons.append("psycopg2 not installed")
+        return reasons
+
+    def _classify_postgres_connection_error(self, exc: Exception) -> str:
+        message = str(exc or "").strip()
+        lowered = message.lower()
+        host = str(os.getenv("POSTGRES_HOST", "") or "").strip() or "localhost"
+        port = str(os.getenv("POSTGRES_PORT", "") or "").strip() or "5432"
+        database = str(os.getenv("POSTGRES_DB", "") or "").strip()
+        if not self.config.database_url:
+            reasons = self._postgres_missing_configuration_reasons()
+            return "; ".join(reasons) if reasons else "DATABASE_URL not set"
+        if "password authentication failed" in lowered or "authentication failed" in lowered:
+            return "user/password rejected"
+        if "role" in lowered and "does not exist" in lowered:
+            return "database user does not exist"
+        if "database" in lowered and "does not exist" in lowered:
+            return f"database does not exist ({database or 'unknown'})"
+        if "connection refused" in lowered:
+            return f"could not connect to {host}:{port}"
+        if "could not translate host name" in lowered or "name or service not known" in lowered:
+            return f"could not resolve host {host}"
+        if "timeout expired" in lowered:
+            return f"connection timed out to {host}:{port}"
+        if "permission denied" in lowered and "schema" in lowered:
+            return "operations tables missing or schema permissions denied"
+        if "permission denied" in lowered:
+            return "permission denied while preparing operations store"
+        if "relation" in lowered and "does not exist" in lowered:
+            return "operations tables missing"
+        if ".env" in lowered:
+            return message
+        return message or f"could not connect to {host}:{port}"
 
     def _resolve_estimated_cost(
         self,
@@ -2397,6 +3231,101 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS slow_enrichment_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    work_key TEXT NOT NULL DEFAULT '',
+                    tick_id TEXT NOT NULL,
+                    queued_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    source TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    asset_class TEXT NOT NULL DEFAULT '',
+                    rank INTEGER NOT NULL DEFAULT 0,
+                    discovery_score REAL NOT NULL DEFAULT 0,
+                    bar_timestamp TEXT,
+                    claimed_at TEXT,
+                    processed_at TEXT,
+                    retry_at TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    error TEXT NOT NULL DEFAULT '',
+                    candidate_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            self._ensure_sqlite_columns(
+                connection,
+                table_name="slow_enrichment_jobs",
+                columns={
+                    "work_key": "TEXT NOT NULL DEFAULT ''",
+                    "retry_at": "TEXT",
+                    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                },
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_slow_enrichment_jobs_status_queued
+                ON slow_enrichment_jobs (status, queued_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_slow_enrichment_jobs_tick_symbol
+                ON slow_enrichment_jobs (tick_id, source, symbol)
+                """
+            )
+            connection.execute(
+                """
+                DROP INDEX IF EXISTS idx_slow_enrichment_jobs_work_key
+                """
+            )
+            connection.execute(
+                """
+                UPDATE slow_enrichment_jobs
+                SET work_key = source || ':' || UPPER(symbol)
+                WHERE work_key = ''
+                """
+            )
+            connection.execute(
+                """
+                DELETE FROM slow_enrichment_jobs
+                WHERE rowid NOT IN (
+                    SELECT MAX(rowid)
+                    FROM slow_enrichment_jobs
+                    WHERE work_key <> ''
+                    GROUP BY work_key
+                )
+                AND work_key <> ''
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_slow_enrichment_jobs_work_key
+                ON slow_enrichment_jobs (work_key)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS slow_enrichment_results (
+                    job_id TEXT PRIMARY KEY,
+                    tick_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    processed_at TEXT NOT NULL,
+                    trade_authority TEXT NOT NULL DEFAULT 'none',
+                    technical_context_json TEXT NOT NULL DEFAULT '{}',
+                    result_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_slow_enrichment_results_tick_symbol
+                ON slow_enrichment_results (tick_id, source, symbol)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS gemini_candidate_analyses (
                     tick_id TEXT NOT NULL,
                     symbol TEXT NOT NULL,
@@ -2841,6 +3770,134 @@ class UsageLedger:
                 """
                 CREATE INDEX IF NOT EXISTS idx_strategy_fitness_snapshots_env_source
                 ON strategy_fitness_snapshots (environment, source_environment, mode, captured_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_promotions (
+                    strategy_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT 'research_only',
+                    research_only_profile INTEGER NOT NULL DEFAULT 0,
+                    paper_execution_profile INTEGER NOT NULL DEFAULT 0,
+                    paper_approved INTEGER NOT NULL DEFAULT 0,
+                    live_approved INTEGER NOT NULL DEFAULT 0,
+                    rejected INTEGER NOT NULL DEFAULT 0,
+                    max_paper_notional_usd REAL NOT NULL DEFAULT 0,
+                    max_open_trades INTEGER NOT NULL DEFAULT 0,
+                    cooldown_minutes INTEGER NOT NULL DEFAULT 0,
+                    recommendation TEXT NOT NULL DEFAULT '',
+                    rejection_reason TEXT NOT NULL DEFAULT '',
+                    blocker_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    replay_summary_json TEXT NOT NULL DEFAULT '{}',
+                    paper_sim_summary_json TEXT NOT NULL DEFAULT '{}',
+                    data_integrity_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    approved_at TEXT,
+                    rejected_at TEXT,
+                    PRIMARY KEY (strategy_id, profile_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_promotions_stage
+                ON strategy_promotions (stage, updated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_promotions_approval
+                ON strategy_promotions (paper_approved, live_approved, rejected, updated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS research_cycle_decisions (
+                    cycle_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    asset_class TEXT NOT NULL,
+                    symbol_universe_json TEXT NOT NULL DEFAULT '[]',
+                    timeframe TEXT NOT NULL,
+                    replay_window_start TEXT NOT NULL,
+                    replay_window_end TEXT NOT NULL,
+                    windows_tested_count INTEGER NOT NULL DEFAULT 0,
+                    candidates_evaluated INTEGER NOT NULL DEFAULT 0,
+                    signals_generated INTEGER NOT NULL DEFAULT 0,
+                    proposals_created INTEGER NOT NULL DEFAULT 0,
+                    outcomes_recorded INTEGER NOT NULL DEFAULT 0,
+                    gross_return_summary_json TEXT NOT NULL DEFAULT '{}',
+                    estimated_cost_assumptions_json TEXT NOT NULL DEFAULT '{}',
+                    net_return_summary_json TEXT NOT NULL DEFAULT '{}',
+                    win_rate_summary_json TEXT NOT NULL DEFAULT '{}',
+                    sample_size_status TEXT NOT NULL DEFAULT '',
+                    data_integrity_status TEXT NOT NULL DEFAULT '',
+                    recommendation TEXT NOT NULL DEFAULT '',
+                    blocker_reasons_json TEXT NOT NULL DEFAULT '[]',
+                    source_environment TEXT NOT NULL DEFAULT 'backtest',
+                    execution_provider TEXT NOT NULL DEFAULT 'simulator',
+                    windows_used_json TEXT NOT NULL DEFAULT '[]',
+                    timeframes_used_json TEXT NOT NULL DEFAULT '[]',
+                    timeframes_skipped_json TEXT NOT NULL DEFAULT '[]',
+                    paper_fitness_includes_backtest INTEGER NOT NULL DEFAULT 0,
+                    live_fitness_includes_backtest INTEGER NOT NULL DEFAULT 0,
+                    raw_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (cycle_id, strategy_id, profile_id, timeframe)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_research_cycle_decisions_cycle
+                ON research_cycle_decisions (cycle_id, created_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_research_cycle_decisions_latest
+                ON research_cycle_decisions (created_at, recommendation, strategy_id, profile_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attention_alerts (
+                    event_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    severity TEXT NOT NULL DEFAULT 'warning',
+                    event_type TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL DEFAULT '',
+                    profile_id TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT '',
+                    evidence_summary_json TEXT NOT NULL DEFAULT '{}',
+                    recommended_action TEXT NOT NULL DEFAULT '',
+                    approval_request_id TEXT NOT NULL DEFAULT '',
+                    requires_attention INTEGER NOT NULL DEFAULT 0,
+                    attention_status TEXT NOT NULL DEFAULT 'open',
+                    first_slack_sent_at TEXT,
+                    last_slack_sent_at TEXT,
+                    next_slack_due_at TEXT,
+                    slack_send_count INTEGER NOT NULL DEFAULT 0,
+                    slack_sent INTEGER NOT NULL DEFAULT 0,
+                    slack_error TEXT NOT NULL DEFAULT '',
+                    resolved_at TEXT,
+                    resolved_reason TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_attention_alerts_due
+                ON attention_alerts (requires_attention, attention_status, next_slack_due_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_attention_alerts_approval
+                ON attention_alerts (approval_request_id, attention_status, updated_at)
                 """
             )
 
@@ -3328,6 +4385,113 @@ class UsageLedger:
                         raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                         PRIMARY KEY (tick_id, source, symbol)
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS slow_enrichment_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        work_key TEXT NOT NULL DEFAULT '',
+                        tick_id TEXT NOT NULL,
+                        queued_at TIMESTAMPTZ NOT NULL,
+                        expires_at TIMESTAMPTZ,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        source TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        asset_class TEXT NOT NULL DEFAULT '',
+                        rank INTEGER NOT NULL DEFAULT 0,
+                        discovery_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        bar_timestamp TIMESTAMPTZ,
+                        claimed_at TIMESTAMPTZ,
+                        processed_at TIMESTAMPTZ,
+                        retry_at TIMESTAMPTZ,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        error TEXT NOT NULL DEFAULT '',
+                        candidate_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE slow_enrichment_jobs
+                    ADD COLUMN IF NOT EXISTS work_key TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE slow_enrichment_jobs
+                    ADD COLUMN IF NOT EXISTS retry_at TIMESTAMPTZ
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE slow_enrichment_jobs
+                    ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_slow_enrichment_jobs_status_queued
+                    ON slow_enrichment_jobs (status, queued_at)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_slow_enrichment_jobs_tick_symbol
+                    ON slow_enrichment_jobs (tick_id, source, symbol)
+                    """
+                )
+                cursor.execute(
+                    """
+                    DROP INDEX IF EXISTS idx_slow_enrichment_jobs_work_key
+                    """
+                )
+                cursor.execute(
+                    """
+                    UPDATE slow_enrichment_jobs
+                    SET work_key = source || ':' || UPPER(symbol)
+                    WHERE work_key = ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM slow_enrichment_jobs
+                    WHERE ctid NOT IN (
+                        SELECT ctid
+                        FROM (
+                            SELECT DISTINCT ON (work_key) ctid
+                            FROM slow_enrichment_jobs
+                            WHERE work_key <> ''
+                            ORDER BY work_key, queued_at DESC, job_id DESC
+                        ) deduped
+                    )
+                    AND work_key <> ''
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_slow_enrichment_jobs_work_key
+                    ON slow_enrichment_jobs (work_key)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS slow_enrichment_results (
+                        job_id TEXT PRIMARY KEY,
+                        tick_id TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        processed_at TIMESTAMPTZ NOT NULL,
+                        trade_authority TEXT NOT NULL DEFAULT 'none',
+                        technical_context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        result_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_slow_enrichment_results_tick_symbol
+                    ON slow_enrichment_results (tick_id, source, symbol)
                     """
                 )
                 cursor.execute(
@@ -3974,6 +5138,134 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_strategy_fitness_snapshots_env_source
                     ON strategy_fitness_snapshots (environment, source_environment, mode, captured_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS strategy_promotions (
+                        strategy_id TEXT NOT NULL,
+                        profile_id TEXT NOT NULL,
+                        stage TEXT NOT NULL DEFAULT 'research_only',
+                        research_only_profile INTEGER NOT NULL DEFAULT 0,
+                        paper_execution_profile INTEGER NOT NULL DEFAULT 0,
+                        paper_approved INTEGER NOT NULL DEFAULT 0,
+                        live_approved INTEGER NOT NULL DEFAULT 0,
+                        rejected INTEGER NOT NULL DEFAULT 0,
+                        max_paper_notional_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        max_open_trades INTEGER NOT NULL DEFAULT 0,
+                        cooldown_minutes INTEGER NOT NULL DEFAULT 0,
+                        recommendation TEXT NOT NULL DEFAULT '',
+                        rejection_reason TEXT NOT NULL DEFAULT '',
+                        blocker_reasons_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        replay_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        paper_sim_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        data_integrity_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        approved_at TIMESTAMPTZ,
+                        rejected_at TIMESTAMPTZ,
+                        PRIMARY KEY (strategy_id, profile_id)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_promotions_stage
+                    ON strategy_promotions (stage, updated_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_promotions_approval
+                    ON strategy_promotions (paper_approved, live_approved, rejected, updated_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS research_cycle_decisions (
+                        cycle_id TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        strategy_id TEXT NOT NULL,
+                        profile_id TEXT NOT NULL,
+                        asset_class TEXT NOT NULL,
+                        symbol_universe_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        timeframe TEXT NOT NULL,
+                        replay_window_start TIMESTAMPTZ NOT NULL,
+                        replay_window_end TIMESTAMPTZ NOT NULL,
+                        windows_tested_count INTEGER NOT NULL DEFAULT 0,
+                        candidates_evaluated INTEGER NOT NULL DEFAULT 0,
+                        signals_generated INTEGER NOT NULL DEFAULT 0,
+                        proposals_created INTEGER NOT NULL DEFAULT 0,
+                        outcomes_recorded INTEGER NOT NULL DEFAULT 0,
+                        gross_return_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        estimated_cost_assumptions_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        net_return_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        win_rate_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        sample_size_status TEXT NOT NULL DEFAULT '',
+                        data_integrity_status TEXT NOT NULL DEFAULT '',
+                        recommendation TEXT NOT NULL DEFAULT '',
+                        blocker_reasons_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        source_environment TEXT NOT NULL DEFAULT 'backtest',
+                        execution_provider TEXT NOT NULL DEFAULT 'simulator',
+                        windows_used_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        timeframes_used_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        timeframes_skipped_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        paper_fitness_includes_backtest INTEGER NOT NULL DEFAULT 0,
+                        live_fitness_includes_backtest INTEGER NOT NULL DEFAULT 0,
+                        raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        PRIMARY KEY (cycle_id, strategy_id, profile_id, timeframe)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_research_cycle_decisions_cycle
+                    ON research_cycle_decisions (cycle_id, created_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_research_cycle_decisions_latest
+                    ON research_cycle_decisions (created_at DESC, recommendation, strategy_id, profile_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS attention_alerts (
+                        event_id TEXT PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        severity TEXT NOT NULL DEFAULT 'warning',
+                        event_type TEXT NOT NULL,
+                        strategy_id TEXT NOT NULL DEFAULT '',
+                        profile_id TEXT NOT NULL DEFAULT '',
+                        title TEXT NOT NULL DEFAULT '',
+                        message TEXT NOT NULL DEFAULT '',
+                        evidence_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        recommended_action TEXT NOT NULL DEFAULT '',
+                        approval_request_id TEXT NOT NULL DEFAULT '',
+                        requires_attention INTEGER NOT NULL DEFAULT 0,
+                        attention_status TEXT NOT NULL DEFAULT 'open',
+                        first_slack_sent_at TIMESTAMPTZ,
+                        last_slack_sent_at TIMESTAMPTZ,
+                        next_slack_due_at TIMESTAMPTZ,
+                        slack_send_count INTEGER NOT NULL DEFAULT 0,
+                        slack_sent INTEGER NOT NULL DEFAULT 0,
+                        slack_error TEXT NOT NULL DEFAULT '',
+                        resolved_at TIMESTAMPTZ,
+                        resolved_reason TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_attention_alerts_due
+                    ON attention_alerts (requires_attention, attention_status, next_slack_due_at)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_attention_alerts_approval
+                    ON attention_alerts (approval_request_id, attention_status, updated_at DESC)
                     """
                 )
                 self._ensure_postgres_lane_layout(cursor)
@@ -4941,26 +6233,53 @@ class UsageLedger:
         *,
         tick_id: str,
         symbol_keys: list[tuple[str, str]],
+        current_rows: list[dict[str, Any]],
     ) -> dict[tuple[str, str], dict[str, Any]]:
         result: dict[tuple[str, str], dict[str, Any]] = {}
         if not symbol_keys:
             return result
+        current_by_key = {
+            (str(row.get("source", "")), str(row.get("symbol", ""))): row
+            for row in current_rows
+            if isinstance(row, dict)
+        }
 
         with self._connect_sqlite() as connection:
             for source, symbol in symbol_keys:
-                row = connection.execute(
-                    """
-                    SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
-                           open_price, high_price, low_price, close_price,
-                           open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
-                           volume, trade_count, vwap
-                    FROM market_data_latest_bars
-                    WHERE source = ? AND symbol = ? AND tick_id != ?
-                    ORDER BY captured_at DESC
-                    LIMIT 1
-                    """,
-                    (source, symbol, tick_id),
-                ).fetchone()
+                current_row = current_by_key.get((source, symbol), {})
+                current_reference = self._normalize_db_datetime_value(
+                    current_row.get("bar_timestamp") or current_row.get("captured_at")
+                )
+                if current_reference is not None:
+                    row = connection.execute(
+                        """
+                        SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
+                               open_price, high_price, low_price, close_price,
+                               open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
+                               volume, trade_count, vwap
+                        FROM market_data_latest_bars
+                        WHERE source = ? AND symbol = ? AND tick_id != ?
+                          AND datetime(COALESCE(bar_timestamp, captured_at)) < datetime(?)
+                        ORDER BY datetime(COALESCE(bar_timestamp, captured_at)) DESC,
+                                 datetime(captured_at) DESC
+                        LIMIT 1
+                        """,
+                        (source, symbol, tick_id, current_reference.isoformat()),
+                    ).fetchone()
+                else:
+                    row = connection.execute(
+                        """
+                        SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
+                               open_price, high_price, low_price, close_price,
+                               open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
+                               volume, trade_count, vwap
+                        FROM market_data_latest_bars
+                        WHERE source = ? AND symbol = ? AND tick_id != ?
+                        ORDER BY datetime(captured_at) DESC
+                        LIMIT 1
+                        """,
+                        (source, symbol, tick_id),
+                    ).fetchone()
                 if row is not None:
                     result[(source, symbol)] = dict(row)
         return result
@@ -4970,27 +6289,53 @@ class UsageLedger:
         *,
         tick_id: str,
         symbol_keys: list[tuple[str, str]],
+        current_rows: list[dict[str, Any]],
     ) -> dict[tuple[str, str], dict[str, Any]]:
         result: dict[tuple[str, str], dict[str, Any]] = {}
         if not symbol_keys:
             return result
+        current_by_key = {
+            (str(row.get("source", "")), str(row.get("symbol", ""))): row
+            for row in current_rows
+            if isinstance(row, dict)
+        }
 
         with self._connect_postgres() as connection:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 for source, symbol in symbol_keys:
-                    cursor.execute(
-                        """
-                        SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
-                               open_price, high_price, low_price, close_price,
-                               open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
-                               volume, trade_count, vwap
-                        FROM market_data_latest_bars
-                        WHERE source = %s AND symbol = %s AND tick_id != %s
-                        ORDER BY captured_at DESC
-                        LIMIT 1
-                        """,
-                        (source, symbol, tick_id),
+                    current_row = current_by_key.get((source, symbol), {})
+                    current_reference = self._normalize_db_datetime_value(
+                        current_row.get("bar_timestamp") or current_row.get("captured_at")
                     )
+                    if current_reference is not None:
+                        cursor.execute(
+                            """
+                            SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
+                                   open_price, high_price, low_price, close_price,
+                                   open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
+                                   volume, trade_count, vwap
+                            FROM market_data_latest_bars
+                            WHERE source = %s AND symbol = %s AND tick_id != %s
+                              AND COALESCE(bar_timestamp, captured_at) < %s
+                            ORDER BY COALESCE(bar_timestamp, captured_at) DESC, captured_at DESC
+                            LIMIT 1
+                            """,
+                            (source, symbol, tick_id, current_reference),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            SELECT tick_id, source, symbol, bar_timestamp, quote_currency,
+                                   open_price, high_price, low_price, close_price,
+                                   open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
+                                   volume, trade_count, vwap
+                            FROM market_data_latest_bars
+                            WHERE source = %s AND symbol = %s AND tick_id != %s
+                            ORDER BY captured_at DESC
+                            LIMIT 1
+                            """,
+                            (source, symbol, tick_id),
+                        )
                     row = cursor.fetchone()
                     if row is not None:
                         result[(source, symbol)] = dict(row)
@@ -5100,6 +6445,653 @@ class UsageLedger:
                         for item in candidates
                     ],
                 )
+
+    def _enqueue_slow_enrichment_jobs_sqlite(
+        self,
+        *,
+        jobs: list[dict[str, Any]],
+        max_pending_items: int,
+        queued_at: datetime | None = None,
+    ) -> dict[str, int]:
+        effective_now = queued_at or datetime.now().astimezone()
+        repair_counts = self._repair_slow_enrichment_jobs_sqlite(repaired_at=effective_now)
+        pending_before = self._count_active_slow_enrichment_jobs_sqlite(
+            counted_at=effective_now
+        )
+        available_slots = max(0, max_pending_items - pending_before)
+        inserted = 0
+        refreshed = 0
+        skipped_invalid_work_key = 0
+        skipped_pending_cap = 0
+        refreshed_by_previous_status: dict[str, int] = {}
+        with self._connect_sqlite() as connection:
+            for item in jobs:
+                work_key = self._slow_enrichment_work_key(item)
+                if not work_key or work_key == ":":
+                    skipped_invalid_work_key += 1
+                    continue
+                row = connection.execute(
+                    """
+                    SELECT status
+                    FROM slow_enrichment_jobs
+                    WHERE work_key = ?
+                    """,
+                    (work_key,),
+                ).fetchone()
+                if row is None and available_slots <= 0:
+                    skipped_pending_cap += 1
+                    continue
+                cursor = connection.execute(
+                    """
+                    INSERT INTO slow_enrichment_jobs (
+                        job_id, work_key, tick_id, queued_at, expires_at, status, source,
+                        symbol, asset_class, rank, discovery_score, bar_timestamp,
+                        candidate_json
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(work_key) DO UPDATE SET
+                        job_id = excluded.job_id,
+                        tick_id = excluded.tick_id,
+                        queued_at = excluded.queued_at,
+                        expires_at = excluded.expires_at,
+                        source = excluded.source,
+                        symbol = excluded.symbol,
+                        asset_class = excluded.asset_class,
+                        rank = excluded.rank,
+                        discovery_score = excluded.discovery_score,
+                        bar_timestamp = excluded.bar_timestamp,
+                        candidate_json = excluded.candidate_json,
+                        status = CASE
+                            WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.status
+                            ELSE 'pending'
+                        END,
+                        claimed_at = CASE
+                            WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.claimed_at
+                            ELSE NULL
+                        END,
+                        processed_at = CASE
+                            WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.processed_at
+                            ELSE NULL
+                        END,
+                        retry_at = NULL,
+                        error = CASE
+                            WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.error
+                            ELSE ''
+                        END
+                    """,
+                    (
+                        item["job_id"],
+                        work_key,
+                        item["tick_id"],
+                        item["queued_at"].isoformat(),
+                        _isoformat_or_none(item.get("expires_at")),
+                        item["source"],
+                        item["symbol"],
+                        item.get("asset_class", ""),
+                        item.get("rank", 0),
+                        item.get("discovery_score", 0),
+                        _isoformat_or_none(item.get("bar_timestamp")),
+                        self._to_json(item.get("candidate", {})),
+                    ),
+                )
+                if row is None:
+                    inserted += int(cursor.rowcount or 0)
+                    available_slots = max(0, available_slots - int(cursor.rowcount or 0))
+                else:
+                    refreshed += int(cursor.rowcount or 0)
+                    previous_status = str(row["status"] or "unknown")
+                    refreshed_by_previous_status[previous_status] = (
+                        refreshed_by_previous_status.get(previous_status, 0) + int(cursor.rowcount or 0)
+                    )
+        return {
+            "pending_before": pending_before,
+            "enqueued": inserted,
+            "refreshed": refreshed,
+            "skipped_invalid_work_key": skipped_invalid_work_key,
+            "skipped_pending_cap": skipped_pending_cap,
+            "repaired_expired": int(repair_counts.get("expired_reset", 0) or 0),
+            "repaired_stale_processing": int(repair_counts.get("stale_processing_reset", 0) or 0),
+            "pending_after_estimate": min(max_pending_items, pending_before + inserted),
+            "refreshed_processed": int(refreshed_by_previous_status.get("processed", 0)),
+            "refreshed_failed": int(refreshed_by_previous_status.get("failed", 0)),
+            "refreshed_expired": int(refreshed_by_previous_status.get("expired", 0)),
+            "refreshed_pending": int(refreshed_by_previous_status.get("pending", 0)),
+            "refreshed_processing": int(refreshed_by_previous_status.get("processing", 0)),
+        }
+
+    def _enqueue_slow_enrichment_jobs_postgres(
+        self,
+        *,
+        jobs: list[dict[str, Any]],
+        max_pending_items: int,
+        queued_at: datetime | None = None,
+    ) -> dict[str, int]:
+        effective_now = queued_at or datetime.now().astimezone()
+        repair_counts = self._repair_slow_enrichment_jobs_postgres(repaired_at=effective_now)
+        pending_before = self._count_active_slow_enrichment_jobs_postgres(
+            counted_at=effective_now
+        )
+        available_slots = max(0, max_pending_items - pending_before)
+        inserted = 0
+        refreshed = 0
+        skipped_invalid_work_key = 0
+        skipped_pending_cap = 0
+        refreshed_by_previous_status: dict[str, int] = {}
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                for item in jobs:
+                    work_key = self._slow_enrichment_work_key(item)
+                    if not work_key or work_key == ":":
+                        skipped_invalid_work_key += 1
+                        continue
+                    cursor.execute(
+                        """
+                        SELECT status
+                        FROM slow_enrichment_jobs
+                        WHERE work_key = %s
+                        LIMIT 1
+                        """,
+                        (work_key,),
+                    )
+                    existing_row = cursor.fetchone()
+                    exists = existing_row is not None
+                    if not exists and available_slots <= 0:
+                        skipped_pending_cap += 1
+                        continue
+                    cursor.execute(
+                        """
+                        INSERT INTO slow_enrichment_jobs (
+                            job_id, work_key, tick_id, queued_at, expires_at, status, source,
+                            symbol, asset_class, rank, discovery_score, bar_timestamp,
+                            candidate_json
+                        ) VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s::jsonb)
+                        ON CONFLICT(work_key) DO UPDATE SET
+                            job_id = EXCLUDED.job_id,
+                            tick_id = EXCLUDED.tick_id,
+                            queued_at = EXCLUDED.queued_at,
+                            expires_at = EXCLUDED.expires_at,
+                            source = EXCLUDED.source,
+                            symbol = EXCLUDED.symbol,
+                            asset_class = EXCLUDED.asset_class,
+                            rank = EXCLUDED.rank,
+                            discovery_score = EXCLUDED.discovery_score,
+                            bar_timestamp = EXCLUDED.bar_timestamp,
+                            candidate_json = EXCLUDED.candidate_json,
+                            status = CASE
+                                WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.status
+                                ELSE 'pending'
+                            END,
+                            claimed_at = CASE
+                                WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.claimed_at
+                                ELSE NULL
+                            END,
+                            processed_at = CASE
+                                WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.processed_at
+                                ELSE NULL
+                            END,
+                            retry_at = NULL,
+                            error = CASE
+                                WHEN slow_enrichment_jobs.status = 'processing' THEN slow_enrichment_jobs.error
+                                ELSE ''
+                            END
+                        RETURNING xmax = 0 AS inserted
+                        """,
+                        (
+                            item["job_id"],
+                            work_key,
+                            item["tick_id"],
+                            item["queued_at"],
+                            item.get("expires_at"),
+                            item["source"],
+                            item["symbol"],
+                            item.get("asset_class", ""),
+                            item.get("rank", 0),
+                            item.get("discovery_score", 0),
+                            item.get("bar_timestamp"),
+                            self._to_json(item.get("candidate", {})),
+                        ),
+                    )
+                    row = cursor.fetchone()
+                    if row and bool(row[0]):
+                        inserted += 1
+                        available_slots = max(0, available_slots - 1)
+                    elif row:
+                        refreshed += 1
+                        previous_status = str(existing_row[0] or "unknown") if existing_row else "unknown"
+                        refreshed_by_previous_status[previous_status] = (
+                            refreshed_by_previous_status.get(previous_status, 0) + 1
+                        )
+        return {
+            "pending_before": pending_before,
+            "enqueued": inserted,
+            "refreshed": refreshed,
+            "skipped_invalid_work_key": skipped_invalid_work_key,
+            "skipped_pending_cap": skipped_pending_cap,
+            "repaired_expired": int(repair_counts.get("expired_reset", 0) or 0),
+            "repaired_stale_processing": int(repair_counts.get("stale_processing_reset", 0) or 0),
+            "pending_after_estimate": min(max_pending_items, pending_before + inserted),
+            "refreshed_processed": int(refreshed_by_previous_status.get("processed", 0)),
+            "refreshed_failed": int(refreshed_by_previous_status.get("failed", 0)),
+            "refreshed_expired": int(refreshed_by_previous_status.get("expired", 0)),
+            "refreshed_pending": int(refreshed_by_previous_status.get("pending", 0)),
+            "refreshed_processing": int(refreshed_by_previous_status.get("processing", 0)),
+        }
+
+    def _count_active_slow_enrichment_jobs_sqlite(self, *, counted_at: datetime) -> int:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM slow_enrichment_jobs
+                WHERE (
+                    status = 'pending'
+                    AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
+                    AND (retry_at IS NULL OR datetime(retry_at) <= datetime(?))
+                )
+                OR status = 'processing'
+                """,
+                (counted_at.isoformat(), counted_at.isoformat()),
+            ).fetchone()
+        return int((row or {})["count"] if row else 0)
+
+    def _count_active_slow_enrichment_jobs_postgres(self, *, counted_at: datetime) -> int:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM slow_enrichment_jobs
+                    WHERE (
+                        status = 'pending'
+                        AND (expires_at IS NULL OR expires_at > %s)
+                        AND (retry_at IS NULL OR retry_at <= %s)
+                    )
+                    OR status = 'processing'
+                    """,
+                    (counted_at, counted_at),
+                )
+                row = cursor.fetchone()
+        return int((row or {}).get("count", 0))
+
+    def _count_slow_enrichment_jobs_sqlite(self, *, statuses: tuple[str, ...]) -> int:
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM slow_enrichment_jobs
+                WHERE status IN ({placeholders})
+                """,
+                statuses,
+            ).fetchone()
+        return int((row or {})["count"] if row else 0)
+
+    def _count_slow_enrichment_jobs_postgres(self, *, statuses: tuple[str, ...]) -> int:
+        if not statuses:
+            return 0
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM slow_enrichment_jobs
+                    WHERE status = ANY(%s)
+                    """,
+                    (list(statuses),),
+                )
+                row = cursor.fetchone()
+        return int((row or {}).get("count", 0))
+
+    def _claim_slow_enrichment_jobs_sqlite(
+        self,
+        *,
+        limit: int,
+        claimed_at: datetime,
+    ) -> list[dict[str, Any]]:
+        self._repair_slow_enrichment_jobs_sqlite(repaired_at=claimed_at)
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id, tick_id, queued_at, source, symbol, candidate_json
+                FROM slow_enrichment_jobs
+                WHERE status = 'pending'
+                  AND (expires_at IS NULL OR datetime(expires_at) > datetime(?))
+                  AND (retry_at IS NULL OR datetime(retry_at) <= datetime(?))
+                ORDER BY queued_at ASC, rank ASC, job_id ASC
+                LIMIT ?
+                """,
+                (claimed_at.isoformat(), claimed_at.isoformat(), max(0, limit)),
+            ).fetchall()
+            job_ids = [str(row["job_id"]) for row in rows]
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                connection.execute(
+                    f"""
+                    UPDATE slow_enrichment_jobs
+                    SET status = 'processing', claimed_at = ?, attempt_count = attempt_count + 1
+                    WHERE job_id IN ({placeholders})
+                    """,
+                    (claimed_at.isoformat(), *job_ids),
+                )
+        return [self._normalize_slow_enrichment_job_row(dict(row)) for row in rows]
+
+    def _claim_slow_enrichment_jobs_postgres(
+        self,
+        *,
+        limit: int,
+        claimed_at: datetime,
+    ) -> list[dict[str, Any]]:
+        self._repair_slow_enrichment_jobs_postgres(repaired_at=claimed_at)
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    WITH claimed AS (
+                        SELECT job_id
+                        FROM slow_enrichment_jobs
+                        WHERE status = 'pending'
+                          AND (expires_at IS NULL OR expires_at > %s)
+                          AND (retry_at IS NULL OR retry_at <= %s)
+                        ORDER BY queued_at ASC, rank ASC, job_id ASC
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE slow_enrichment_jobs AS jobs
+                    SET status = 'processing',
+                        claimed_at = %s,
+                        attempt_count = jobs.attempt_count + 1
+                    FROM claimed
+                    WHERE jobs.job_id = claimed.job_id
+                    RETURNING jobs.job_id, jobs.tick_id, jobs.queued_at,
+                              jobs.source, jobs.symbol, jobs.candidate_json
+                    """,
+                    (claimed_at, claimed_at, max(0, limit), claimed_at),
+                )
+                rows = cursor.fetchall()
+        return [self._normalize_slow_enrichment_job_row(dict(row)) for row in rows]
+
+    def _complete_slow_enrichment_jobs_sqlite(
+        self,
+        *,
+        processed: list[dict[str, Any]],
+        errors: list[dict[str, Any]],
+        completed_at: datetime | None = None,
+    ) -> None:
+        completed_at = completed_at or datetime.now().astimezone()
+        max_retries = max(0, int(getattr(self.config, "slow_enrichment_queue_max_retries", 3)))
+        backoff_seconds = max(
+            0,
+            int(getattr(self.config, "slow_enrichment_queue_retry_backoff_seconds", 120)),
+        )
+        with self._connect_sqlite() as connection:
+            for item in processed:
+                connection.execute(
+                    """
+                    INSERT INTO slow_enrichment_results (
+                        job_id, tick_id, source, symbol, processed_at,
+                        trade_authority, technical_context_json, result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        tick_id = excluded.tick_id,
+                        source = excluded.source,
+                        symbol = excluded.symbol,
+                        processed_at = excluded.processed_at,
+                        trade_authority = excluded.trade_authority,
+                        technical_context_json = excluded.technical_context_json,
+                        result_json = excluded.result_json
+                    """,
+                    (
+                        item["job_id"],
+                        item["tick_id"],
+                        item["source"],
+                        item["symbol"],
+                        item["processed_at"].isoformat(),
+                        item.get("trade_authority", "none"),
+                        self._to_json(item.get("technical_context", {})),
+                        self._to_json(item),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE slow_enrichment_jobs
+                    SET status = 'processed', processed_at = ?, retry_at = NULL, error = ''
+                    WHERE job_id = ?
+                    """,
+                    (item["processed_at"].isoformat(), item["job_id"]),
+                )
+            for item in errors:
+                job_row = connection.execute(
+                    """
+                    SELECT attempt_count, expires_at
+                    FROM slow_enrichment_jobs
+                    WHERE job_id = ?
+                    """,
+                    (item["job_id"],),
+                ).fetchone()
+                job_payload = dict(job_row) if job_row is not None else {}
+                attempt_count = int(job_payload.get("attempt_count", 0) or 0)
+                expires_at = self._normalize_db_datetime_value(job_payload.get("expires_at"))
+                exhausted = attempt_count >= max_retries
+                expired = expires_at is not None and expires_at <= completed_at
+                if exhausted or expired:
+                    connection.execute(
+                        """
+                        UPDATE slow_enrichment_jobs
+                        SET status = ?, processed_at = ?, retry_at = NULL, error = ?, claimed_at = NULL
+                        WHERE job_id = ?
+                        """,
+                        (
+                            "expired" if expired else "failed",
+                            item["errored_at"].isoformat(),
+                            str(item.get("error", ""))[:1000],
+                            item["job_id"],
+                        ),
+                    )
+                    continue
+                retry_at = item["errored_at"] + timedelta(seconds=backoff_seconds * max(1, attempt_count))
+                connection.execute(
+                    """
+                    UPDATE slow_enrichment_jobs
+                    SET status = 'pending',
+                        processed_at = ?,
+                        claimed_at = NULL,
+                        retry_at = ?,
+                        error = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        item["errored_at"].isoformat(),
+                        retry_at.isoformat(),
+                        str(item.get("error", ""))[:1000],
+                        item["job_id"],
+                    ),
+                )
+
+    def _complete_slow_enrichment_jobs_postgres(
+        self,
+        *,
+        processed: list[dict[str, Any]],
+        errors: list[dict[str, Any]],
+        completed_at: datetime | None = None,
+    ) -> None:
+        completed_at = completed_at or datetime.now().astimezone()
+        max_retries = max(0, int(getattr(self.config, "slow_enrichment_queue_max_retries", 3)))
+        backoff_seconds = max(
+            0,
+            int(getattr(self.config, "slow_enrichment_queue_retry_backoff_seconds", 120)),
+        )
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                for item in processed:
+                    cursor.execute(
+                        """
+                        INSERT INTO slow_enrichment_results (
+                            job_id, tick_id, source, symbol, processed_at,
+                            trade_authority, technical_context_json, result_json
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                        ON CONFLICT(job_id) DO UPDATE SET
+                            tick_id = EXCLUDED.tick_id,
+                            source = EXCLUDED.source,
+                            symbol = EXCLUDED.symbol,
+                            processed_at = EXCLUDED.processed_at,
+                            trade_authority = EXCLUDED.trade_authority,
+                            technical_context_json = EXCLUDED.technical_context_json,
+                            result_json = EXCLUDED.result_json
+                        """,
+                        (
+                            item["job_id"],
+                            item["tick_id"],
+                            item["source"],
+                            item["symbol"],
+                            item["processed_at"],
+                            item.get("trade_authority", "none"),
+                            self._to_json(item.get("technical_context", {})),
+                            self._to_json(item),
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE slow_enrichment_jobs
+                        SET status = 'processed', processed_at = %s, retry_at = NULL, error = ''
+                        WHERE job_id = %s
+                        """,
+                        (item["processed_at"], item["job_id"]),
+                    )
+                for item in errors:
+                    cursor.execute(
+                        """
+                        SELECT attempt_count, expires_at
+                        FROM slow_enrichment_jobs
+                        WHERE job_id = %s
+                        """,
+                        (item["job_id"],),
+                    )
+                    job_row = cursor.fetchone()
+                    attempt_count = int(job_row[0] or 0) if job_row else 0
+                    expires_at = job_row[1] if job_row else None
+                    exhausted = attempt_count >= max_retries
+                    expired = expires_at is not None and expires_at <= completed_at
+                    if exhausted or expired:
+                        cursor.execute(
+                            """
+                            UPDATE slow_enrichment_jobs
+                            SET status = %s, processed_at = %s, retry_at = NULL, error = %s, claimed_at = NULL
+                            WHERE job_id = %s
+                            """,
+                            (
+                                "expired" if expired else "failed",
+                                item["errored_at"],
+                                str(item.get("error", ""))[:1000],
+                                item["job_id"],
+                            ),
+                        )
+                        continue
+                    retry_at = item["errored_at"] + timedelta(seconds=backoff_seconds * max(1, attempt_count))
+                    cursor.execute(
+                        """
+                        UPDATE slow_enrichment_jobs
+                        SET status = 'pending',
+                            processed_at = %s,
+                            claimed_at = NULL,
+                            retry_at = %s,
+                            error = %s
+                        WHERE job_id = %s
+                        """,
+                        (
+                            item["errored_at"],
+                            retry_at,
+                            str(item.get("error", ""))[:1000],
+                            item["job_id"],
+                        ),
+                    )
+
+    def _repair_slow_enrichment_jobs_sqlite(self, *, repaired_at: datetime) -> dict[str, int]:
+        processing_timeout = max(
+            60,
+            int(getattr(self.config, "slow_enrichment_queue_processing_timeout_seconds", 900)),
+        )
+        stale_before = (repaired_at - timedelta(seconds=processing_timeout)).isoformat()
+        with self._connect_sqlite() as connection:
+            expired_reset = int(
+                connection.execute(
+                    """
+                    UPDATE slow_enrichment_jobs
+                    SET status = 'expired', processed_at = ?, retry_at = NULL, claimed_at = NULL
+                    WHERE status = 'pending'
+                      AND expires_at IS NOT NULL
+                      AND datetime(expires_at) <= datetime(?)
+                    """,
+                    (repaired_at.isoformat(), repaired_at.isoformat()),
+                ).rowcount
+                or 0
+            )
+            stale_processing_reset = int(
+                connection.execute(
+                    """
+                    UPDATE slow_enrichment_jobs
+                    SET status = 'pending', claimed_at = NULL, retry_at = ?, error = 'processing_timeout_requeued'
+                    WHERE status = 'processing'
+                      AND claimed_at IS NOT NULL
+                      AND datetime(claimed_at) <= datetime(?)
+                    """,
+                    (repaired_at.isoformat(), stale_before),
+                ).rowcount
+                or 0
+            )
+        return {
+            "expired_reset": expired_reset,
+            "stale_processing_reset": stale_processing_reset,
+        }
+
+    def _repair_slow_enrichment_jobs_postgres(self, *, repaired_at: datetime) -> dict[str, int]:
+        processing_timeout = max(
+            60,
+            int(getattr(self.config, "slow_enrichment_queue_processing_timeout_seconds", 900)),
+        )
+        stale_before = repaired_at - timedelta(seconds=processing_timeout)
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE slow_enrichment_jobs
+                    SET status = 'expired', processed_at = %s, retry_at = NULL, claimed_at = NULL
+                    WHERE status = 'pending'
+                      AND expires_at IS NOT NULL
+                      AND expires_at <= %s
+                    """,
+                    (repaired_at, repaired_at),
+                )
+                expired_reset = int(cursor.rowcount or 0)
+                cursor.execute(
+                    """
+                    UPDATE slow_enrichment_jobs
+                    SET status = 'pending', claimed_at = NULL, retry_at = %s, error = 'processing_timeout_requeued'
+                    WHERE status = 'processing'
+                      AND claimed_at IS NOT NULL
+                      AND claimed_at <= %s
+                    """,
+                    (repaired_at, stale_before),
+                )
+                stale_processing_reset = int(cursor.rowcount or 0)
+        return {
+            "expired_reset": expired_reset,
+            "stale_processing_reset": stale_processing_reset,
+        }
+
+    def _normalize_slow_enrichment_job_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        candidate = self._from_json(row.get("candidate_json"), default={})
+        row["candidate"] = candidate if isinstance(candidate, dict) else {}
+        row.pop("candidate_json", None)
+        for key in ("queued_at", "expires_at", "claimed_at", "processed_at", "retry_at"):
+            if key in row:
+                row[key] = self._normalize_db_datetime_value(row[key])
+        return row
+
+    def _slow_enrichment_work_key(self, item: dict[str, Any]) -> str:
+        source = str(item.get("source", "")).strip()
+        symbol = str(item.get("symbol", "")).strip().upper()
+        return f"{source}:{symbol}"
 
     def _record_gemini_analyses_sqlite(
         self,
@@ -5737,7 +7729,11 @@ class UsageLedger:
                     stop_price = COALESCE(excluded.stop_price, paper_trade_orders.stop_price),
                     take_profit_price = COALESCE(excluded.take_profit_price, paper_trade_orders.take_profit_price),
                     stop_loss_price = COALESCE(excluded.stop_loss_price, paper_trade_orders.stop_loss_price),
-                    raw_json = excluded.raw_json
+                    raw_json = CASE
+                        WHEN json_valid(paper_trade_orders.raw_json) AND json_valid(excluded.raw_json)
+                        THEN json_patch(paper_trade_orders.raw_json, excluded.raw_json)
+                        ELSE excluded.raw_json
+                    END
                 """,
                 [
                     (
@@ -7148,15 +9144,44 @@ class UsageLedger:
         *,
         as_of: datetime,
         lookback_days: int,
+        source_environments: tuple[str, ...],
+        execution_providers: tuple[str, ...],
+        strategy_ids: tuple[str, ...],
+        profile_ids: tuple[str, ...],
+        note_prefix: str,
     ) -> list[dict[str, Any]]:
         cutoff = None
         if lookback_days > 0:
             cutoff = (as_of - timedelta(days=lookback_days)).isoformat()
+        conditions = ["p.strategy_id != ''", "o.evaluated_at IS NOT NULL"]
+        params_base: list[Any] = []
+        if cutoff is not None:
+            conditions.append("p.proposed_at >= ?")
+            params_base.append(cutoff)
+        if source_environments:
+            conditions.append(
+                f"p.source_environment IN ({','.join('?' for _ in source_environments)})"
+            )
+            params_base.extend(source_environments)
+        if execution_providers:
+            conditions.append(
+                f"p.execution_provider IN ({','.join('?' for _ in execution_providers)})"
+            )
+            params_base.extend(execution_providers)
+        if strategy_ids:
+            conditions.append(f"p.strategy_id IN ({','.join('?' for _ in strategy_ids)})")
+            params_base.extend(strategy_ids)
+        if profile_ids:
+            conditions.append(f"p.profile_id IN ({','.join('?' for _ in profile_ids)})")
+            params_base.extend(profile_ids)
+        if note_prefix:
+            conditions.append("p.note LIKE ?")
+            params_base.append(f"{note_prefix}%")
+        where_clause = " AND ".join(conditions)
 
         with self._connect_sqlite() as connection:
-            if cutoff is None:
-                rows = connection.execute(
-                    """
+            rows = connection.execute(
+                f"""
                     SELECT p.strategy_id, p.strategy_family, p.profile_id, p.asset_class,
                            o.checkpoint_code, 0 AS lookback_days,
                            COUNT(DISTINCT p.proposal_id) AS evaluated_proposals,
@@ -7178,44 +9203,12 @@ class UsageLedger:
                            MAX(o.evaluated_at) AS last_evaluated_at
                     FROM shadow_trade_proposals p
                     JOIN shadow_trade_outcomes o ON o.proposal_id = p.proposal_id
-                    WHERE p.strategy_id != ''
-                      AND o.evaluated_at IS NOT NULL
+                    WHERE {where_clause}
                     GROUP BY p.strategy_id, p.strategy_family, p.profile_id, p.asset_class, o.checkpoint_code
                     ORDER BY avg_fitness_score DESC, checkpoints_evaluated DESC, p.strategy_id ASC
-                    """
-                ).fetchall()
-            else:
-                rows = connection.execute(
-                    """
-                    SELECT p.strategy_id, p.strategy_family, p.profile_id, p.asset_class,
-                           o.checkpoint_code, ? AS lookback_days,
-                           COUNT(DISTINCT p.proposal_id) AS evaluated_proposals,
-                           COUNT(o.proposal_id) AS checkpoints_evaluated,
-                           SUM(CASE WHEN o.realized_return_pct > 0 THEN 1 ELSE 0 END) AS win_count,
-                           SUM(CASE WHEN o.realized_return_pct < 0 THEN 1 ELSE 0 END) AS loss_count,
-                           SUM(CASE WHEN o.outcome_status = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
-                           SUM(CASE WHEN o.outcome_status = 'stop_hit' THEN 1 ELSE 0 END) AS stop_hit_count,
-                           SUM(CASE WHEN o.outcome_status = 'time_exit' THEN 1 ELSE 0 END) AS time_exit_count,
-                           SUM(CASE WHEN o.outcome_status = 'ambiguous_range' THEN 1 ELSE 0 END) AS ambiguous_count,
-                           AVG(o.fitness_score) AS avg_fitness_score,
-                           AVG(o.realized_return_pct) AS avg_realized_return_pct,
-                           AVG(o.max_favorable_excursion_pct) AS avg_max_favorable_excursion_pct,
-                           AVG(o.max_adverse_excursion_pct) AS avg_max_adverse_excursion_pct,
-                           AVG(p.signal_score) AS avg_signal_score,
-                           AVG(p.signal_confidence) AS avg_signal_confidence,
-                           AVG(p.discovery_score) AS avg_discovery_score,
-                           MIN(p.proposed_at) AS first_proposed_at,
-                           MAX(o.evaluated_at) AS last_evaluated_at
-                    FROM shadow_trade_proposals p
-                    JOIN shadow_trade_outcomes o ON o.proposal_id = p.proposal_id
-                    WHERE p.strategy_id != ''
-                      AND o.evaluated_at IS NOT NULL
-                      AND p.proposed_at >= ?
-                    GROUP BY p.strategy_id, p.strategy_family, p.profile_id, p.asset_class, o.checkpoint_code
-                    ORDER BY avg_fitness_score DESC, checkpoints_evaluated DESC, p.strategy_id ASC
-                    """,
-                    (lookback_days, cutoff),
-                ).fetchall()
+                """,
+                tuple(params_base),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def _list_strategy_fitness_rows_postgres(
@@ -7223,16 +9216,41 @@ class UsageLedger:
         *,
         as_of: datetime,
         lookback_days: int,
+        source_environments: tuple[str, ...],
+        execution_providers: tuple[str, ...],
+        strategy_ids: tuple[str, ...],
+        profile_ids: tuple[str, ...],
+        note_prefix: str,
     ) -> list[dict[str, Any]]:
         cutoff = None
         if lookback_days > 0:
             cutoff = as_of - timedelta(days=lookback_days)
+        conditions = ["p.strategy_id != ''", "o.evaluated_at IS NOT NULL"]
+        params: list[Any] = []
+        if cutoff is not None:
+            conditions.append("p.proposed_at >= %s")
+            params.append(cutoff)
+        if source_environments:
+            conditions.append("p.source_environment = ANY(%s)")
+            params.append(list(source_environments))
+        if execution_providers:
+            conditions.append("p.execution_provider = ANY(%s)")
+            params.append(list(execution_providers))
+        if strategy_ids:
+            conditions.append("p.strategy_id = ANY(%s)")
+            params.append(list(strategy_ids))
+        if profile_ids:
+            conditions.append("p.profile_id = ANY(%s)")
+            params.append(list(profile_ids))
+        if note_prefix:
+            conditions.append("p.note LIKE %s")
+            params.append(f"{note_prefix}%")
+        where_clause = " AND ".join(conditions)
 
         with self._connect_postgres(scope="core") as connection:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                if cutoff is None:
-                    cursor.execute(
-                        """
+                cursor.execute(
+                    f"""
                         SELECT p.strategy_id, p.strategy_family, p.profile_id, p.asset_class,
                                o.checkpoint_code, 0 AS lookback_days,
                                COUNT(DISTINCT p.proposal_id) AS evaluated_proposals,
@@ -7254,44 +9272,102 @@ class UsageLedger:
                                MAX(o.evaluated_at) AS last_evaluated_at
                         FROM shadow_trade_proposals p
                         JOIN shadow_trade_outcomes o ON o.proposal_id = p.proposal_id
-                        WHERE p.strategy_id != ''
-                          AND o.evaluated_at IS NOT NULL
+                        WHERE {where_clause}
                         GROUP BY p.strategy_id, p.strategy_family, p.profile_id, p.asset_class, o.checkpoint_code
                         ORDER BY avg_fitness_score DESC, checkpoints_evaluated DESC, p.strategy_id ASC
-                        """
-                    )
-                else:
-                    cursor.execute(
-                        """
-                        SELECT p.strategy_id, p.strategy_family, p.profile_id, p.asset_class,
-                               o.checkpoint_code, %s AS lookback_days,
-                               COUNT(DISTINCT p.proposal_id) AS evaluated_proposals,
-                               COUNT(o.proposal_id) AS checkpoints_evaluated,
-                               SUM(CASE WHEN o.realized_return_pct > 0 THEN 1 ELSE 0 END) AS win_count,
-                               SUM(CASE WHEN o.realized_return_pct < 0 THEN 1 ELSE 0 END) AS loss_count,
-                               SUM(CASE WHEN o.outcome_status = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
-                               SUM(CASE WHEN o.outcome_status = 'stop_hit' THEN 1 ELSE 0 END) AS stop_hit_count,
-                               SUM(CASE WHEN o.outcome_status = 'time_exit' THEN 1 ELSE 0 END) AS time_exit_count,
-                               SUM(CASE WHEN o.outcome_status = 'ambiguous_range' THEN 1 ELSE 0 END) AS ambiguous_count,
-                               AVG(o.fitness_score) AS avg_fitness_score,
-                               AVG(o.realized_return_pct) AS avg_realized_return_pct,
-                               AVG(o.max_favorable_excursion_pct) AS avg_max_favorable_excursion_pct,
-                               AVG(o.max_adverse_excursion_pct) AS avg_max_adverse_excursion_pct,
-                               AVG(p.signal_score) AS avg_signal_score,
-                               AVG(p.signal_confidence) AS avg_signal_confidence,
-                               AVG(p.discovery_score) AS avg_discovery_score,
-                               MIN(p.proposed_at) AS first_proposed_at,
-                               MAX(o.evaluated_at) AS last_evaluated_at
-                        FROM shadow_trade_proposals p
-                        JOIN shadow_trade_outcomes o ON o.proposal_id = p.proposal_id
-                        WHERE p.strategy_id != ''
-                          AND o.evaluated_at IS NOT NULL
-                          AND p.proposed_at >= %s
-                        GROUP BY p.strategy_id, p.strategy_family, p.profile_id, p.asset_class, o.checkpoint_code
-                        ORDER BY avg_fitness_score DESC, checkpoints_evaluated DESC, p.strategy_id ASC
-                        """,
-                        (lookback_days, cutoff),
-                    )
+                    """,
+                    tuple(params),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_strategy_fitness_evidence_mix_sqlite(
+        self,
+        *,
+        as_of: datetime,
+        lookback_days: int,
+        source_environments: tuple[str, ...],
+        execution_providers: tuple[str, ...],
+        strategy_ids: tuple[str, ...],
+        profile_ids: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        cutoff = (as_of - timedelta(days=lookback_days)).isoformat() if lookback_days > 0 else None
+        conditions = ["p.strategy_id != ''", "o.evaluated_at IS NOT NULL"]
+        params: list[Any] = []
+        if cutoff is not None:
+            conditions.append("p.proposed_at >= ?")
+            params.append(cutoff)
+        if source_environments:
+            conditions.append(f"p.source_environment IN ({','.join('?' for _ in source_environments)})")
+            params.extend(source_environments)
+        if execution_providers:
+            conditions.append(f"p.execution_provider IN ({','.join('?' for _ in execution_providers)})")
+            params.extend(execution_providers)
+        if strategy_ids:
+            conditions.append(f"p.strategy_id IN ({','.join('?' for _ in strategy_ids)})")
+            params.extend(strategy_ids)
+        if profile_ids:
+            conditions.append(f"p.profile_id IN ({','.join('?' for _ in profile_ids)})")
+            params.extend(profile_ids)
+        where_clause = " AND ".join(conditions)
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.environment, p.source_environment, p.execution_provider,
+                       COUNT(DISTINCT p.proposal_id) AS evaluated_proposals
+                FROM shadow_trade_proposals p
+                JOIN shadow_trade_outcomes o ON o.proposal_id = p.proposal_id
+                WHERE {where_clause}
+                GROUP BY p.environment, p.source_environment, p.execution_provider
+                ORDER BY evaluated_proposals DESC, p.environment ASC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_strategy_fitness_evidence_mix_postgres(
+        self,
+        *,
+        as_of: datetime,
+        lookback_days: int,
+        source_environments: tuple[str, ...],
+        execution_providers: tuple[str, ...],
+        strategy_ids: tuple[str, ...],
+        profile_ids: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        cutoff = as_of - timedelta(days=lookback_days) if lookback_days > 0 else None
+        conditions = ["p.strategy_id != ''", "o.evaluated_at IS NOT NULL"]
+        params: list[Any] = []
+        if cutoff is not None:
+            conditions.append("p.proposed_at >= %s")
+            params.append(cutoff)
+        if source_environments:
+            conditions.append("p.source_environment = ANY(%s)")
+            params.append(list(source_environments))
+        if execution_providers:
+            conditions.append("p.execution_provider = ANY(%s)")
+            params.append(list(execution_providers))
+        if strategy_ids:
+            conditions.append("p.strategy_id = ANY(%s)")
+            params.append(list(strategy_ids))
+        if profile_ids:
+            conditions.append("p.profile_id = ANY(%s)")
+            params.append(list(profile_ids))
+        where_clause = " AND ".join(conditions)
+        with self._connect_postgres(scope="core") as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT p.environment, p.source_environment, p.execution_provider,
+                           COUNT(DISTINCT p.proposal_id) AS evaluated_proposals
+                    FROM shadow_trade_proposals p
+                    JOIN shadow_trade_outcomes o ON o.proposal_id = p.proposal_id
+                    WHERE {where_clause}
+                    GROUP BY p.environment, p.source_environment, p.execution_provider
+                    ORDER BY evaluated_proposals DESC, p.environment ASC
+                    """,
+                    tuple(params),
+                )
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
@@ -7539,6 +9615,297 @@ class UsageLedger:
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def _summarize_historical_bars_sqlite(
+        self,
+        *,
+        as_of: datetime,
+    ) -> dict[str, Any]:
+        last_1_day_start = as_of - timedelta(days=1)
+        last_5_day_start = as_of - timedelta(days=5)
+        with self._connect_sqlite() as connection:
+            total_rows = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM market_data_historical_bars"
+                ).fetchone()[0]
+            )
+            distinct_symbols = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT symbol) FROM market_data_historical_bars"
+                ).fetchone()[0]
+            )
+            min_bar_timestamp, max_bar_timestamp = connection.execute(
+                """
+                SELECT MIN(bar_timestamp), MAX(bar_timestamp)
+                FROM market_data_historical_bars
+                """
+            ).fetchone()
+            rows_by_source = [
+                {"source": row[0], "rows": int(row[1] or 0)}
+                for row in connection.execute(
+                    """
+                    SELECT source, COUNT(*)
+                    FROM market_data_historical_bars
+                    GROUP BY source
+                    ORDER BY COUNT(*) DESC, source ASC
+                    """
+                ).fetchall()
+            ]
+            rows_by_timeframe = [
+                {"timeframe": row[0], "rows": int(row[1] or 0)}
+                for row in connection.execute(
+                    """
+                    SELECT timeframe, COUNT(*)
+                    FROM market_data_historical_bars
+                    GROUP BY timeframe
+                    ORDER BY COUNT(*) DESC, timeframe ASC
+                    """
+                ).fetchall()
+            ]
+            symbol_rows = [
+                {
+                    "symbol": row[0],
+                    "rows": int(row[1] or 0),
+                    "last_bar_timestamp": self._normalize_db_datetime_value(row[2]),
+                }
+                for row in connection.execute(
+                    """
+                    SELECT symbol, COUNT(*), MAX(bar_timestamp)
+                    FROM market_data_historical_bars
+                    GROUP BY symbol
+                    ORDER BY COUNT(*) DESC, symbol ASC
+                    LIMIT 20
+                    """
+                ).fetchall()
+            ]
+            last_1_day_rows = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM market_data_historical_bars
+                    WHERE bar_timestamp >= ?
+                    """,
+                    (last_1_day_start.isoformat(),),
+                ).fetchone()[0]
+            )
+            last_5_day_rows = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM market_data_historical_bars
+                    WHERE bar_timestamp >= ?
+                    """,
+                    (last_5_day_start.isoformat(),),
+                ).fetchone()[0]
+            )
+            latest_total_rows = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM market_data_latest_bars"
+                ).fetchone()[0]
+            )
+            latest_min_timestamp, latest_max_timestamp = connection.execute(
+                """
+                SELECT MIN(bar_timestamp), MAX(bar_timestamp)
+                FROM market_data_latest_bars
+                """
+            ).fetchone()
+            latest_rows_by_source = [
+                {"source": row[0], "rows": int(row[1] or 0)}
+                for row in connection.execute(
+                    """
+                    SELECT source, COUNT(*)
+                    FROM market_data_latest_bars
+                    GROUP BY source
+                    ORDER BY COUNT(*) DESC, source ASC
+                    """
+                ).fetchall()
+            ]
+
+        normalized_min = self._normalize_db_datetime_value(min_bar_timestamp)
+        normalized_max = self._normalize_db_datetime_value(max_bar_timestamp)
+        normalized_latest_min = self._normalize_db_datetime_value(latest_min_timestamp)
+        normalized_latest_max = self._normalize_db_datetime_value(latest_max_timestamp)
+        newest_bar_age_seconds = None
+        if isinstance(normalized_max, datetime):
+            newest_bar_age_seconds = max(
+                0.0,
+                (as_of - normalized_max).total_seconds(),
+            )
+        return {
+            "backend": self.backend,
+            "backend_detail": self.backend_detail,
+            "as_of": as_of,
+            "historical": {
+                "total_rows": total_rows,
+                "rows_by_source": rows_by_source,
+                "rows_by_timeframe": rows_by_timeframe,
+                "min_bar_timestamp": normalized_min,
+                "max_bar_timestamp": normalized_max,
+                "last_1_day_rows": last_1_day_rows,
+                "last_5_day_rows": last_5_day_rows,
+                "distinct_symbols": distinct_symbols,
+                "symbol_rows": symbol_rows,
+                "newest_bar_age_seconds": newest_bar_age_seconds,
+            },
+            "latest": {
+                "total_rows": latest_total_rows,
+                "rows_by_source": latest_rows_by_source,
+                "min_bar_timestamp": normalized_latest_min,
+                "max_bar_timestamp": normalized_latest_max,
+            },
+        }
+
+    def _summarize_historical_bars_postgres(
+        self,
+        *,
+        as_of: datetime,
+    ) -> dict[str, Any]:
+        last_1_day_start = as_of - timedelta(days=1)
+        last_5_day_start = as_of - timedelta(days=5)
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("SELECT COUNT(*) AS count FROM market_data_historical_bars")
+                total_rows = int(cursor.fetchone()["count"] or 0)
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT symbol) AS count FROM market_data_historical_bars"
+                )
+                distinct_symbols = int(cursor.fetchone()["count"] or 0)
+                cursor.execute(
+                    """
+                    SELECT MIN(bar_timestamp) AS min_bar_timestamp,
+                           MAX(bar_timestamp) AS max_bar_timestamp
+                    FROM market_data_historical_bars
+                    """
+                )
+                minmax_row = cursor.fetchone() or {}
+                cursor.execute(
+                    """
+                    SELECT source, COUNT(*) AS rows
+                    FROM market_data_historical_bars
+                    GROUP BY source
+                    ORDER BY COUNT(*) DESC, source ASC
+                    """
+                )
+                rows_by_source = [
+                    {"source": str(row["source"] or ""), "rows": int(row["rows"] or 0)}
+                    for row in cursor.fetchall()
+                ]
+                cursor.execute(
+                    """
+                    SELECT timeframe, COUNT(*) AS rows
+                    FROM market_data_historical_bars
+                    GROUP BY timeframe
+                    ORDER BY COUNT(*) DESC, timeframe ASC
+                    """
+                )
+                rows_by_timeframe = [
+                    {
+                        "timeframe": str(row["timeframe"] or ""),
+                        "rows": int(row["rows"] or 0),
+                    }
+                    for row in cursor.fetchall()
+                ]
+                cursor.execute(
+                    """
+                    SELECT symbol, COUNT(*) AS rows, MAX(bar_timestamp) AS last_bar_timestamp
+                    FROM market_data_historical_bars
+                    GROUP BY symbol
+                    ORDER BY COUNT(*) DESC, symbol ASC
+                    LIMIT 20
+                    """
+                )
+                symbol_rows = [
+                    {
+                        "symbol": str(row["symbol"] or ""),
+                        "rows": int(row["rows"] or 0),
+                        "last_bar_timestamp": self._normalize_db_datetime_value(
+                            row["last_bar_timestamp"]
+                        ),
+                    }
+                    for row in cursor.fetchall()
+                ]
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM market_data_historical_bars
+                    WHERE bar_timestamp >= %s
+                    """,
+                    (last_1_day_start,),
+                )
+                last_1_day_rows = int(cursor.fetchone()["count"] or 0)
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM market_data_historical_bars
+                    WHERE bar_timestamp >= %s
+                    """,
+                    (last_5_day_start,),
+                )
+                last_5_day_rows = int(cursor.fetchone()["count"] or 0)
+                cursor.execute("SELECT COUNT(*) AS count FROM market_data_latest_bars")
+                latest_total_rows = int(cursor.fetchone()["count"] or 0)
+                cursor.execute(
+                    """
+                    SELECT MIN(bar_timestamp) AS min_bar_timestamp,
+                           MAX(bar_timestamp) AS max_bar_timestamp
+                    FROM market_data_latest_bars
+                    """
+                )
+                latest_minmax_row = cursor.fetchone() or {}
+                cursor.execute(
+                    """
+                    SELECT source, COUNT(*) AS rows
+                    FROM market_data_latest_bars
+                    GROUP BY source
+                    ORDER BY COUNT(*) DESC, source ASC
+                    """
+                )
+                latest_rows_by_source = [
+                    {"source": str(row["source"] or ""), "rows": int(row["rows"] or 0)}
+                    for row in cursor.fetchall()
+                ]
+
+        normalized_min = self._normalize_db_datetime_value(
+            minmax_row.get("min_bar_timestamp")
+        )
+        normalized_max = self._normalize_db_datetime_value(
+            minmax_row.get("max_bar_timestamp")
+        )
+        normalized_latest_min = self._normalize_db_datetime_value(
+            latest_minmax_row.get("min_bar_timestamp")
+        )
+        normalized_latest_max = self._normalize_db_datetime_value(
+            latest_minmax_row.get("max_bar_timestamp")
+        )
+        newest_bar_age_seconds = None
+        if isinstance(normalized_max, datetime):
+            newest_bar_age_seconds = max(
+                0.0,
+                (as_of - normalized_max).total_seconds(),
+            )
+        return {
+            "backend": self.backend,
+            "backend_detail": self.backend_detail,
+            "as_of": as_of,
+            "historical": {
+                "total_rows": total_rows,
+                "rows_by_source": rows_by_source,
+                "rows_by_timeframe": rows_by_timeframe,
+                "min_bar_timestamp": normalized_min,
+                "max_bar_timestamp": normalized_max,
+                "last_1_day_rows": last_1_day_rows,
+                "last_5_day_rows": last_5_day_rows,
+                "distinct_symbols": distinct_symbols,
+                "symbol_rows": symbol_rows,
+                "newest_bar_age_seconds": newest_bar_age_seconds,
+            },
+            "latest": {
+                "total_rows": latest_total_rows,
+                "rows_by_source": latest_rows_by_source,
+                "min_bar_timestamp": normalized_latest_min,
+                "max_bar_timestamp": normalized_latest_max,
+            },
+        }
+
     def _list_daily_usage_sqlite(self, *, usage_date: date) -> list[dict[str, Any]]:
         with self._connect_sqlite() as connection:
             rows = connection.execute(
@@ -7633,6 +10000,34 @@ class UsageLedger:
                     ORDER BY started_at DESC
                     LIMIT 1
                     """
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_tick_run_sqlite(self, *, tick_id: str) -> dict[str, Any] | None:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM control_tick_runs
+                WHERE tick_id = ?
+                LIMIT 1
+                """,
+                (tick_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_tick_run_postgres(self, *, tick_id: str) -> dict[str, Any] | None:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM control_tick_runs
+                    WHERE tick_id = %s
+                    LIMIT 1
+                    """,
+                    (tick_id,),
                 )
                 row = cursor.fetchone()
         return dict(row) if row is not None else None
@@ -8340,6 +10735,881 @@ class UsageLedger:
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def _get_latest_strategy_fitness_summary_sqlite(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM strategy_fitness_snapshots
+                WHERE strategy_id = ? AND profile_id = ?
+                ORDER BY captured_at DESC, fitness_rank ASC, checkpoint_code ASC
+                LIMIT 1
+                """,
+                (strategy_id, profile_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_latest_strategy_fitness_summary_postgres(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM strategy_fitness_snapshots
+                    WHERE strategy_id = %s AND profile_id = %s
+                    ORDER BY captured_at DESC, fitness_rank ASC, checkpoint_code ASC
+                    LIMIT 1
+                    """,
+                    (strategy_id, profile_id),
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def _list_strategy_promotions_sqlite(self) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM strategy_promotions
+                ORDER BY updated_at DESC, strategy_id ASC, profile_id ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_strategy_promotions_postgres(self) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM strategy_promotions
+                    ORDER BY updated_at DESC, strategy_id ASC, profile_id ASC
+                    """
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _get_strategy_promotion_sqlite(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM strategy_promotions
+                WHERE strategy_id = ? AND profile_id = ?
+                """,
+                (strategy_id, profile_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_strategy_promotion_postgres(
+        self,
+        *,
+        strategy_id: str,
+        profile_id: str,
+    ) -> dict[str, Any] | None:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM strategy_promotions
+                    WHERE strategy_id = %s AND profile_id = %s
+                    """,
+                    (strategy_id, profile_id),
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def _upsert_strategy_promotion_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                INSERT INTO strategy_promotions (
+                    strategy_id, profile_id, stage, research_only_profile,
+                    paper_execution_profile, paper_approved, live_approved, rejected,
+                    max_paper_notional_usd, max_open_trades, cooldown_minutes,
+                    recommendation, rejection_reason, blocker_reasons_json,
+                    replay_summary_json, paper_sim_summary_json, data_integrity_json,
+                    updated_at, approved_at, rejected_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(strategy_id, profile_id) DO UPDATE SET
+                    stage = excluded.stage,
+                    research_only_profile = excluded.research_only_profile,
+                    paper_execution_profile = excluded.paper_execution_profile,
+                    paper_approved = excluded.paper_approved,
+                    live_approved = excluded.live_approved,
+                    rejected = excluded.rejected,
+                    max_paper_notional_usd = excluded.max_paper_notional_usd,
+                    max_open_trades = excluded.max_open_trades,
+                    cooldown_minutes = excluded.cooldown_minutes,
+                    recommendation = excluded.recommendation,
+                    rejection_reason = excluded.rejection_reason,
+                    blocker_reasons_json = excluded.blocker_reasons_json,
+                    replay_summary_json = excluded.replay_summary_json,
+                    paper_sim_summary_json = excluded.paper_sim_summary_json,
+                    data_integrity_json = excluded.data_integrity_json,
+                    updated_at = excluded.updated_at,
+                    approved_at = excluded.approved_at,
+                    rejected_at = excluded.rejected_at
+                """,
+                (
+                    row["strategy_id"],
+                    row["profile_id"],
+                    row["stage"],
+                    row["research_only_profile"],
+                    row["paper_execution_profile"],
+                    row["paper_approved"],
+                    row["live_approved"],
+                    row["rejected"],
+                    row["max_paper_notional_usd"],
+                    row["max_open_trades"],
+                    row["cooldown_minutes"],
+                    row["recommendation"],
+                    row["rejection_reason"],
+                    row["blocker_reasons_json"],
+                    row["replay_summary_json"],
+                    row["paper_sim_summary_json"],
+                    row["data_integrity_json"],
+                    row["updated_at"],
+                    row["approved_at"],
+                    row["rejected_at"],
+                ),
+            )
+
+    def _upsert_strategy_promotion_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO strategy_promotions (
+                        strategy_id, profile_id, stage, research_only_profile,
+                        paper_execution_profile, paper_approved, live_approved, rejected,
+                        max_paper_notional_usd, max_open_trades, cooldown_minutes,
+                        recommendation, rejection_reason, blocker_reasons_json,
+                        replay_summary_json, paper_sim_summary_json, data_integrity_json,
+                        updated_at, approved_at, rejected_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s
+                    )
+                    ON CONFLICT(strategy_id, profile_id) DO UPDATE SET
+                        stage = EXCLUDED.stage,
+                        research_only_profile = EXCLUDED.research_only_profile,
+                        paper_execution_profile = EXCLUDED.paper_execution_profile,
+                        paper_approved = EXCLUDED.paper_approved,
+                        live_approved = EXCLUDED.live_approved,
+                        rejected = EXCLUDED.rejected,
+                        max_paper_notional_usd = EXCLUDED.max_paper_notional_usd,
+                        max_open_trades = EXCLUDED.max_open_trades,
+                        cooldown_minutes = EXCLUDED.cooldown_minutes,
+                        recommendation = EXCLUDED.recommendation,
+                        rejection_reason = EXCLUDED.rejection_reason,
+                        blocker_reasons_json = EXCLUDED.blocker_reasons_json,
+                        replay_summary_json = EXCLUDED.replay_summary_json,
+                        paper_sim_summary_json = EXCLUDED.paper_sim_summary_json,
+                        data_integrity_json = EXCLUDED.data_integrity_json,
+                        updated_at = EXCLUDED.updated_at,
+                        approved_at = EXCLUDED.approved_at,
+                        rejected_at = EXCLUDED.rejected_at
+                    """,
+                    (
+                        row["strategy_id"],
+                        row["profile_id"],
+                        row["stage"],
+                        row["research_only_profile"],
+                        row["paper_execution_profile"],
+                        row["paper_approved"],
+                        row["live_approved"],
+                        row["rejected"],
+                        row["max_paper_notional_usd"],
+                        row["max_open_trades"],
+                        row["cooldown_minutes"],
+                        row["recommendation"],
+                        row["rejection_reason"],
+                        row["blocker_reasons_json"],
+                        row["replay_summary_json"],
+                        row["paper_sim_summary_json"],
+                        row["data_integrity_json"],
+                        row["updated_at"],
+                        row["approved_at"],
+                        row["rejected_at"],
+                    ),
+                )
+
+    def _record_research_cycle_decisions_sqlite(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        with self._connect_sqlite() as connection:
+            connection.executemany(
+                """
+                INSERT INTO research_cycle_decisions (
+                    cycle_id, created_at, strategy_id, profile_id, asset_class,
+                    symbol_universe_json, timeframe, replay_window_start, replay_window_end,
+                    windows_tested_count, candidates_evaluated, signals_generated,
+                    proposals_created, outcomes_recorded, gross_return_summary_json,
+                    estimated_cost_assumptions_json, net_return_summary_json, win_rate_summary_json,
+                    sample_size_status, data_integrity_status, recommendation, blocker_reasons_json,
+                    source_environment, execution_provider, windows_used_json,
+                    timeframes_used_json, timeframes_skipped_json,
+                    paper_fitness_includes_backtest, live_fitness_includes_backtest, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cycle_id, strategy_id, profile_id, timeframe) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    asset_class = excluded.asset_class,
+                    symbol_universe_json = excluded.symbol_universe_json,
+                    replay_window_start = excluded.replay_window_start,
+                    replay_window_end = excluded.replay_window_end,
+                    windows_tested_count = excluded.windows_tested_count,
+                    candidates_evaluated = excluded.candidates_evaluated,
+                    signals_generated = excluded.signals_generated,
+                    proposals_created = excluded.proposals_created,
+                    outcomes_recorded = excluded.outcomes_recorded,
+                    gross_return_summary_json = excluded.gross_return_summary_json,
+                    estimated_cost_assumptions_json = excluded.estimated_cost_assumptions_json,
+                    net_return_summary_json = excluded.net_return_summary_json,
+                    win_rate_summary_json = excluded.win_rate_summary_json,
+                    sample_size_status = excluded.sample_size_status,
+                    data_integrity_status = excluded.data_integrity_status,
+                    recommendation = excluded.recommendation,
+                    blocker_reasons_json = excluded.blocker_reasons_json,
+                    source_environment = excluded.source_environment,
+                    execution_provider = excluded.execution_provider,
+                    windows_used_json = excluded.windows_used_json,
+                    timeframes_used_json = excluded.timeframes_used_json,
+                    timeframes_skipped_json = excluded.timeframes_skipped_json,
+                    paper_fitness_includes_backtest = excluded.paper_fitness_includes_backtest,
+                    live_fitness_includes_backtest = excluded.live_fitness_includes_backtest,
+                    raw_json = excluded.raw_json
+                """,
+                [
+                    (
+                        row["cycle_id"],
+                        row["created_at"],
+                        row["strategy_id"],
+                        row["profile_id"],
+                        row["asset_class"],
+                        row["symbol_universe_json"],
+                        row["timeframe"],
+                        row["replay_window_start"],
+                        row["replay_window_end"],
+                        row["windows_tested_count"],
+                        row["candidates_evaluated"],
+                        row["signals_generated"],
+                        row["proposals_created"],
+                        row["outcomes_recorded"],
+                        row["gross_return_summary_json"],
+                        row["estimated_cost_assumptions_json"],
+                        row["net_return_summary_json"],
+                        row["win_rate_summary_json"],
+                        row["sample_size_status"],
+                        row["data_integrity_status"],
+                        row["recommendation"],
+                        row["blocker_reasons_json"],
+                        row["source_environment"],
+                        row["execution_provider"],
+                        row["windows_used_json"],
+                        row["timeframes_used_json"],
+                        row["timeframes_skipped_json"],
+                        row["paper_fitness_includes_backtest"],
+                        row["live_fitness_includes_backtest"],
+                        row["raw_json"],
+                    )
+                    for row in rows
+                ],
+            )
+
+    def _record_research_cycle_decisions_postgres(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    INSERT INTO research_cycle_decisions (
+                        cycle_id, created_at, strategy_id, profile_id, asset_class,
+                        symbol_universe_json, timeframe, replay_window_start, replay_window_end,
+                        windows_tested_count, candidates_evaluated, signals_generated,
+                        proposals_created, outcomes_recorded, gross_return_summary_json,
+                        estimated_cost_assumptions_json, net_return_summary_json, win_rate_summary_json,
+                        sample_size_status, data_integrity_status, recommendation, blocker_reasons_json,
+                        source_environment, execution_provider, windows_used_json,
+                        timeframes_used_json, timeframes_skipped_json,
+                        paper_fitness_includes_backtest, live_fitness_includes_backtest, raw_json
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                        %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s::jsonb
+                    )
+                    ON CONFLICT(cycle_id, strategy_id, profile_id, timeframe) DO UPDATE SET
+                        created_at = EXCLUDED.created_at,
+                        asset_class = EXCLUDED.asset_class,
+                        symbol_universe_json = EXCLUDED.symbol_universe_json,
+                        replay_window_start = EXCLUDED.replay_window_start,
+                        replay_window_end = EXCLUDED.replay_window_end,
+                        windows_tested_count = EXCLUDED.windows_tested_count,
+                        candidates_evaluated = EXCLUDED.candidates_evaluated,
+                        signals_generated = EXCLUDED.signals_generated,
+                        proposals_created = EXCLUDED.proposals_created,
+                        outcomes_recorded = EXCLUDED.outcomes_recorded,
+                        gross_return_summary_json = EXCLUDED.gross_return_summary_json,
+                        estimated_cost_assumptions_json = EXCLUDED.estimated_cost_assumptions_json,
+                        net_return_summary_json = EXCLUDED.net_return_summary_json,
+                        win_rate_summary_json = EXCLUDED.win_rate_summary_json,
+                        sample_size_status = EXCLUDED.sample_size_status,
+                        data_integrity_status = EXCLUDED.data_integrity_status,
+                        recommendation = EXCLUDED.recommendation,
+                        blocker_reasons_json = EXCLUDED.blocker_reasons_json,
+                        source_environment = EXCLUDED.source_environment,
+                        execution_provider = EXCLUDED.execution_provider,
+                        windows_used_json = EXCLUDED.windows_used_json,
+                        timeframes_used_json = EXCLUDED.timeframes_used_json,
+                        timeframes_skipped_json = EXCLUDED.timeframes_skipped_json,
+                        paper_fitness_includes_backtest = EXCLUDED.paper_fitness_includes_backtest,
+                        live_fitness_includes_backtest = EXCLUDED.live_fitness_includes_backtest,
+                        raw_json = EXCLUDED.raw_json
+                    """,
+                    [
+                        (
+                            row["cycle_id"],
+                            row["created_at"],
+                            row["strategy_id"],
+                            row["profile_id"],
+                            row["asset_class"],
+                            row["symbol_universe_json"],
+                            row["timeframe"],
+                            row["replay_window_start"],
+                            row["replay_window_end"],
+                            row["windows_tested_count"],
+                            row["candidates_evaluated"],
+                            row["signals_generated"],
+                            row["proposals_created"],
+                            row["outcomes_recorded"],
+                            row["gross_return_summary_json"],
+                            row["estimated_cost_assumptions_json"],
+                            row["net_return_summary_json"],
+                            row["win_rate_summary_json"],
+                            row["sample_size_status"],
+                            row["data_integrity_status"],
+                            row["recommendation"],
+                            row["blocker_reasons_json"],
+                            row["source_environment"],
+                            row["execution_provider"],
+                            row["windows_used_json"],
+                            row["timeframes_used_json"],
+                            row["timeframes_skipped_json"],
+                            row["paper_fitness_includes_backtest"],
+                            row["live_fitness_includes_backtest"],
+                            row["raw_json"],
+                        )
+                        for row in rows
+                    ],
+                )
+
+    def _list_research_cycle_decisions_sqlite(
+        self,
+        *,
+        cycle_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            if cycle_id:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM research_cycle_decisions
+                    WHERE cycle_id = ?
+                    ORDER BY created_at DESC, strategy_id ASC, profile_id ASC, timeframe ASC
+                    LIMIT ?
+                    """,
+                    (cycle_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM research_cycle_decisions
+                    ORDER BY created_at DESC, strategy_id ASC, profile_id ASC, timeframe ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_research_cycle_decisions_postgres(
+        self,
+        *,
+        cycle_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                if cycle_id:
+                    cursor.execute(
+                        """
+                        SELECT *
+                        FROM research_cycle_decisions
+                        WHERE cycle_id = %s
+                        ORDER BY created_at DESC, strategy_id ASC, profile_id ASC, timeframe ASC
+                        LIMIT %s
+                        """,
+                        (cycle_id, limit),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT *
+                        FROM research_cycle_decisions
+                        ORDER BY created_at DESC, strategy_id ASC, profile_id ASC, timeframe ASC
+                        LIMIT %s
+                        """,
+                        (limit,),
+                    )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_latest_research_cycle_decisions_sqlite(self) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM research_cycle_decisions
+                WHERE cycle_id = (
+                    SELECT cycle_id
+                    FROM research_cycle_decisions
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                )
+                ORDER BY strategy_id ASC, profile_id ASC, timeframe ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_latest_research_cycle_decisions_postgres(self) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM research_cycle_decisions
+                    WHERE cycle_id = (
+                        SELECT cycle_id
+                        FROM research_cycle_decisions
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    ORDER BY strategy_id ASC, profile_id ASC, timeframe ASC
+                    """
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _upsert_attention_alert_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                INSERT INTO attention_alerts (
+                    event_id, created_at, updated_at, severity, event_type,
+                    strategy_id, profile_id, title, message, evidence_summary_json,
+                    recommended_action, approval_request_id, requires_attention,
+                    attention_status, first_slack_sent_at, last_slack_sent_at,
+                    next_slack_due_at, slack_send_count, slack_sent, slack_error,
+                    resolved_at, resolved_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    severity = excluded.severity,
+                    event_type = excluded.event_type,
+                    strategy_id = excluded.strategy_id,
+                    profile_id = excluded.profile_id,
+                    title = excluded.title,
+                    message = excluded.message,
+                    evidence_summary_json = excluded.evidence_summary_json,
+                    recommended_action = excluded.recommended_action,
+                    approval_request_id = excluded.approval_request_id,
+                    requires_attention = excluded.requires_attention,
+                    attention_status = CASE
+                        WHEN attention_alerts.attention_status IN ('resolved', 'rejected', 'expired', 'acknowledged')
+                        THEN attention_alerts.attention_status
+                        ELSE excluded.attention_status
+                    END,
+                    resolved_at = CASE
+                        WHEN attention_alerts.attention_status IN ('resolved', 'rejected', 'expired', 'acknowledged')
+                        THEN attention_alerts.resolved_at
+                        ELSE excluded.resolved_at
+                    END,
+                    resolved_reason = CASE
+                        WHEN attention_alerts.attention_status IN ('resolved', 'rejected', 'expired', 'acknowledged')
+                        THEN attention_alerts.resolved_reason
+                        ELSE excluded.resolved_reason
+                    END
+                """,
+                (
+                    row["event_id"],
+                    row["created_at"],
+                    row["updated_at"],
+                    row["severity"],
+                    row["event_type"],
+                    row["strategy_id"],
+                    row["profile_id"],
+                    row["title"],
+                    row["message"],
+                    row["evidence_summary_json"],
+                    row["recommended_action"],
+                    row["approval_request_id"],
+                    row["requires_attention"],
+                    row["attention_status"],
+                    row["first_slack_sent_at"],
+                    row["last_slack_sent_at"],
+                    row["next_slack_due_at"],
+                    row["slack_send_count"],
+                    row["slack_sent"],
+                    row["slack_error"],
+                    row["resolved_at"],
+                    row["resolved_reason"],
+                ),
+            )
+
+    def _upsert_attention_alert_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO attention_alerts (
+                        event_id, created_at, updated_at, severity, event_type,
+                        strategy_id, profile_id, title, message, evidence_summary_json,
+                        recommended_action, approval_request_id, requires_attention,
+                        attention_status, first_slack_sent_at, last_slack_sent_at,
+                        next_slack_due_at, slack_send_count, slack_sent, slack_error,
+                        resolved_at, resolved_reason
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT(event_id) DO UPDATE SET
+                        updated_at = EXCLUDED.updated_at,
+                        severity = EXCLUDED.severity,
+                        event_type = EXCLUDED.event_type,
+                        strategy_id = EXCLUDED.strategy_id,
+                        profile_id = EXCLUDED.profile_id,
+                        title = EXCLUDED.title,
+                        message = EXCLUDED.message,
+                        evidence_summary_json = EXCLUDED.evidence_summary_json,
+                        recommended_action = EXCLUDED.recommended_action,
+                        approval_request_id = EXCLUDED.approval_request_id,
+                        requires_attention = EXCLUDED.requires_attention,
+                        attention_status = CASE
+                            WHEN attention_alerts.attention_status IN ('resolved', 'rejected', 'expired', 'acknowledged')
+                            THEN attention_alerts.attention_status
+                            ELSE EXCLUDED.attention_status
+                        END,
+                        resolved_at = CASE
+                            WHEN attention_alerts.attention_status IN ('resolved', 'rejected', 'expired', 'acknowledged')
+                            THEN attention_alerts.resolved_at
+                            ELSE EXCLUDED.resolved_at
+                        END,
+                        resolved_reason = CASE
+                            WHEN attention_alerts.attention_status IN ('resolved', 'rejected', 'expired', 'acknowledged')
+                            THEN attention_alerts.resolved_reason
+                            ELSE EXCLUDED.resolved_reason
+                        END
+                    """,
+                    (
+                        row["event_id"],
+                        row["created_at"],
+                        row["updated_at"],
+                        row["severity"],
+                        row["event_type"],
+                        row["strategy_id"],
+                        row["profile_id"],
+                        row["title"],
+                        row["message"],
+                        row["evidence_summary_json"],
+                        row["recommended_action"],
+                        row["approval_request_id"],
+                        row["requires_attention"],
+                        row["attention_status"],
+                        row["first_slack_sent_at"],
+                        row["last_slack_sent_at"],
+                        row["next_slack_due_at"],
+                        row["slack_send_count"],
+                        row["slack_sent"],
+                        row["slack_error"],
+                        row["resolved_at"],
+                        row["resolved_reason"],
+                    ),
+                )
+
+    def _list_due_attention_alerts_sqlite(self, *, due_at: datetime) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM attention_alerts
+                WHERE requires_attention = 1
+                  AND attention_status = 'open'
+                  AND next_slack_due_at IS NOT NULL
+                  AND next_slack_due_at <= ?
+                ORDER BY next_slack_due_at ASC, created_at ASC
+                """,
+                (due_at.isoformat(),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_due_attention_alerts_postgres(self, *, due_at: datetime) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM attention_alerts
+                    WHERE requires_attention = 1
+                      AND attention_status = 'open'
+                      AND next_slack_due_at IS NOT NULL
+                      AND next_slack_due_at <= %s
+                    ORDER BY next_slack_due_at ASC, created_at ASC
+                    """,
+                    (due_at,),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_open_attention_alerts_sqlite(self, *, limit: int) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM attention_alerts
+                WHERE attention_status = 'open'
+                ORDER BY created_at DESC, event_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_open_attention_alerts_postgres(self, *, limit: int) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM attention_alerts
+                    WHERE attention_status = 'open'
+                    ORDER BY created_at DESC, event_id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _get_attention_alert_sqlite(self, *, event_id: str) -> dict[str, Any] | None:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                "SELECT * FROM attention_alerts WHERE event_id = ? LIMIT 1",
+                (event_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_attention_alert_postgres(self, *, event_id: str) -> dict[str, Any] | None:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    "SELECT * FROM attention_alerts WHERE event_id = %s LIMIT 1",
+                    (event_id,),
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    def _resolve_attention_alert_sqlite(
+        self,
+        *,
+        event_id: str,
+        status: str,
+        reason: str,
+        resolved_at: datetime,
+    ) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                UPDATE attention_alerts
+                SET attention_status = ?,
+                    updated_at = ?,
+                    resolved_at = ?,
+                    resolved_reason = ?,
+                    next_slack_due_at = NULL
+                WHERE event_id = ?
+                """,
+                (status, resolved_at.isoformat(), resolved_at.isoformat(), reason, event_id),
+            )
+
+    def _resolve_attention_alert_postgres(
+        self,
+        *,
+        event_id: str,
+        status: str,
+        reason: str,
+        resolved_at: datetime,
+    ) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE attention_alerts
+                    SET attention_status = %s,
+                        updated_at = %s,
+                        resolved_at = %s,
+                        resolved_reason = %s,
+                        next_slack_due_at = NULL
+                    WHERE event_id = %s
+                    """,
+                    (status, resolved_at, resolved_at, reason, event_id),
+                )
+
+    def _resolve_attention_alerts_for_approval_request_sqlite(
+        self,
+        *,
+        approval_request_id: str,
+        status: str,
+        reason: str,
+        resolved_at: datetime,
+    ) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                UPDATE attention_alerts
+                SET attention_status = ?,
+                    updated_at = ?,
+                    resolved_at = ?,
+                    resolved_reason = ?,
+                    next_slack_due_at = NULL
+                WHERE approval_request_id = ?
+                  AND attention_status = 'open'
+                """,
+                (
+                    status,
+                    resolved_at.isoformat(),
+                    resolved_at.isoformat(),
+                    reason,
+                    approval_request_id,
+                ),
+            )
+
+    def _resolve_attention_alerts_for_approval_request_postgres(
+        self,
+        *,
+        approval_request_id: str,
+        status: str,
+        reason: str,
+        resolved_at: datetime,
+    ) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE attention_alerts
+                    SET attention_status = %s,
+                        updated_at = %s,
+                        resolved_at = %s,
+                        resolved_reason = %s,
+                        next_slack_due_at = NULL
+                    WHERE approval_request_id = %s
+                      AND attention_status = 'open'
+                    """,
+                    (status, resolved_at, resolved_at, reason, approval_request_id),
+                )
+
+    def _mark_attention_alert_sent_sqlite(
+        self,
+        *,
+        event_id: str,
+        sent_at: datetime,
+        next_due_at: datetime | None,
+        slack_send_count: int,
+        slack_error: str,
+    ) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                UPDATE attention_alerts
+                SET updated_at = ?,
+                    first_slack_sent_at = COALESCE(first_slack_sent_at, ?),
+                    last_slack_sent_at = ?,
+                    next_slack_due_at = ?,
+                    slack_send_count = ?,
+                    slack_sent = 1,
+                    slack_error = ?
+                WHERE event_id = ?
+                """,
+                (
+                    sent_at.isoformat(),
+                    sent_at.isoformat(),
+                    sent_at.isoformat(),
+                    next_due_at.isoformat() if next_due_at is not None else None,
+                    slack_send_count,
+                    slack_error,
+                    event_id,
+                ),
+            )
+
+    def _mark_attention_alert_sent_postgres(
+        self,
+        *,
+        event_id: str,
+        sent_at: datetime,
+        next_due_at: datetime | None,
+        slack_send_count: int,
+        slack_error: str,
+    ) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE attention_alerts
+                    SET updated_at = %s,
+                        first_slack_sent_at = COALESCE(first_slack_sent_at, %s),
+                        last_slack_sent_at = %s,
+                        next_slack_due_at = %s,
+                        slack_send_count = %s,
+                        slack_sent = 1,
+                        slack_error = %s
+                    WHERE event_id = %s
+                    """,
+                    (
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        next_due_at,
+                        slack_send_count,
+                        slack_error,
+                        event_id,
+                    ),
+                )
+
     def _paper_order_client_id_exists_sqlite(
         self,
         *,
@@ -8626,6 +11896,80 @@ class UsageLedger:
                     LIMIT %s
                     """,
                     (limit,),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_shadow_trade_proposals_by_note_prefix_sqlite(
+        self,
+        *,
+        note_prefix: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM shadow_trade_proposals
+                WHERE note LIKE ?
+                ORDER BY proposed_at ASC, proposal_id ASC
+                """,
+                (f"{note_prefix}%",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_shadow_trade_proposals_by_note_prefix_postgres(
+        self,
+        *,
+        note_prefix: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect_postgres(scope="core") as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM shadow_trade_proposals
+                    WHERE note LIKE %s
+                    ORDER BY proposed_at ASC, proposal_id ASC
+                    """,
+                    (f"{note_prefix}%",),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_shadow_trade_outcomes_by_note_prefix_sqlite(
+        self,
+        *,
+        note_prefix: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT o.*, p.proposed_at, p.strategy_id, p.profile_id, p.symbol, p.note
+                FROM shadow_trade_outcomes o
+                JOIN shadow_trade_proposals p ON p.proposal_id = o.proposal_id
+                WHERE p.note LIKE ?
+                ORDER BY p.proposed_at ASC, o.checkpoint_minutes ASC, o.proposal_id ASC
+                """,
+                (f"{note_prefix}%",),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_shadow_trade_outcomes_by_note_prefix_postgres(
+        self,
+        *,
+        note_prefix: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect_postgres(scope="core") as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT o.*, p.proposed_at, p.strategy_id, p.profile_id, p.symbol, p.note
+                    FROM shadow_trade_outcomes o
+                    JOIN shadow_trade_proposals p ON p.proposal_id = o.proposal_id
+                    WHERE p.note LIKE %s
+                    ORDER BY p.proposed_at ASC, o.checkpoint_minutes ASC, o.proposal_id ASC
+                    """,
+                    (f"{note_prefix}%",),
                 )
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
@@ -9330,3 +12674,11 @@ class UsageLedger:
                 connection.execute(
                     f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
                 )
+
+
+def _isoformat_or_none(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)

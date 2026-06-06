@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import unittest
 
 from app.framework.strategies.crypto_momentum import CryptoMomentumStrategy
+from app.framework.strategies.crypto_pullback import CryptoPullbackStrategy
+from app.framework.strategies.crypto_research import CryptoResearchStrategy
 from app.framework.strategies.mean_reversion import MeanReversionStrategy
 from app.framework.strategies.momentum_breakout import MomentumVolatilityBreakoutStrategy
 from app.framework.strategies.registry import evaluate_strategies
@@ -163,6 +165,174 @@ class StrategyRegistryTests(unittest.TestCase):
             )
         )
 
+    def test_crypto_research_dip_rebound_is_crypto_only_shadow_signal(self) -> None:
+        config = self._config()
+        strategy = CryptoResearchStrategy()
+        profile = strategy.build_profiles(config)[0]
+        candidate = {
+            "source": "alpaca_crypto_data",
+            "symbol": "ETH/USD",
+            "asset_class": "crypto",
+            "canonical_instrument_id": "ETH-USD-SPOT",
+            "close_price": 100.0,
+            "close_price_gbp": 79.0,
+            "movement_pct": -0.4,
+            "discovery_score": 4.0,
+            "trade_count": 10,
+            "volume": 1_000,
+        }
+
+        signal = strategy.evaluate_candidate(
+            profile=profile,
+            candidate=candidate,
+            market_context={},
+        )
+
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.strategy_id, "crypto_research.dip_rebound")
+        self.assertEqual(signal.asset_class, "crypto")
+        self.assertEqual(signal.note, "shadow_only_crypto_dip_rebound")
+        self.assertEqual(signal.stop_loss_price, 99.0)
+        self.assertEqual(signal.target_price, 102.0)
+
+        self.assertIsNone(
+            strategy.evaluate_candidate(
+                profile=profile,
+                candidate={**candidate, "asset_class": "equity", "symbol": "AAPL"},
+                market_context={},
+            )
+        )
+        self.assertIsNone(
+            strategy.evaluate_candidate(
+                profile=profile,
+                candidate={**candidate, "movement_pct": -3.0},
+                market_context={},
+            )
+        )
+        self.assertIsNone(
+            strategy.evaluate_candidate(
+                profile=profile,
+                candidate={**candidate, "spread_pct": 0.5},
+                market_context={},
+            )
+        )
+
+    def test_crypto_pullback_downside_watch_emits_paper_research_signal_only_on_negative_moves(self) -> None:
+        config = self._config()
+        strategy = CryptoPullbackStrategy()
+        profile = strategy.build_profiles(config)[0]
+        candidate = {
+            "source": "alpaca_crypto_data",
+            "symbol": "AVAX/USD",
+            "asset_class": "crypto",
+            "canonical_instrument_id": "AVAX-USD-SPOT",
+            "close_price": 100.0,
+            "close_price_gbp": 79.0,
+            "movement_pct": -0.417,
+            "discovery_score": 2.8,
+            "trade_count": 3,
+            "volume": 1_000,
+            "volume_gbp": 79_000.0,
+            "spread_pct": 0.12,
+        }
+
+        signal = strategy.evaluate_candidate(
+            profile=profile,
+            candidate=candidate,
+            market_context={},
+        )
+
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.strategy_id, "crypto_pullback.downside_reversal_watch")
+        self.assertEqual(signal.direction, "pullback_watch")
+        self.assertEqual(signal.note, "paper_research_only_crypto_pullback_watch")
+
+        self.assertIsNone(
+            strategy.evaluate_candidate(
+                profile=profile,
+                candidate={**candidate, "movement_pct": 0.417},
+                market_context={},
+            )
+        )
+
+    def test_crypto_research_range_breakout_requires_crypto_technical_confirmation(self) -> None:
+        config = self._config()
+        strategy = CryptoResearchStrategy()
+        profile = strategy.build_profiles(config)[1]
+        candidate = {
+            "source": "alpaca_crypto_data",
+            "symbol": "SOL/USD",
+            "asset_class": "crypto",
+            "canonical_instrument_id": "SOL-USD-SPOT",
+            "close_price": 100.0,
+            "close_price_gbp": 79.0,
+            "movement_pct": 0.35,
+            "discovery_score": 4.0,
+            "trade_count": 10,
+            "volume": 1_000,
+            "technical_context_ready": True,
+            "price_trigger_20": True,
+            "volume_ratio_20": 1.8,
+            "atr_pct_20": 0.8,
+        }
+
+        signal = strategy.evaluate_candidate(
+            profile=profile,
+            candidate=candidate,
+            market_context={},
+        )
+
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.strategy_id, "crypto_research.range_breakout")
+        self.assertEqual(signal.asset_class, "crypto")
+        self.assertEqual(signal.note, "shadow_only_crypto_range_breakout")
+
+        for override in (
+            {"technical_context_ready": False},
+            {"price_trigger_20": False},
+            {"volume_ratio_20": 1.25},
+            {"atr_pct_20": 0.1},
+            {"atr_pct_20": 4.0},
+            {"movement_pct": 3.0},
+        ):
+            self.assertIsNone(
+                strategy.evaluate_candidate(
+                    profile=profile,
+                    candidate={**candidate, **override},
+                    market_context={},
+                )
+            )
+
+    def test_crypto_research_profiles_are_not_execution_allowlisted(self) -> None:
+        paper_allowed = {
+            "mean_reversion.snapback",
+            "crypto_momentum.trend",
+            "momentum.volatility_breakout",
+        }
+        live_allowed = set(paper_allowed)
+        research_ids = {
+            profile.strategy_id
+            for profile in CryptoResearchStrategy().build_profiles(self._config())
+        }
+
+        self.assertTrue(research_ids)
+        self.assertTrue(research_ids.isdisjoint(paper_allowed))
+        self.assertTrue(research_ids.isdisjoint(live_allowed))
+
+    def test_crypto_pullback_profile_is_not_live_execution_allowlisted(self) -> None:
+        strategy_id = CryptoPullbackStrategy().build_profiles(self._config())[0].strategy_id
+        paper_allowed = {
+            "mean_reversion.snapback",
+            "crypto_momentum.trend",
+            "momentum.volatility_breakout",
+        }
+        live_allowed = set(paper_allowed)
+
+        self.assertNotIn(strategy_id, live_allowed)
+
     def test_volatility_breakout_requires_ready_trigger_volume_and_atr_floor(self) -> None:
         config = self._config()
         strategy = MomentumVolatilityBreakoutStrategy()
@@ -236,12 +406,29 @@ class StrategyRegistryTests(unittest.TestCase):
                     "volume_ratio_20": 2.5,
                     "atr_pct_20": 1.5,
                 },
+                {
+                    "source": "alpaca_crypto_data",
+                    "symbol": "SOL/USD",
+                    "asset_class": "crypto",
+                    "canonical_instrument_id": "SOL-USD-SPOT",
+                    "close_price": 100.0,
+                    "close_price_gbp": 79.0,
+                    "movement_pct": 0.35,
+                    "discovery_score": 4.0,
+                    "trade_count": 10,
+                    "volume": 1_000,
+                    "technical_context_ready": True,
+                    "price_trigger_20": True,
+                    "volume_ratio_20": 1.8,
+                    "atr_pct_20": 0.8,
+                },
             ],
         )
 
         signal_ids = {signal.strategy_id for signal in batch.signals}
         self.assertIn("mean_reversion.snapback", signal_ids)
         self.assertIn("crypto_momentum.trend", signal_ids)
+        self.assertIn("crypto_research.range_breakout", signal_ids)
         self.assertIn("momentum.volatility_breakout", signal_ids)
         self.assertEqual(
             [signal.signal_rank for signal in batch.signals],

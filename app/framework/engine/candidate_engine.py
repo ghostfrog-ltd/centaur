@@ -28,6 +28,10 @@ class RankedCandidate:
     venue: str = ""
     venue_symbol: str = ""
     instrument_ref: InstrumentRef | None = None
+    market_data_fresh: bool = True
+    market_data_eligible: bool = True
+    market_data_rejection_reason: str = ""
+    market_data_source_used_for_strategy: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -48,6 +52,10 @@ class RankedCandidate:
             "trade_count": self.trade_count,
             "bar_timestamp": _normalize_timestamp(self.bar_timestamp),
             "note": self.note,
+            "market_data_fresh": self.market_data_fresh,
+            "market_data_eligible": self.market_data_eligible,
+            "market_data_rejection_reason": self.market_data_rejection_reason,
+            "market_data_source_used_for_strategy": self.market_data_source_used_for_strategy,
         }
         if self.instrument_ref is not None:
             payload["instrument_ref"] = self.instrument_ref.as_dict()

@@ -12,6 +12,7 @@ from app.framework.runtime.test_monitor import (
     build_failure_fingerprint,
     mark_alerts_sent,
     plan_state_update,
+    preflight_operations_store_for_scheduler,
     reset_failure_notification,
 )
 
@@ -106,6 +107,7 @@ class TestMonitorTests(unittest.TestCase):
                 exit_code=0,
                 output="unit tests OK",
                 duration_seconds=1.0,
+                checks={"unit_tests": {"status": "pass", "summary": "Unit tests passed."}},
             ),
             config=self._config(),
             latest_tick={
@@ -118,6 +120,7 @@ class TestMonitorTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0)
         self.assertIn("PASS: latest tick 20260603-120000", result.output)
+        self.assertEqual(result.checks["scheduler_freshness"]["status"], "pass")
 
     def test_scheduler_freshness_fails_for_stale_tick(self) -> None:
         now = self._now()
@@ -126,6 +129,7 @@ class TestMonitorTests(unittest.TestCase):
                 exit_code=0,
                 output="unit tests OK",
                 duration_seconds=1.0,
+                checks={"unit_tests": {"status": "pass", "summary": "Unit tests passed."}},
             ),
             config=self._config(),
             latest_tick={
@@ -138,6 +142,7 @@ class TestMonitorTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("reason=stale", result.output)
+        self.assertEqual(result.checks["scheduler_freshness"]["status"], "fail")
 
     def test_scheduler_freshness_fails_for_missing_latest_tick(self) -> None:
         result = append_scheduler_freshness_check(
@@ -145,6 +150,7 @@ class TestMonitorTests(unittest.TestCase):
                 exit_code=0,
                 output="unit tests OK",
                 duration_seconds=1.0,
+                checks={"unit_tests": {"status": "pass", "summary": "Unit tests passed."}},
             ),
             config=self._config(),
             latest_tick=None,
@@ -153,6 +159,54 @@ class TestMonitorTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("no control tick has been recorded", result.output)
+
+    def test_operations_store_preflight_reports_missing_postgres_separately(self) -> None:
+        ok, message = preflight_operations_store_for_scheduler(
+            runtime_config=type(
+                "Config",
+                (),
+                {
+                    "operations_db_backend_preference": "postgres",
+                    "postgres_configured": False,
+                    "database_url": "",
+                    "paper_execution_enabled": False,
+                    "live_execution_enabled": False,
+                },
+            )()
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("PostgreSQL operations store is unavailable", message)
+
+    def test_failure_alert_says_tests_passed_but_operations_store_unavailable(self) -> None:
+        now = self._now()
+        result = append_scheduler_freshness_check(
+            result=TestRunResult(
+                exit_code=0,
+                output="unit tests OK",
+                duration_seconds=1.0,
+                checks={"unit_tests": {"status": "pass", "summary": "Unit tests passed."}},
+            ),
+            config=self._config(),
+            latest_tick=None,
+            now=now,
+            check_error="PostgreSQL operations store is unavailable; check DATABASE_URL/POSTGRES_* settings.",
+        )
+
+        state, alerts = plan_state_update(
+            previous_state={},
+            result=result,
+            config=self._config(),
+            now=now,
+        )
+
+        self.assertEqual(state["last_status"], "failed")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn(
+            "Tests passed, but scheduler freshness check failed because PostgreSQL operations store is unavailable.",
+            alerts[0].text,
+        )
+        self.assertNotIn("Centaur test monitor failed", alerts[0].text)
 
     def _failed_result(self, output: str) -> TestRunResult:
         return TestRunResult(exit_code=1, output=output, duration_seconds=0.5)

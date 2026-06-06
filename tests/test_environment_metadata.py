@@ -84,6 +84,47 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(rows["live-order"]["source_environment"], "paper")
         self.assertEqual(rows["live-order"]["execution_provider"], "alpaca_live")
 
+    def test_order_refresh_preserves_exit_quality_audit_payload(self) -> None:
+        captured_at = datetime.now().astimezone()
+        self.ledger.record_paper_trade_orders(
+            tick_id="test-tick",
+            captured_at=captured_at,
+            orders=[
+                {
+                    "id": "exit-order-1",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "status": "new",
+                    "broker_id": "alpaca_paper",
+                    "exit_quality_audit": {
+                        "schema_version": 1,
+                        "affects_execution": False,
+                        "target_touch_flags": {"1.75": True},
+                    },
+                }
+            ],
+        )
+        self.ledger.record_paper_trade_orders(
+            tick_id="test-tick-2",
+            captured_at=captured_at + timedelta(minutes=1),
+            orders=[
+                {
+                    "id": "exit-order-1",
+                    "symbol": "AAPL",
+                    "side": "sell",
+                    "status": "filled",
+                    "broker_id": "alpaca_paper",
+                    "filled_avg_price": 101.0,
+                }
+            ],
+        )
+
+        row = self.ledger.list_recent_paper_trade_orders(limit=1)[0]
+
+        self.assertEqual(row["status"], "filled")
+        self.assertEqual(row["raw_json"]["exit_quality_audit"]["schema_version"], 1)
+        self.assertTrue(row["raw_json"]["exit_quality_audit"]["target_touch_flags"]["1.75"])
+
     def test_fitness_snapshots_carry_evidence_origin(self) -> None:
         self.ledger.record_strategy_fitness_snapshots(
             tick_id="test-tick",
@@ -208,6 +249,51 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(row["close_price_gbp"], 0.725)
         self.assertEqual(row["venue"], "trading212")
         self.assertEqual(row["venue_symbol"], "VODl_EQ")
+
+    def test_previous_bars_use_prior_distinct_bar_not_prior_capture_of_same_bar(self) -> None:
+        base = datetime.now().astimezone().replace(second=0, microsecond=0)
+        same_bar_ts = base.isoformat()
+        prior_bar_ts = (base - timedelta(minutes=1)).isoformat()
+        for tick_id, captured_at, bar_ts, close_price in (
+            ("tick-1", base - timedelta(seconds=20), prior_bar_ts, 100.0),
+            ("tick-2", base - timedelta(seconds=10), same_bar_ts, 101.0),
+            ("tick-3", base, same_bar_ts, 101.0),
+        ):
+            self.ledger.record_latest_bars(
+                tick_id=tick_id,
+                captured_at=captured_at,
+                source="alpaca_crypto_data",
+                bars_by_symbol={
+                    "BTC/USD": {
+                        "t": bar_ts,
+                        "o": close_price,
+                        "h": close_price,
+                        "l": close_price,
+                        "c": close_price,
+                        "v": 10,
+                        "n": 2,
+                        "vw": close_price,
+                    }
+                },
+            )
+
+        previous = self.ledger.get_previous_bars(
+            tick_id="tick-3",
+            symbol_keys=[("alpaca_crypto_data", "BTC/USD")],
+            current_rows=[
+                {
+                    "source": "alpaca_crypto_data",
+                    "symbol": "BTC/USD",
+                    "bar_timestamp": same_bar_ts,
+                    "close_price": 101.0,
+                }
+            ],
+        )
+
+        row = previous[("alpaca_crypto_data", "BTC/USD")]
+        self.assertEqual(str(row["tick_id"]), "tick-1")
+        self.assertEqual(str(row["bar_timestamp"]), prior_bar_ts)
+        self.assertEqual(float(row["close_price"]), 100.0)
 
     def test_historical_bars_carry_instrument_metadata(self) -> None:
         now = datetime.now().astimezone()
@@ -665,17 +751,16 @@ class EnvironmentMetadataTests(unittest.TestCase):
 
         self.assertEqual(config.postgres_schema, "liveops2026")
 
-    def test_armed_live_config_fails_when_risk_lever_differs_from_paper(self) -> None:
+    def test_armed_live_config_accepts_live_risk_lever_different_from_paper(self) -> None:
         os.environ["LIVE_EXECUTION_ENABLED"] = "true"
         os.environ["LIVE_EXECUTION_ACTIVATION_ACK"] = "LIVE_TRADING_APPROVED"
         os.environ["PAPER_EXECUTION_DEFAULT_NOTIONAL_USD"] = "10.00"
         os.environ["LIVE_EXECUTION_DEFAULT_NOTIONAL_USD"] = "11.00"
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "live_same_as_paper_config_mismatch: execution_default_notional_usd",
-        ):
-            load_runtime_config()
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_execution_default_notional_usd, 10.0)
+        self.assertEqual(config.live_execution_default_notional_usd, 11.0)
 
     def test_armed_live_config_can_allow_named_paper_difference(self) -> None:
         os.environ["LIVE_EXECUTION_ENABLED"] = "true"
@@ -742,17 +827,16 @@ class EnvironmentMetadataTests(unittest.TestCase):
         self.assertEqual(config.paper_observe_only_signal_score_floor, 80.0)
         self.assertEqual(config.live_observe_only_signal_score_floor, 82.5)
 
-    def test_armed_live_config_fails_when_crypto_momentum_differs_from_paper(self) -> None:
+    def test_armed_live_config_accepts_crypto_momentum_different_from_paper(self) -> None:
         os.environ["LIVE_EXECUTION_ENABLED"] = "true"
         os.environ["LIVE_EXECUTION_ACTIVATION_ACK"] = "LIVE_TRADING_APPROVED"
         os.environ["PAPER_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "0.01"
         os.environ["LIVE_CRYPTO_MOMENTUM_STOP_LOSS_PCT"] = "0.02"
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "live_same_as_paper_config_mismatch: crypto_momentum_stop_loss_pct",
-        ):
-            load_runtime_config()
+        config = load_runtime_config()
+
+        self.assertEqual(config.paper_crypto_momentum_stop_loss_pct, 0.01)
+        self.assertEqual(config.live_crypto_momentum_stop_loss_pct, 0.02)
 
     def test_armed_live_config_rejects_unknown_allowed_difference(self) -> None:
         os.environ["LIVE_EXECUTION_ENABLED"] = "true"
@@ -761,7 +845,7 @@ class EnvironmentMetadataTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "live_same_as_paper_unknown_allowed_difference: made_up_lever",
+            "live_lane_unknown_allowed_difference: made_up_lever",
         ):
             load_runtime_config()
 

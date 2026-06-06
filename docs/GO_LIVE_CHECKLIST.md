@@ -54,7 +54,7 @@ If a human override is granted, first live mode should still be extremely constr
 
 The 2026-05-29 operator-selected plan explicitly chooses the same-as-paper follower lane instead of the one-strategy default. That exception is acceptable only while the `$10` notional, `10` base slots, one-order-per-tick cap, same-tick submitted-paper-order follow rule, `$2.00` daily protector, and rollback triggers remain in force.
 
-2026-06-04 direction: this checklist describes the current first-live follower envelope, not the desired final architecture. The target design is an independent live lane that follows `LIVE_*` `.env` dials exactly over shared evidence/signals, while paper follows `PAPER_*`. That future lane needs a separate implementation/checklist/reporting update before activation.
+2026-06-04 update: the active Alpaca Live lane now follows `LIVE_*` `.env` dials exactly over shared evidence/signals, while paper follows `PAPER_*`. The first-live follower envelope remains useful historical context, but it is no longer the active entry-selection rule.
 
 ## Current Dormant Live Lane
 Current May-readiness prep is:
@@ -67,17 +67,17 @@ Current May-readiness prep is:
 - readiness strategy allowlist: `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`, matching paper
 - readiness entry economics: `$10` notional, one order per tick, `$2.00` daily drawdown protector, `1.5%` equity projected-gain floor, `2.0%` crypto projected-gain floor, `5` bps equity limit buffer, and `25` bps crypto limit buffer
 - earned-slot rule: after live has its own baseline, each full `10` account-currency units of tracked P/L may add one effective `10` unit slot
-- live entry submission: dormant unless all explicit go-live gates pass
+- live entry submission: active only when all explicit go-live gates pass
 - live cancellation/stale-order cleanup: implemented but guarded by live credentials plus activation acknowledgement
 - live managed exits: prepared to refresh stale or non-marketable sell exits like paper once the live lane is deliberately activated
 - API keys plus `LIVE_EXECUTION_ENABLED=true`: not enough to trade live
-- live can only follow a same-tick paper-approved trade that paper execution actually submitted
+- live evaluates shared proposals independently using `LIVE_*` `.env` dials exactly
 - live execution intelligence: read-only live-vs-paper execution monitor; strategy fitness remains shared shadow fitness
 
 This lets paper and live be designed as side-by-side lanes without allowing accidental real-money execution.
 
-## Current Funded Readiness State
-As of 2026-05-29, Alpaca Live API keys have been added locally, the initial funds are visible, and the read-only funded checks passed. This is still not go-live approval.
+## Funded Readiness State
+As of 2026-05-29, Alpaca Live API keys had been added locally, the initial funds were visible, and the read-only funded checks passed. As of 2026-06-04, the active live entry policy is the independent `LIVE_*` dial lane described above.
 
 ## Explicit Go-Live Override
 On 2026-05-29 at about 10:48 BST, the operator explicitly instructed Codex to turn Alpaca Live on. This satisfies the human-override requirement for the previously recorded first-live same-as-paper follower plan.
@@ -139,7 +139,8 @@ The operator-selected first-live policy is "same as paper" rather than one strat
 First-live strategy policy:
 - allow only the current paper execution strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, and `momentum.volatility_breakout`
 - do not add any strategy that is not already paper-allowed
-- live may only follow a same-tick paper-approved trade that paper execution actually submitted
+- historical first-live rule: live could only follow a same-tick paper-approved trade that paper execution actually submitted
+- active 2026-06-04 rule: live evaluates shared proposals independently using `LIVE_*` dials exactly
 - strategy scoring remains shared paper/shadow fitness; live gets execution monitoring, not its own strategy brain
 
 Day-one live limits:
@@ -161,8 +162,8 @@ Day-one live limits:
 Rollback triggers:
 - any unexpected live position or live open order before activation
 - any live account block, trading block, or user suspension
-- any live order that does not correspond to a same-proposal submitted paper order
-- any surprising live-vs-paper fill drift, status mismatch, reject, or partial-fill behavior
+- any live order that does not correspond to an approved live proposal and final live guard pass
+- any surprising live-vs-paper or live-vs-intent fill drift, status mismatch, reject, or partial-fill behavior
 - any stale live order that cannot be canceled/refreshed by the guarded live path
 - live daily drawdown reaches the configured `$2.00` protector
 - account/equity numbers diverge from Alpaca or become unavailable
@@ -181,7 +182,7 @@ Before activating live entries, do this in order:
 1. Re-run the read-only status/sync check immediately before activation and confirm Alpaca Live cash, equity, buying power, positions, and orders are still sane.
 2. Confirm the live account has no unexpected positions and no unexpected open orders.
 3. Confirm the live readiness envelope still matches the intended first phase: `$10` notional, one order per tick, `10` base slots, `$2.00` daily protector, same paper strategy allowlist, equities plus crypto, and the same projected-gain/limit-buffer settings. The `$132.05` balance does not widen the `$10 x 10` envelope.
-4. Confirm which live policy is being activated: the existing same-as-paper follower lane, or a separately implemented/tested/reported independent live lane that obeys `LIVE_*` `.env` dials exactly. Do not blur the two policies.
+4. Confirm the active independent live lane still obeys `LIVE_*` `.env` dials exactly and that status/reporting labels live decisions, skips, and final guard outcomes without blurring them with paper.
 5. Run one final paper tick/status check and confirm paper execution is not showing unresolved broker, order, stale-exit, or accounting alerts.
 6. Update this checklist, `CONSTRAINTS.md`, `DECISION_LOG.md`, `docs/DECISION_LOG.md`, `docs/PROJECT_RECORD.md`, and `PROGRESS.txt` with the explicit go-live override.
 7. Only after that documentation exists, set `LIVE_EXECUTION_ENABLED=true`, set `LIVE_EXECUTION_ACTIVATION_ACK=LIVE_TRADING_APPROVED`, and clear `LIVE_EXECUTION_KILL_SWITCH=false`.
@@ -200,8 +201,8 @@ Do not skip the read-only key test. Do not flip all live flags just because the 
 Current Centaur status is:
 
 - paper active
-- Alpaca Live explicitly approved for same-as-paper follower activation
-- first-live same-as-paper policy, limits, and rollback rules recorded
+- Alpaca Live explicitly approved for independent `LIVE_*` dial activation
+- first-live same-as-paper history plus active independent-live policy, limits, and rollback rules recorded
 - no risk widening beyond the `$10 x 10` / `$5.00` protector envelope
 
 ## Decision Record

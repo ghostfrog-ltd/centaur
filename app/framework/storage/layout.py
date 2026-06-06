@@ -81,7 +81,7 @@ def storage_layout_from_config(config: Any) -> StorageLayout:
         ),
         live=StorageLane(
             name="live",
-            purpose="Alpaca Live follower orders, live account snapshots, live execution evidence",
+            purpose="Alpaca Live orders, live account snapshots, live execution evidence",
             postgres_schema=live_schema,
             log_dir="storage/live/logs",
             evidence_dir="storage/live/evidence",

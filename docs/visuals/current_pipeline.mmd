@@ -2,7 +2,7 @@ flowchart TD
   start(["scheduled tick"])
   subgraph lane_runtime["Runtime control / app.heartbeat.steps + app.framework.runtime"]
     n01["control.heartbeat<br/>app/heartbeat/steps/01_control_heartbeat/pipeline.py::run"]
-    n24["context.enrichment<br/>app/heartbeat/steps/24_context_enrichment/pipeline.py::run"]
+    n25["context.enrichment<br/>app/heartbeat/steps/25_context_enrichment/pipeline.py::run"]
   end
   subgraph lane_broker["Broker sync / app.heartbeat.steps + app.framework.adapters"]
     n02["alpaca.account<br/>app/heartbeat/steps/02_alpaca_account/pipeline.py::run"]
@@ -17,8 +17,8 @@ flowchart TD
     n09["risk.live_daily_protection<br/>app/heartbeat/steps/09_risk_live_daily_protection/pipeline.py::run"]
     n10["risk.trailing_drawdown_observer<br/>app/heartbeat/steps/10_risk_trailing_drawdown_observer/pipeline.py::run"]
     n15["risk.trading212_paper_daily_protection<br/>app/heartbeat/steps/15_risk_trading212_paper_daily_protection/pipeline.py::run"]
-    n28["risk.cfo<br/>app/heartbeat/steps/28_risk_cfo/pipeline.py::run"]
-    n30["risk.live_cfo<br/>app/heartbeat/steps/30_risk_live_cfo/pipeline.py::run"]
+    n29["risk.cfo<br/>app/heartbeat/steps/29_risk_cfo/pipeline.py::run"]
+    n31["risk.live_cfo<br/>app/heartbeat/steps/31_risk_live_cfo/pipeline.py::run"]
   end
   subgraph lane_maintenance["Maintenance / app.heartbeat.steps"]
     n11["maintenance.stale_orders<br/>app/heartbeat/steps/11_maintenance_stale_orders/pipeline.py::run"]
@@ -35,19 +35,20 @@ flowchart TD
   subgraph lane_execution["Execution routing / app.heartbeat.steps + app.framework.runtime"]
     n19["execution.paper_exits<br/>app/heartbeat/steps/19_execution_paper_exits/pipeline.py::run"]
     n20["execution.live_exits<br/>app/heartbeat/steps/20_execution_live_exits/pipeline.py::run"]
-    n29["execution.paper<br/>app/heartbeat/steps/29_execution_paper/pipeline.py::run"]
-    n31["execution.live<br/>app/heartbeat/steps/31_execution_live/pipeline.py::run"]
+    n30["execution.paper<br/>app/heartbeat/steps/30_execution_paper/pipeline.py::run"]
+    n32["execution.live<br/>app/heartbeat/steps/32_execution_live/pipeline.py::run"]
   end
   subgraph lane_research["Research, evidence, and analysis / app.heartbeat.steps + app.framework.engine"]
     n21["shadow.outcomes<br/>app/heartbeat/steps/21_shadow_outcomes/pipeline.py::run"]
     n22["strategy.fitness<br/>app/heartbeat/steps/22_strategy_fitness/pipeline.py::run"]
-    n25["strategy.signals<br/>app/heartbeat/steps/25_strategy_signals/pipeline.py::run"]
-    n26["analysis.gemini<br/>app/heartbeat/steps/26_analysis_gemini/pipeline.py::run"]
-    n27["shadow.proposals<br/>app/heartbeat/steps/27_shadow_proposals/pipeline.py::run"]
-    n32["evaluation.post_trade<br/>app/heartbeat/steps/32_evaluation_post_trade/pipeline.py::run"]
+    n24["slow.enrichment_queue<br/>app/heartbeat/steps/24_slow_enrichment_queue/pipeline.py::run"]
+    n26["strategy.signals<br/>app/heartbeat/steps/26_strategy_signals/pipeline.py::run"]
+    n27["analysis.gemini<br/>app/heartbeat/steps/27_analysis_gemini/pipeline.py::run"]
+    n28["shadow.proposals<br/>app/heartbeat/steps/28_shadow_proposals/pipeline.py::run"]
+    n33["evaluation.post_trade<br/>app/heartbeat/steps/33_evaluation_post_trade/pipeline.py::run"]
   end
   subgraph lane_notifications["Operator notifications / app.heartbeat.steps + app.framework.runtime"]
-    n33["notifications.slack<br/>app/heartbeat/steps/33_notifications_slack/pipeline.py::run"]
+    n34["notifications.slack<br/>app/heartbeat/steps/34_notifications_slack/pipeline.py::run"]
   end
   start --> n01
   n01 --> n02
@@ -82,8 +83,9 @@ flowchart TD
   n30 --> n31
   n31 --> n32
   n32 --> n33
+  n33 --> n34
   done(["tick complete"])
-  n33 --> done
+  n34 --> done
   classDef runtime fill:#eef7f4,stroke:#28705f,color:#10231f
   classDef broker fill:#f7fbff,stroke:#2f6f9f,color:#13283a
   classDef risk fill:#fff1f0,stroke:#b0413e,color:#3d1716
@@ -93,11 +95,11 @@ flowchart TD
   classDef research fill:#f2f5f7,stroke:#657174,color:#172022
   classDef notifications fill:#eef5f1,stroke:#0f8b8d,color:#10231f
   classDef other fill:#ffffff,stroke:#657174,color:#172022
-  class n01,n24 runtime
+  class n01,n25 runtime
   class n02,n03,n04,n05,n06,n07 broker
-  class n08,n09,n10,n15,n28,n30 risk
+  class n08,n09,n10,n15,n29,n31 risk
   class n11,n12 maintenance
   class n13,n14,n16,n17,n18,n23 market
-  class n19,n20,n29,n31 execution
-  class n21,n22,n25,n26,n27,n32 research
-  class n33 notifications
+  class n19,n20,n30,n32 execution
+  class n21,n22,n24,n26,n27,n28,n33 research
+  class n34 notifications

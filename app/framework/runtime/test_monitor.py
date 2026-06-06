@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -33,6 +33,7 @@ class TestRunResult:
     exit_code: int
     output: str
     duration_seconds: float
+    checks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -135,7 +136,43 @@ def run_test_command(
         exit_code=int(completed.returncode),
         output=str(completed.stdout or ""),
         duration_seconds=max(0.0, (finished_at - started_at).total_seconds()),
+        checks={
+            "unit_tests": {
+                "status": "pass" if int(completed.returncode) == 0 else "fail",
+                "summary": (
+                    "Unit tests passed."
+                    if int(completed.returncode) == 0
+                    else f"Unit tests failed with exit={int(completed.returncode)}."
+                ),
+            }
+        },
     )
+
+
+def preflight_operations_store_for_scheduler(*, runtime_config: Any) -> tuple[bool, str]:
+    preference = str(
+        getattr(runtime_config, "operations_db_backend_preference", "") or ""
+    ).strip().lower()
+    postgres_configured = bool(getattr(runtime_config, "postgres_configured", False))
+    database_url = str(getattr(runtime_config, "database_url", "") or "").strip()
+    paper_execution_enabled = bool(
+        getattr(runtime_config, "paper_execution_enabled", False)
+    )
+    live_execution_enabled = bool(getattr(runtime_config, "live_execution_enabled", False))
+    postgres_required = (
+        paper_execution_enabled
+        or live_execution_enabled
+        or preference == "postgres"
+        or postgres_configured
+    )
+    if not postgres_required:
+        return True, "PostgreSQL operations store is not required for this runtime."
+    if not postgres_configured or not database_url:
+        return (
+            False,
+            "PostgreSQL operations store is unavailable; check DATABASE_URL/POSTGRES_* settings.",
+        )
+    return True, "PostgreSQL operations store is configured."
 
 
 def append_scheduler_freshness_check(
@@ -150,11 +187,24 @@ def append_scheduler_freshness_check(
     if not config.scheduler_freshness_enabled:
         return result
 
+    checks = dict(result.checks)
     passed = False
     lines = ["", "Centaur scheduler freshness check:"]
+    scheduler_status = "fail"
+    scheduler_summary = ""
+    operations_store_status = "pass"
+    operations_store_summary = "Operations store preflight passed."
     if check_error:
-        lines.append(f"FAILED: could not read latest control tick: {check_error}")
+        operations_store_status = "fail"
+        operations_store_summary = check_error
+        scheduler_status = "skipped"
+        scheduler_summary = (
+            "Scheduler freshness check skipped because operations store preflight failed."
+        )
+        lines.append("SKIPPED: operations store preflight failed")
+        lines.append(f"Reason: {check_error}")
     elif latest_tick is None:
+        scheduler_summary = "No control tick has been recorded."
         lines.append("FAILED: no control tick has been recorded")
     else:
         tick_id = str(latest_tick.get("tick_id") or "-")
@@ -170,12 +220,20 @@ def append_scheduler_freshness_check(
             age_text = _format_age(seconds=age_seconds)
             if status == "ok" and age_seconds <= max_age_seconds:
                 passed = True
+                scheduler_status = "pass"
+                scheduler_summary = (
+                    f"Latest tick {tick_id} is fresh and ok with age={age_text}."
+                )
                 lines.append(
                     f"PASS: latest tick {tick_id} status=ok age={age_text} "
                     f"limit={config.scheduler_max_age_minutes}m"
                 )
             else:
                 reason = "stale" if age_seconds > max_age_seconds else "not_ok"
+                scheduler_summary = (
+                    f"Latest tick {tick_id} failed freshness with status={status} "
+                    f"age={age_text} reason={reason}."
+                )
                 lines.append(
                     f"FAILED: latest tick {tick_id} status={status} age={age_text} "
                     f"limit={config.scheduler_max_age_minutes}m reason={reason}"
@@ -184,11 +242,20 @@ def append_scheduler_freshness_check(
     output = "\n".join(
         part for part in [result.output.rstrip(), "\n".join(lines)] if part
     )
+    checks["operations_store"] = {
+        "status": operations_store_status,
+        "summary": operations_store_summary,
+    }
+    checks["scheduler_freshness"] = {
+        "status": scheduler_status,
+        "summary": scheduler_summary,
+    }
     exit_code = result.exit_code if result.exit_code != 0 or passed else 1
     return TestRunResult(
         exit_code=exit_code,
         output=output,
         duration_seconds=result.duration_seconds,
+        checks=checks,
     )
 
 
@@ -378,21 +445,56 @@ def _failure_message(
     config: TestMonitorConfig,
     output_tail: str,
 ) -> str:
-    heading = (
-        "Centaur test monitor failed"
-        if kind == "failed"
-        else "Centaur test monitor is still failing"
-    )
+    unit_status = str((result.checks.get("unit_tests") or {}).get("status", "")).lower()
+    ops_status = str((result.checks.get("operations_store") or {}).get("status", "")).lower()
+    scheduler_status = str(
+        (result.checks.get("scheduler_freshness") or {}).get("status", "")
+    ).lower()
+    if unit_status == "pass" and ops_status == "fail":
+        heading = (
+            "Centaur monitor runtime issue"
+            if kind == "failed"
+            else "Centaur monitor runtime issue is still unresolved"
+        )
+    elif unit_status == "pass" and scheduler_status == "fail":
+        heading = (
+            "Centaur scheduler freshness check failed"
+            if kind == "failed"
+            else "Centaur scheduler freshness check is still failing"
+        )
+    else:
+        heading = (
+            "Centaur test monitor failed"
+            if kind == "failed"
+            else "Centaur test monitor is still failing"
+        )
     command = " ".join(shlex.quote(item) for item in config.command)
     tail = output_tail or "(no test output captured)"
-    return (
-        f"{heading}: exit={result.exit_code}, fingerprint={fingerprint[:12]}, "
-        f"duration={result.duration_seconds:.1f}s.\n"
-        f"Command: {command}\n"
-        "Reset reminders for this exact failure with: "
-        "scripts/run_test_monitor.py --reset-failure-notification\n"
-        f"Last output:\n{tail}"
+    lines = [
+        f"{heading}: exit={result.exit_code}, fingerprint={fingerprint[:12]}, duration={result.duration_seconds:.1f}s.",
+        f"Command: {command}",
+    ]
+    if unit_status == "pass" and ops_status == "fail":
+        lines.append(
+            "Tests passed, but scheduler freshness check failed because PostgreSQL operations store is unavailable."
+        )
+    else:
+        unit_summary = str((result.checks.get("unit_tests") or {}).get("summary", "") or "")
+        ops_summary = str((result.checks.get("operations_store") or {}).get("summary", "") or "")
+        scheduler_summary = str((result.checks.get("scheduler_freshness") or {}).get("summary", "") or "")
+        if unit_summary:
+            lines.append(f"Unit tests: {unit_summary}")
+        if ops_summary:
+            lines.append(f"Operations store: {ops_summary}")
+        if scheduler_summary:
+            lines.append(f"Scheduler freshness: {scheduler_summary}")
+    lines.extend(
+        [
+            "Reset reminders for this exact failure with: scripts/run_test_monitor.py --reset-failure-notification",
+            f"Last output:\n{tail}",
+        ]
     )
+    return "\n".join(lines)
 
 
 def _resolve_project_path(project_root: Path, value: str) -> Path:

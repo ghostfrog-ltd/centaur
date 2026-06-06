@@ -6,7 +6,7 @@ Last updated: 2026-05-31
 
 Project Centaur's strategic growth target is to reach a sustained, evidence-backed net profit pace of `$50/day` while preserving capital and obeying all current risk constraints.
 
-This target is not permission to widen risk. It does not change the `$10` per-trade notional, broker routing, strategy allowlists, projected-gain floors, daily protection, live follower gates, or managed exits without explicit human approval and matching reliability-stack updates.
+This target is not permission to widen risk. It does not change the `$10` per-trade notional, broker routing, strategy allowlists, projected-gain floors, daily protection, live gates, or managed exits without explicit human approval and matching reliability-stack updates.
 
 ## Current Observed State
 
@@ -113,4 +113,3 @@ Each stage should require:
 ## Operating Rule
 
 The `$50/day` target must guide prioritization, reporting, and research, but it must not override capital preservation. Strategy fitness remains invalid if it depends on breaking risk rules.
-

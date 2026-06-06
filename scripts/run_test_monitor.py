@@ -22,6 +22,7 @@ from app.framework.runtime.test_monitor import (
     load_test_monitor_config,
     mark_alerts_sent,
     plan_state_update,
+    preflight_operations_store_for_scheduler,
     reset_failure_notification,
     run_test_command,
     send_slack_alerts,
@@ -68,7 +69,13 @@ def main() -> int:
         if config.scheduler_freshness_enabled:
             try:
                 runtime_config = load_runtime_config()
-                latest_tick = UsageLedger(config=runtime_config).get_latest_tick_run()
+                store_ok, store_message = preflight_operations_store_for_scheduler(
+                    runtime_config=runtime_config
+                )
+                if store_ok:
+                    latest_tick = UsageLedger(config=runtime_config).get_latest_tick_run()
+                else:
+                    scheduler_check_error = store_message
             except Exception as exc:
                 scheduler_check_error = f"{type(exc).__name__}: {exc}"
         result = append_scheduler_freshness_check(
