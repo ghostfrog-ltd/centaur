@@ -1,87 +1,121 @@
 # Project Centaur
 
-Project Centaur is a pipeline-first trading research and micro paper-trading system.
+Project Centaur is an autonomous trading research, shadow-learning, paper-execution, and promotion-gated control system.
 
-It scans equity and crypto markets, creates deterministic strategy signals, scores them against stored shadow outcomes, applies strict risk/CFO gates, and submits tiny Alpaca Paper orders only when the configured constraints allow it.
+It runs continuously, stores operational state in PostgreSQL, collects live market/account/risk data, runs real historical replay research from stored bars, evaluates strategy/profile evidence, updates internal research and promotion stages, and sends Slack attention alerts when Gary needs to approve or reject paper/live permission changes.
 
-The current experiment is deliberately small:
+Centaur may advance internal evidence stages automatically. It must not auto-approve broker paper execution, must not auto-approve live execution, and must not silently remove paper/live permissions without manual review.
 
-> Can a system trade for almost nothing, repeatedly capture small profits, keep losses controlled, and produce a measurable edge before any live-money discussion?
+## Current Project Summary
 
-Centaur is not a live-money bot. It is an auditable learning system with a paper execution lane.
+Centaur is not just a paper bot and not just an offline backtester. The current system combines:
 
-## The Current Hypothesis
+- unattended heartbeat supervision via `launchd`
+- continuous market/account/risk observation
+- deterministic signal generation and shadow learning
+- real replay research over stored historical bars
+- promotion-stage updates driven by evidence
+- manual Slack attention workflows for execution permission changes
 
-The important 2026-05-28 insight is that Centaur's paper lane is a **micro system**.
+The practical question is still small and conservative:
 
-That means:
+> Can a tightly constrained system learn continuously, protect capital, and earn the right to paper or live execution through auditable evidence rather than assumption?
 
-- `$10` entries
-- small profit capture
-- many repetitions
-- strict stops and daily protection
-- fitness as a guardrail, not a total handbrake
-- larger profit targets recorded in shadow, not forced onto tiny paper trades
+## Runtime Architecture
 
-The suspected old failure mode was:
+- `launchd` is the primary runtime supervisor.
+- A cron kickstart/backstop path exists so the unattended agent can be re-kicked or monitored if needed.
+- The supervised heartbeat service runs `main.py --heartbeat-service --interval-seconds 10`.
+- Ticks are sequential and reload `.env` plus runtime storage each loop.
+- PostgreSQL is required for operations storage. When PostgreSQL is configured, or paper/live execution is enabled, Centaur fails closed instead of silently falling back to SQLite.
+- Slack is notification-only. The heartbeat can send hourly liveness messages and repeat unresolved attention alerts, but Slack is not a command surface.
+- The autonomous research cycle runs on a 60-minute cadence when enabled.
+- The real research path replays stored historical bars, writes evidence decisions, updates internal stages, and keeps broker paper/live safety gates closed unless a manual approval path is completed.
 
-1. Centaur found high-scoring setups.
-2. The setup score was often strong, for example `92`.
-3. The accumulated fitness score drifted just below the suppress threshold.
-4. Fitness acted as a hard veto.
-5. No `$10` entry happened, so the system could not express the micro edge.
-6. When trades did happen, old targets were often too ambitious for `$10` micro trades.
+Useful service commands:
 
-The current paper operating model is:
-
-```text
-high-quality setup -> $10 paper entry -> 1.25% profit capture -> record what bigger targets would have done -> repeat and measure
+```bash
+scripts/centaur-agent.sh status
+scripts/centaur-agent.sh start
+scripts/centaur-agent.sh stop
+scripts/centaur-agent.sh restart
 ```
 
-This is a hypothesis, not proof. The goal now is to collect enough paper outcomes to judge whether the small edge survives across different market sessions.
+## Learning And Promotion Model
 
-## What Would Count As Evidence?
+Centaur distinguishes between autonomous internal stages and manual execution stages.
 
-Useful evidence:
+Autonomous internal stages:
 
-- how often `1.25%` profit capture fires
-- average win size
-- average loss size
-- stop-hit frequency
-- time-to-profit-capture
-- daily realized P/L
-- whether losing days stay small
-- whether `2%`, `3%`, `4%`, or `6%` targets would have hit later in shadow
-- whether crypto and equities behave differently
+- `research_only`
+- `promising_research`
+- `paper_sim_candidate`
+- `paper_sim_active`
+- `paper_candidate`
+- `paper_removal_candidate`
+- `rejected`
 
-Danger signs:
+Manual execution stages:
 
-- many trades hit stops before touching `1.25%`
-- average loss grows larger than several small wins
-- high-score override floods weak trades
-- daily drawdown protector is hit often
-- green open P/L appears but does not convert into filled exits
-- results depend on one unusual market session
+- `paper_approved`
+- `live_approved`
+
+Important rule:
+
+- Centaur may move strategies through internal evidence stages automatically.
+- Centaur must not add or remove broker paper or live execution permissions without manual approval through the Slack attention workflow.
+
+## Proof Commands
+
+```bash
+python main.py --autopilot-proof
+python main.py --real-learning-proof
+python main.py --real-learning-proof --run-fresh
+python main.py --historical-replay-coverage
+python main.py --research-cycle-status
+python main.py --research-proof-vs-real
+python main.py --postgres-preflight
+python main.py --attention-status
+```
+
+- `--autopilot-proof` is the synthetic safety harness. It proves the promotion and execution guardrails, not real learning from stored history.
+- `--real-learning-proof` is the real stored historical replay evidence proof. It verifies that the unattended heartbeat used stored bars, wrote decisions, and kept paper/live auto-approval closed.
+
+## Current Proven State
+
+Latest real proof output:
+
+```text
+real_learning_proven=true
+historical_windows_selected=8
+profiles_with_replay=3
+raw_decisions_count=18
+evidence_decisions_count=18
+promotion_eligible_count=0
+broker_orders_created=0
+live_orders_created=0
+final_safety_summary=PASS
+```
+
+This means the real learning path is working and writing replay-backed evidence, but no strategy is currently promotion-eligible. Centaur is learning, not self-authorizing execution.
 
 ## Current Status
 
-- Runtime: Python control pipeline
-- Scheduler: macOS `launchd`, currently every `30` seconds, with busy-skip locking
+- Runtime: Python heartbeat/control pipeline
+- Scheduler: macOS `launchd` heartbeat service, `10` second interval, sequential busy-skip behavior
+- Research cadence: `60` minutes when `RESEARCH_CYCLE_ENABLED=true`
 - Operations store: PostgreSQL
 - Dashboard: DDEV/OrbStack web dashboard at `https://ghostfrog-centaur.ddev.site`
-- Active broker: Alpaca Paper
-- Live broker: Alpaca Live same-as-paper follower lane approved for activation on 2026-05-29
-- Trade size: `$10` paper notional
+- Paper lanes: Alpaca Paper and eligible Trading 212 Paper equity lane
+- Live lane: separate `LIVE_*`-dial lane that remains manual-gated and must not be inferred as active from documentation alone
+- Trade size: `$10` paper notional by default
 - Base paper slots: `10`
-- Earned slots: each full `$10` of tracked paper P/L earns one extra `$10` slot
 - Allowed paper strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`
-- Research/watch-only crypto strategy: `crypto_pullback.downside_reversal_watch` can emit paper-research shadow proposals and diagnostics, but it is not a live execution strategy and uses non-executable `pullback_watch` direction labeling.
-- Replay/reporting-only continuation interpretation: `crypto_pullback.downside_continuation_watch` summarizes the inverse short-side continuation outcome for moderate downside pullbacks from `-0.15%` to `-1.00%`. It remains research-only and does not submit paper or live orders.
-- Replay/reporting-only extreme reversal segmentation: `crypto_pullback.extreme_drop_reversal_watch` summarizes reversal behavior for pullbacks worse than `-1.00%`. It is research-only and does not submit paper or live orders.
-- Replay summaries include a regime comparison section for these two crypto pullback views with minimum-sample warnings, best/worst symbols, and checkpoint recommendations. This remains report-only.
+- Research/watch-only crypto strategy: `crypto_pullback.downside_reversal_watch` can emit research diagnostics and replay evidence, but it is not execution-approved
+- Replay/reporting-only continuation interpretation: `crypto_pullback.downside_continuation_watch` remains research-only
+- Replay/reporting-only extreme reversal segmentation: `crypto_pullback.extreme_drop_reversal_watch` remains research-only
 - Paper exit capture: `1.25%`
 - Shadow target ladder: `1.25%`, `2%`, `3%`, `4%`, `6%`
-- Live-money trading: approved only inside the recorded `$10 x 10` Alpaca Live envelope
 
 API keys alone must not activate live trading.
 
@@ -97,10 +131,15 @@ Read these before changing behavior:
 
 Important current constraints:
 
-- No live-money order submission outside the recorded 2026-05-29 go-live override.
-- No paper trade above `$10` notional without explicit approval.
+- No live auto-approval.
+- No broker paper auto-approval.
+- No auto removal from paper or live without Gary.
 - No silent broker switch.
 - No silent risk widening.
+- No threshold changes without review.
+- No secrets in logs or in this README.
+- SQLite fallback is refused for live/paper operations when PostgreSQL is required.
+- No paper trade above `$10` notional without explicit approval.
 - No new paper entry after the daily drawdown protector has triggered.
 - Equities require market hours when configured.
 - Crypto can trade outside equity market hours when crypto scanning is ready.
@@ -120,11 +159,11 @@ Each control tick is an explicit sequence:
 7. Recompute strategy fitness.
 8. Discover current market candidates.
 9. Generate deterministic strategy signals.
-10. Apply fitness allocation and high-score near-miss override.
+10. Apply fitness allocation and promotion-safe evidence rules.
 11. Create shadow proposals.
 12. Apply paper CFO/risk approval.
 13. Submit Alpaca Paper orders.
-14. Let Alpaca Live follow only submitted same-tick paper trades if every live gate passes.
+14. Evaluate the live lane only if it has been intentionally enabled and manually approved; otherwise keep live mutation blocked.
 15. Persist diagnostics for status and review.
 
 Paper and live can see the same signal, but each lane must pass its own checks.
@@ -222,7 +261,7 @@ These live in `.env`. Use `.env.example` as the template.
 ### Control
 
 `CONTROL_TICK_INTERVAL_SECONDS`
-: Target scheduler interval. Currently `30`.
+: Target heartbeat interval. The supervised `launchd` service currently runs at `10` seconds.
 
 `CONTROL_MAX_TICK_RUNTIME_SECONDS`
 : Expected maximum tick runtime before it should be treated as too slow.
@@ -494,7 +533,7 @@ Live crypto momentum values default to the paper values. When live is armed, any
 : Optional replay cap. `0` means no timestamp cap.
 
 `RESEARCH_CYCLE_ENABLED`
-: Docs-only scheduler gate for unattended research cycles. Defaults to `false` and does not auto-activate anything by itself.
+: Gate for unattended heartbeat research cycles. When `true`, the supervised heartbeat may run the replay-only research cycle on its normal 60-minute cadence without approving broker paper or live execution.
 
 `RESEARCH_REPLAY_TIMEFRAME` / `RESEARCH_REPLAY_DAYS`
 : Replay settings for `main.py --research-cycle`.
@@ -645,10 +684,10 @@ micro envelope.
 : Alpaca Live API base URL.
 
 `LIVE_EXECUTION_ENABLED`
-: Main live execution enable flag. Must remain false unless a go-live override is completed.
+: Main live execution enable flag. Treat live as `safe_off` unless the explicit activation path has been completed and current runtime status confirms otherwise.
 
 `LIVE_EXECUTION_KILL_SWITCH`
-: Live kill switch. Must remain on until explicit go-live.
+: Live kill switch. Keep it on unless live has been intentionally armed.
 
 `LIVE_EXECUTION_REQUIRE_MARKET_OPEN`
 : Market-hours requirement for live equities.
@@ -698,28 +737,16 @@ Live trading requires all of these to be intentionally handled:
 - live strategy allowlist configured
 - go-live checklist updated
 
-API keys plus `LIVE_EXECUTION_ENABLED=true` are not enough. Live entries only
-follow paper trades that were approved and actually submitted on the same tick;
-guarded cancellation and managed sell exits exist so a deliberately activated
-live lane can protect positions like paper. New live follower entries are also
-blocked while any existing Alpaca Live position lacks a persisted managed-exit
-entry plan.
+API keys plus `LIVE_EXECUTION_ENABLED=true` are not enough. Live execution
+must remain a manually gated lane with its own `LIVE_*` dials, approvals,
+checklists, and safety guards.
 
 Do not infer live readiness from paper success.
 
-Current funded readiness state: Alpaca Live keys and read-only funded checks
-passed with an active, unblocked account, `132.05` cash/equity/buying power,
-and no positions or recent/open orders. That balance does not widen the `$10 x
-10` live envelope. First-live strategy policy, limits, and rollback rules are
-now recorded: by operator request, live starts as a same-as-paper follower lane
-using the current paper strategy allowlist, equities plus crypto, `$10` entries,
-`10` base slots, one order per tick, the `$2.00` live daily protector, shared
-paper/shadow fitness, and read-only live execution intelligence. The extra
-`32.05` above the `$100` operating envelope is buffer only. On 2026-05-29 at
-about 10:48 BST, the operator explicitly approved turning Alpaca Live on within
-that recorded envelope. That approval does not widen notional, slots, strategy
-allowlist, asset classes, projected-gain floors, limit buffers, or daily loss
-limits.
+Documentation must not claim live is active merely because historical approvals
+or credentials exist. Use `main.py --status`, `main.py --attention-status`, and
+the current runtime environment to determine whether live is `safe_off`,
+`blocked`, or deliberately armed.
 
 ## Key Commands
 
@@ -799,9 +826,10 @@ Optional disabled-by-default scheduler examples for research-only automation:
 15 2 * * * cd /Volumes/Bob/www/ghostfrog-centaur && .venv-mac/bin/python main.py --research-cycle
 ```
 
-Only enable an external scheduler after explicitly setting `RESEARCH_CYCLE_ENABLED=true`
-in your environment and keeping the cycle on the research-only command path. This
-does not place orders and does not change paper/live allocation on its own.
+Only enable an external scheduler after explicitly setting
+`RESEARCH_CYCLE_ENABLED=true` in your environment and keeping the cycle on the
+research-only command path. In the normal runtime, the `launchd` heartbeat is
+already the primary scheduler, and the research cycle stays replay-only.
 
 Start DDEV:
 
