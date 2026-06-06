@@ -75,6 +75,10 @@ Danger signs:
 - Base paper slots: `10`
 - Earned slots: each full `$10` of tracked paper P/L earns one extra `$10` slot
 - Allowed paper strategies: `mean_reversion.snapback`, `crypto_momentum.trend`, `momentum.volatility_breakout`
+- Research/watch-only crypto strategy: `crypto_pullback.downside_reversal_watch` can emit paper-research shadow proposals and diagnostics, but it is not a live execution strategy and uses non-executable `pullback_watch` direction labeling.
+- Replay/reporting-only continuation interpretation: `crypto_pullback.downside_continuation_watch` summarizes the inverse short-side continuation outcome for moderate downside pullbacks from `-0.15%` to `-1.00%`. It remains research-only and does not submit paper or live orders.
+- Replay/reporting-only extreme reversal segmentation: `crypto_pullback.extreme_drop_reversal_watch` summarizes reversal behavior for pullbacks worse than `-1.00%`. It is research-only and does not submit paper or live orders.
+- Replay summaries include a regime comparison section for these two crypto pullback views with minimum-sample warnings, best/worst symbols, and checkpoint recommendations. This remains report-only.
 - Paper exit capture: `1.25%`
 - Shadow target ladder: `1.25%`, `2%`, `3%`, `4%`, `6%`
 - Live-money trading: approved only inside the recorded `$10 x 10` Alpaca Live envelope
@@ -147,31 +151,20 @@ Centaur does not buy `$10` of anything that moved up. A paper trade must pass:
 
 Only after those pass does the system size the order at `$10`.
 
-### Score-to-trade override
+### Fitness-only paper/live admission
 
-This was added after the 2026-05-28 diagnosis.
+Shadow learning still records raw scores and broad proposal evidence, but the
+money-facing paper/live lanes now use fitness-only admission on the fast
+execution path.
 
-If an already allowed strategy has a raw `signal_score` at or above the active score-to-trade dial, it can survive suppression. Paper uses `PAPER_MIN_SIGNAL_SCORE_TO_TRADE`; live/live-dry uses `LIVE_MIN_SIGNAL_SCORE_TO_TRADE`. The current same-as-paper dial is `90.0`.
+Raw `signal_score` remains useful for:
 
-Current settings:
+- ranking candidates
+- research and reporting
+- shadow evidence analysis
 
-```text
-PAPER_MIN_SIGNAL_SCORE_TO_TRADE=90.0
-LIVE_MIN_SIGNAL_SCORE_TO_TRADE=90.0
-PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN=0.25
-```
-
-This means a signal like:
-
-```text
-score=92
-fitness=-6.889
-threshold=-6.800
-```
-
-can be allowed through because it is only `0.089` under the line.
-
-This does **not** allow disallowed strategies to trade, and it does **not** override stops, projected-gain checks, broker routing, notional, max orders, or live execution.
+It no longer has authority to bypass fitness suppression into paper or live
+execution unless a future reviewed policy explicitly re-enables that behavior.
 
 ### Exit
 
@@ -189,7 +182,7 @@ Paper managed exits can sell when:
 - a managed policy says the hold/backstop has elapsed
 - an equity position reaches the final same-day flatten window
 
-For equities, Centaur is no-overnight-carry: new entries are blocked in the final 60 minutes of the equity session, and equity positions are flattened in the final 15 minutes regardless of red/green. Positions missing a managed entry plan use an audited unmanaged flatten instead of being allowed to drift overnight.
+For equities, Centaur is no-overnight-carry: new entries are blocked in the final 15 minutes of the equity session, and equity positions are flattened in the final 5 minutes regardless of red/green. Positions missing a managed entry plan use an audited unmanaged flatten instead of being allowed to drift overnight.
 
 For `crypto_momentum.trend`, the current managed policy is `profit_capture_else_1d`: the `1.25%` capture, stop, and larger target stay active, but if none of them hit the position exits at the hard `1d` backstop.
 
@@ -362,6 +355,9 @@ Live crypto momentum values default to the paper values. When live is armed, any
 `STRATEGY_FITNESS_MIN_CHECKPOINTS`
 : Minimum checkpoint count for fitness summary confidence.
 
+`INCLUDE_BACKTEST_EVIDENCE_IN_PAPER_FITNESS`, `INCLUDE_BACKTEST_EVIDENCE_IN_LIVE_FITNESS`
+: Replay/backtest evidence inclusion switches for allocation fitness. Both default to `false` so `backtest:simulator` evidence does not influence paper/live allocation unless explicitly enabled.
+
 `STRATEGY_ALLOCATION_MIN_CHECKPOINTS`
 : Minimum checkpoints before a fitness row can suppress/favor signals.
 
@@ -422,7 +418,7 @@ Live crypto momentum values default to the paper values. When live is armed, any
 : Per-trade size. Currently `$10.00`.
 
 `PAPER_EXECUTION_MAX_DAILY_DRAWDOWN_USD`
-: Daily equity drawdown protector. Currently `$2.00`.
+: Daily equity drawdown protector. Currently `$10.00` for paper.
 
 `PAPER_EXECUTION_STALE_ORDER_MINUTES`
 : Unfilled equity entry limits older than this are canceled.
@@ -443,13 +439,13 @@ Live crypto momentum values default to the paper values. When live is armed, any
 : Crypto marketable-limit buffer. Currently `25.0` bps.
 
 `PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_ENABLED`
-: Enables the paper-only near-miss override for very strong setup scores.
+: Legacy knob retained for compatibility. The fast paper/live execution path now uses fitness-only admission, so this no longer grants score-based trade authority.
 
 `PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_MIN_SCORE`
-: Minimum raw signal score for the override. Currently `90.0`.
+: Legacy reporting/config knob for historical score-to-trade analysis.
 
 `PAPER_EXECUTION_HIGH_SCORE_OVERRIDE_FITNESS_MARGIN`
-: How far below the active fitness threshold a high-score signal may be and still survive. Currently `0.25`.
+: Legacy reporting/config knob for historical score-to-trade analysis.
 
 `PAPER_EXECUTION_ALLOWED_STRATEGIES`
 : Strategy allowlist for paper orders.
@@ -497,6 +493,24 @@ Live crypto momentum values default to the paper values. When live is armed, any
 `HISTORICAL_REPLAY_MAX_TIMESTAMPS`
 : Optional replay cap. `0` means no timestamp cap.
 
+`RESEARCH_CYCLE_ENABLED`
+: Docs-only scheduler gate for unattended research cycles. Defaults to `false` and does not auto-activate anything by itself.
+
+`RESEARCH_REPLAY_TIMEFRAME` / `RESEARCH_REPLAY_DAYS`
+: Replay settings for `main.py --research-cycle`.
+
+`RESEARCH_MAX_REPLAY_TIMESTAMPS`
+: Per-window replay cap used by the research cycle.
+
+`RESEARCH_MIN_WINDOWS` / `RESEARCH_MIN_PROPOSALS`
+: Minimum bounded replay coverage before a strategy can move beyond `research_only`.
+
+`RESEARCH_MIN_NET_RETURN_PCT` / `RESEARCH_MIN_NET_WIN_RATE`
+: Recommendation thresholds for research-only promotion advice. They do not alter paper/live thresholds.
+
+`RESEARCH_ALLOWED_STRATEGIES`
+: Research-only strategy ids evaluated by the autonomous cycle. These remain non-executable until a separate manual promotion step approves them.
+
 ### FX and Optional Providers
 
 `ECB_REFERENCE_RATES_URL`
@@ -525,6 +539,9 @@ Live crypto momentum values default to the paper values. When live is armed, any
 
 `SLACK_HOURLY_STATUS_ENABLED` / `SLACK_HOURLY_STATUS_INTERVAL_MINUTES`
 : Sends a one-way hourly Slack liveness/status message from the normal control tick. If the message stops arriving, treat the scheduler/control loop as stale until proven healthy.
+
+`SLACK_ATTENTION_REPEAT_ENABLED` / `SLACK_ATTENTION_REPEAT_MINUTES` / `SLACK_ATTENTION_MAX_REPEATS`
+: Repeats unresolved attention-required Slack alerts from the heartbeat until acknowledged, resolved, rejected, expired, or manually approved/rejected where applicable. `SLACK_ATTENTION_MAX_REPEATS=0` means repeat forever.
 
 `TEST_MONITOR_ENABLED`
 : Enables the scheduled unit-test monitor. The monitor runs the test command, checks scheduler freshness, persists only a small JSON status file, and never mutates trading state.
@@ -759,6 +776,32 @@ Run historical replay:
 ```bash
 .venv-mac/bin/python main.py --replay
 ```
+
+Run one autonomous research cycle:
+
+```bash
+.venv-mac/bin/python main.py --research-cycle
+```
+
+Show the latest research-cycle decision report:
+
+```bash
+.venv-mac/bin/python main.py --research-status
+```
+
+Optional disabled-by-default scheduler examples for research-only automation:
+
+```cron
+# hourly
+0 * * * * cd /Volumes/Bob/www/ghostfrog-centaur && .venv-mac/bin/python main.py --research-cycle
+
+# daily
+15 2 * * * cd /Volumes/Bob/www/ghostfrog-centaur && .venv-mac/bin/python main.py --research-cycle
+```
+
+Only enable an external scheduler after explicitly setting `RESEARCH_CYCLE_ENABLED=true`
+in your environment and keeping the cycle on the research-only command path. This
+does not place orders and does not change paper/live allocation on its own.
 
 Start DDEV:
 

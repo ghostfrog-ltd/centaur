@@ -6,8 +6,8 @@ wakes up and how the system decides whether to act.
 ## Short Version
 
 ```text
-cron/launchd tick
-  -> run main.py
+launchd heartbeat service
+  -> run main.py --heartbeat-service --interval-seconds 10
   -> build one TickContext
   -> run pipeline steps in order
   -> maybe manage exits
@@ -53,10 +53,9 @@ flowchart TD
   proposals --> cfo{"CFO risk gate"}
   cfo -->|rejects| hold["Hold"]
   cfo -->|approves| paper["Paper order"]
-  paper --> live{"Current live follower gate"}
+  proposals --> live{"Live lane<br/>LIVE_* dials"}
   live -->|blocked| hold
-  live -->|approved current follower| liveOrder["Live order"]
-  proposals -.-> liveTarget["Target live lane<br/>LIVE_* .env dials"]
+  live -->|approved by live CFO + guard| liveOrder["Live order"]
 ```
 
 ## Where The Tick Starts
@@ -65,24 +64,37 @@ The scheduled wrapper is:
 
 - `scripts/run_control_tick.sh`
 
-It uses a lock so overlapping ticks skip instead of running two control loops at
-once.
+The installed production launch agent uses `scripts/install_launch_agent.sh` to
+write `$HOME/.centaur/run_control_tick.sh`, then `launchd` runs that wrapper as a
+`KeepAlive` service. The wrapper starts:
+
+```text
+main.py --heartbeat-service --interval-seconds 10
+```
+
+The service process runs ticks sequentially. If one tick takes longer than the
+interval, the next tick starts immediately after it finishes; ticks do not
+overlap. The wrapper uses a process lock and stale-lock check so a second service
+does not start beside the first.
 
 The Python entry point is:
 
 - `main.py`
 
-With no report/backfill/dashboard flag, `main.py` loads config, creates a
+With no report/backfill/dashboard flag, `main.py` still runs a one-shot control
+tick. In production heartbeat service mode, `main.py` loads config, creates a
 `ControlPipelineRunner`, and calls:
 
 ```text
-runner.run_tick()
+runner.run_heartbeat_service_loop(interval_seconds=10)
 ```
 
 The runner is:
 
 - `app/framework/runtime/control.py`
 
+The service loop reloads `.env`/runtime config and storage handles before each
+tick so operator dials remain live without restarting the service.
 `ControlPipelineRunner.run_tick()` creates a `TickContext`, gives the tick a
 timestamp id, and runs the heartbeat LangGraph. If a graph node errors, the tick
 routes to `END`, stops before later gates, and records the error.
@@ -112,6 +124,7 @@ execution.live_exits
 shadow.outcomes
 strategy.fitness
 market.scan
+slow.enrichment_queue
 context.enrichment
 strategy.signals
 analysis.gemini
@@ -192,16 +205,17 @@ flowchart TD
   S --> T["shadow.outcomes"]
   T --> U["strategy.fitness"]
   U --> V["market.scan"]
-  V --> W["context.enrichment"]
-  W --> X["strategy.signals"]
-  X --> Y["analysis.gemini"]
-  Y --> Z["shadow.proposals"]
-  Z --> AA["risk.cfo"]
-  AA --> AB["execution.paper"]
-  AB --> AC["risk.live_cfo"]
-  AC --> AD["execution.live"]
-  AD --> AE["evaluation.post_trade"]
-  AE --> AF["notifications.slack"]
+  V --> W["slow.enrichment_queue"]
+  W --> X["context.enrichment"]
+  X --> Y["strategy.signals"]
+  Y --> Z["analysis.gemini"]
+  Z --> AA["shadow.proposals"]
+  AA --> AB["risk.cfo"]
+  AB --> AC["execution.paper"]
+  AC --> AD["risk.live_cfo"]
+  AD --> AE["execution.live"]
+  AE --> AF["evaluation.post_trade"]
+  AF --> AG["notifications.slack"]
 ```
 
 This graph is visual documentation of the current ordered pipeline. It is not
@@ -490,6 +504,61 @@ selected = true
 
 The rest can still be recorded as ranked evidence, but selected candidates are
 the main shortlist for later enrichment and strategy evaluation.
+
+Current runtime:
+
+```text
+market.scan selects 6
+slow.enrichment_queue enqueues non-selected ranked candidates for advisory processing
+context.enrichment enriches only the selected candidates
+strategy.signals evaluates only the selected enriched candidates
+strategy.signals uses cached threshold state, not heavy GA advice
+strategy.signals starts the threshold-advisor worker if it is not already running
+```
+
+So today `selected = true` is the hard boundary for fast same-tick enrichment
+and strategy evaluation. Non-selected candidates no longer reach same-tick
+proposal generation through the fast path.
+
+The fast strategy step also keeps GA/adaptive-threshold advice out of the hot
+path. It uses the last persisted adaptive threshold when available, or the
+configured suppress threshold when not. After signal diagnostics are recorded,
+the step starts a skip-if-running threshold-advisor worker. That worker runs the
+heavy adaptive/GA review outside the trading tick and can refresh the persisted
+threshold state for future ticks. Its output is evidence/config state only:
+`trade_authority = none`.
+
+The slow-queue implementation remains advisory and non-invasive:
+it writes non-selected ranked candidates to operations-store table
+`slow_enrichment_jobs`, starts a worker only when one is not already running,
+and records processed technical-context evidence to `slow_enrichment_results`
+with `trade_authority = none`. It does not place trades.
+
+## Active Fast / Slow Candidate Split
+
+The speed architecture is:
+
+```text
+fast trading path, every control tick:
+  rank all candidates from fresh latest bars
+  select top DISCOVERY_TARGET_COUNT
+  enrich only those selected candidates
+  run strategies on those selected candidates
+  build same-tick proposals
+  send fresh proposals to paper/live gates
+
+slow research path:
+  put the non-selected ranked candidates into a slow enrichment queue
+  process them opportunistically for evidence, reports, and future selector review
+  expire stale work instead of catching up forever
+  never place orders directly from slow queue output
+```
+
+The control tick may start the slow queue worker only when it is not already
+running. If the worker is already running, the tick skips starting another copy.
+Slow queue results can improve reporting and later strategy/selector review, but
+any candidate that might trade still needs a fresh fast-path enrichment, strategy
+signal, proposal, and paper/live risk gate.
 
 The scan step is:
 
@@ -899,16 +968,13 @@ adapter and records the broker response.
 
 ## Live Lane
 
-Current runtime: live is downstream of paper.
-
 The live CFO gate is:
 
 - `app/framework/engine/pipelines.py`
 - function: `live_risk_cfo_gate`
 
-Today, live only considers trades that paper both approved and actually
-submitted. This is the 2026-05-29 first-live safety envelope, not the intended
-end-state.
+Live considers shared proposals directly. It does not require paper to approve
+or submit the same order first.
 
 It then applies live-specific safety gates:
 
@@ -920,14 +986,12 @@ live credentials configured
 activation acknowledgement present
 live daily protection active
 live account trade-ready
-allowed strategy
+allowed live strategy
 available live slots
-same-paper-follow validation
 PDT guard for live equities
 ```
 
-Target runtime direction as of 2026-06-04: live should be its own lane, not a
-blind paper copy. The intended shape is:
+The active shape as of 2026-06-04 is:
 
 ```text
 shared market evidence
@@ -936,14 +1000,11 @@ paper proposal lane -> PAPER_* .env dials -> paper CFO/risk -> paper execution
 live proposal lane  -> LIVE_* .env dials  -> live CFO/risk  -> LiveRiskGuard -> live execution
 ```
 
-In that target design, paper and live may independently trade, skip, reduce, or
+In this design, paper and live may independently trade, skip, reduce, or
 block based on their lane dials and account/broker state. Live independence does
 not mean widening risk or inventing live-only behaviour in code. It means the
 live lane follows the configured `LIVE_*` `.env` values exactly and reports the
 specific dial/gate that authorized or blocked each action.
-
-Until that migration is implemented, tested, reported, and explicitly activated,
-the current same-tick paper follower rule remains the live-money safety boundary.
 
 ## A Tick That Does Nothing Is Often Correct
 
