@@ -139,6 +139,42 @@ function commandGroups(): array
                     'what' => 'Explains where execution-allowed strategies are getting filtered out, including candidate counts, raw signals, stage rejections, and closest misses.',
                 ],
                 [
+                    'command' => 'Proposal suppression funnel',
+                    'example' => '.venv-mac/bin/python main.py --proposal-suppression-funnel',
+                    'tone' => 'read',
+                    'what' => 'Shows the latest real heartbeat and latest real research cycle suppression funnel, including raw signals, raw proposals, per-gate rejection counts, exact per-candidate blockers, threshold-vs-actual values, top 5 closest survivors, the biggest bottleneck, and a final verdict.',
+                ],
+                [
+                    'command' => 'Evidence quality report',
+                    'example' => '.venv-mac/bin/python main.py --evidence-quality-report',
+                    'tone' => 'read',
+                    'what' => 'Explains why the latest real research cycle produced no replay-qualified paper candidates, including per-group replay windows, sample size, returns, win rate, symbol coverage, outcome-row gaps, closest-to-paper ranking, and one actionable next fix.',
+                ],
+                [
+                    'command' => 'Outcome recording status',
+                    'example' => '.venv-mac/bin/python main.py --outcome-recording-status',
+                    'tone' => 'read',
+                    'what' => 'Shows where shadow/replay outcomes are recorded, whether the live heartbeat outcome recorder is running, how many replay proposals and matured checkpoints exist over the last 24 hours, and which strategy/profile/timeframe/symbol groups still have missing matured outcomes.',
+                ],
+                [
+                    'command' => 'Historical coverage report',
+                    'example' => '.venv-mac/bin/python main.py --historical-coverage-report',
+                    'tone' => 'read',
+                    'what' => 'Shows read-only equity historical-bar coverage from market_data_historical_bars for replay-critical timeframes 15Min, 1Hour, and 1Day, plus existing 1Min coverage, with per-symbol row counts, earliest/latest timestamps, source and venue, and a summary verdict for the current historical data gap.',
+                ],
+                [
+                    'command' => 'Alpaca equity historical backfill',
+                    'example' => '.venv-mac/bin/python main.py --backfill-alpaca-equity-bars --years 6 --timeframes 15Min,1Hour,1Day --symbols-from-strategies',
+                    'tone' => 'maint',
+                    'what' => 'Runs a dedicated write-mode Alpaca stock-bar backfill for the current equity strategy universe across multiple replay timeframes. It batches symbols, resumes from the latest stored timestamp per symbol/timeframe where possible, writes through the existing historical upsert path, logs progress, and does not trade or mutate promotion/live state.',
+                ],
+                [
+                    'command' => 'Alpaca equity gap refill from start',
+                    'example' => '.venv-mac/bin/python main.py --backfill-alpaca-equity-bars --years 1 --timeframes 15Min --symbols-from-strategies --backfill-from-start',
+                    'tone' => 'maint',
+                    'what' => 'Safely refills older missing history within the selected lookback window even when newer rows already exist. This is useful for shallow recent-only coverage like 15Min bars; duplicates remain safe through the existing historical upsert path.',
+                ],
+                [
                     'command' => 'Slow queue process',
                     'example' => '.venv-mac/bin/python main.py --slow-enrichment-queue-process',
                     'tone' => 'maint',
@@ -229,10 +265,196 @@ function commandGroups(): array
                     'what' => 'Shows the latest persisted research-cycle decisions, replay windows, timeframes used/skipped, recommendations, blockers, and current approval state.',
                 ],
                 [
+                    'command' => 'Portfolio research planner',
+                    'example' => '.venv-mac/bin/python main.py --strategy-portfolio-research-planner',
+                    'tone' => 'read',
+                    'what' => 'Ranks strategy families and profiles by conservative research priority from persisted evidence, shows the next research-only experiment to run, and keeps paper/live approval unchanged.',
+                ],
+                [
+                    'command' => 'Portfolio research planner JSON',
+                    'example' => '.venv-mac/bin/python main.py --strategy-portfolio-research-planner --json',
+                    'tone' => 'read',
+                    'what' => 'Returns the same portfolio-level research priority report as structured JSON for dashboards, scripts, or machine-readable review without changing approvals or thresholds.',
+                ],
+                [
+                    'command' => 'Paper candidate decision report',
+                    'example' => '.venv-mac/bin/python main.py --paper-candidate-decision-report',
+                    'tone' => 'read',
+                    'what' => 'Shows the read-only gate Centaur uses to decide whether any strategy is currently allowed to paper trade, including the current known best candidate, current paper candidate, block reason, failed audit reason, next required action, concrete replay follow-up, unblock condition, and permanent stop condition.',
+                ],
+                [
+                    'command' => 'Paper candidate decision report JSON',
+                    'example' => '.venv-mac/bin/python main.py --paper-candidate-decision-report --json',
+                    'tone' => 'read',
+                    'what' => 'Returns the same paper-candidate decision layer as structured JSON for dashboards, scripts, or other read-only automation without approving paper or enabling live execution.',
+                ],
+                [
+                    'command' => 'Paper candidate audit',
+                    'example' => '.venv-mac/bin/python main.py --paper-candidate-audit --base-strategy mean_reversion.snapback --profile-id snapback --timeframe 1Hour',
+                    'tone' => 'read',
+                    'what' => 'Runs the replay-only paper-candidate audit for one strategy/profile/timeframe, including candidate-vs-baseline comparison, fragility flags, and the final audit verdict, while keeping paper and live approvals unchanged.',
+                ],
+                [
+                    'command' => 'Strategy research planner',
+                    'example' => '.venv-mac/bin/python main.py --strategy-research-planner --base-strategy mean_reversion.snapback --profile-id snapback --timeframe 1Hour',
+                    'tone' => 'read',
+                    'what' => 'Shows the read-only next-step planner for one strategy/profile/timeframe, including the next research-only experiment, why it was chosen, and the proposed safe follow-up command.',
+                ],
+                [
+                    'command' => 'Diagnose next best strategy',
+                    'example' => '.venv-mac/bin/python main.py --diagnose-next-best-strategy --base-strategy mean_reversion.snapback --profile-id snapback --timeframe 1Hour',
+                    'tone' => 'maint',
+                    'what' => 'Runs the planner-selected bounded replay diagnostics for the current next-best strategy/profile/timeframe and prints before-vs-after research evidence without approving paper or live.',
+                ],
+                [
+                    'command' => 'Research autopilot',
+                    'example' => '.venv-mac/bin/python main.py --research-autopilot --max-steps 10',
+                    'tone' => 'maint',
+                    'what' => 'Runs the bounded research-only autopilot. It executes only allowlisted next research commands, replans after parked candidates, continues to other safe candidates when available, and stops before any paper or live action.',
+                ],
+                [
+                    'command' => 'Strategy variant research report',
+                    'example' => '.venv-mac/bin/python main.py --strategy-variant-research-report --base-strategy mean_reversion.snapback --profile-id snapback --timeframe 1Hour',
+                    'tone' => 'read',
+                    'what' => 'Shows the persisted read-only strategy-variant research report for one strategy/profile/timeframe, including evaluated variants and their replay evidence.',
+                ],
+                [
+                    'command' => 'Run strategy variant research',
+                    'example' => '.venv-mac/bin/python main.py --run-strategy-variant-research --base-strategy crypto_research.range_breakout --profile-id range_breakout_wide_signal --timeframe 15Min',
+                    'tone' => 'maint',
+                    'what' => 'Runs bounded research-only variant generation and evaluation for a supported strategy family, persists replay evidence, and keeps paper/live approval unchanged.',
+                ],
+                [
+                    'command' => 'Strategy loss diagnosis',
+                    'example' => '.venv-mac/bin/python main.py --strategy-loss-diagnosis --base-strategy mean_reversion.snapback --profile-id snapback --timeframe 1Hour',
+                    'tone' => 'read',
+                    'what' => 'Explains why a baseline replay result is underperforming, including profitability, exits, and loss-shape diagnostics, without changing thresholds, approvals, or execution.',
+                ],
+                [
+                    'command' => 'Signal generation diagnosis',
+                    'example' => '.venv-mac/bin/python main.py --signal-generation-diagnosis --base-strategy crypto_momentum.trend --profile-id trend --timeframe 15Min',
+                    'tone' => 'read',
+                    'what' => 'Diagnoses research-only signal-generation blockers and proposes the next safe bounded follow-up command without changing paper/live state.',
+                ],
+                [
+                    'command' => 'Symbol subset stability report',
+                    'example' => '.venv-mac/bin/python main.py --symbol-subset-stability-report --base-strategy mean_reversion.snapback --profile-id snapback --timeframe 1Hour --variant-id holding-window-240 --symbol WDC --wider-period',
+                    'tone' => 'read',
+                    'what' => 'Checks whether a promising symbol-level edge still holds across a wider replay period, so concentrated or unstable candidates can stay research-only instead of being treated as paper-ready.',
+                ],
+                [
+                    'command' => 'Collect symbol replay evidence',
+                    'example' => '.venv-mac/bin/python main.py --collect-symbol-replay-evidence --base-strategy mean_reversion.snapback --variant-id mean_reversion.snapback:snapback:15Min:7c4fb8c038f3 --symbol WDC',
+                    'tone' => 'read',
+                    'what' => 'Checks current stored-bar and replay evidence coverage for one symbol under one research variant, explains whether more evidence can be collected from existing bars, and proposes the next research-only action without approving paper or live.',
+                ],
+                [
+                    'command' => 'Collect symbol replay evidence and execute safe follow-up',
+                    'example' => '.venv-mac/bin/python main.py --collect-symbol-replay-evidence --base-strategy mean_reversion.snapback --variant-id mean_reversion.snapback:snapback:15Min:7c4fb8c038f3 --symbol WDC --execute',
+                    'tone' => 'read',
+                    'what' => 'Runs the same research-only evidence plan and, when additional replay-only work is safely available from existing bars, executes that follow-up without creating paper or live trades.',
+                ],
+                [
+                    'command' => 'Research expansion planner',
+                    'example' => '.venv-mac/bin/python main.py --research-expansion-planner',
+                    'tone' => 'read',
+                    'what' => 'Shows the next bounded research-only expansion step when the current strategy set is exhausted or blocked, including the next generated family candidate and safe follow-up command.',
+                ],
+                [
+                    'command' => 'Generate new strategy family research only',
+                    'example' => '.venv-mac/bin/python main.py --generate-new-strategy-family-research-only',
+                    'tone' => 'maint',
+                    'what' => 'Alias for the research expansion planner that persists one bounded research-only generated strategy-family candidate without enabling paper or live.',
+                ],
+                [
+                    'command' => 'Generated candidate state report',
+                    'example' => '.venv-mac/bin/python main.py --generated-candidate-state-report',
+                    'tone' => 'read',
+                    'what' => 'Shows a read-only trace of persisted generated research candidates and whether the portfolio planner currently treats each one as actionable or excluded.',
+                ],
+                [
+                    'command' => 'Optimise or precompute replay dataset',
+                    'example' => '.venv-mac/bin/python main.py --optimise-or-precompute-replay-dataset --base-strategy crypto_research.dip_rebound --profile-id dip_rebound --timeframe 15Min',
+                    'tone' => 'maint',
+                    'what' => 'Prepares bounded research-only replay dataset coverage and runtime-blocker summaries for one strategy/profile/timeframe without changing paper/live state.',
+                ],
+                [
+                    'command' => 'Prepare replay dataset',
+                    'example' => '.venv-mac/bin/python main.py --prepare-replay-dataset --base-strategy crypto_research.dip_rebound --profile-id dip_rebound --timeframe 15Min',
+                    'tone' => 'maint',
+                    'what' => 'Alias for optimise-or-precompute replay dataset so operators can run the same bounded research-only dataset preparation with a shorter command name.',
+                ],
+                [
+                    'command' => 'Precompute dip rebound 15Min outcomes',
+                    'example' => '.venv-mac/bin/python main.py --precompute-bounded-dip-rebound-15min-outcomes',
+                    'tone' => 'maint',
+                    'what' => 'Precomputes bounded research-only replay outcomes for crypto_research.dip_rebound/dip_rebound/15Min and persists the results for later planner and diagnosis steps.',
+                ],
+                [
                     'command' => 'Real heartbeat research-cycle status',
                     'example' => '.venv-mac/bin/python main.py --research-cycle-status',
                     'tone' => 'read',
                     'what' => 'Shows the latest persisted real-heartbeat research cycle when one exists, or explains why none has been recorded yet with diagnostics such as whether autonomous learning was called, whether research was enabled, whether the cycle started/completed, the source tag, decision counts, candidate counts, alert counts, and any persistence failure.',
+                ],
+                [
+                    'command' => 'Forced vs scheduled research-cycle comparison',
+                    'example' => '.venv-mac/bin/python main.py --research-cycle-last-comparison',
+                    'tone' => 'read',
+                    'what' => 'Compares the last forced real research cycle with the last natural scheduled real cycle so operators can see whether one-shot diagnostics are matching the unattended heartbeat path.',
+                ],
+                [
+                    'command' => 'Forced vs launchd research-cycle comparison',
+                    'example' => '.venv-mac/bin/python main.py --research-cycle-last-launchd-comparison',
+                    'tone' => 'read',
+                    'what' => 'Compares the last forced real research cycle with the last actual launchd-scheduled cycle, which is useful when checking whether launchd and manual one-shot behavior are still aligned.',
+                ],
+                [
+                    'command' => 'Real learning proof',
+                    'example' => '.venv-mac/bin/python main.py --real-learning-proof',
+                    'tone' => 'read',
+                    'what' => 'Verifies that persisted real-heartbeat research used stored historical replay evidence while broker paper and live safety gates stayed closed.',
+                ],
+                [
+                    'command' => 'Real learning proof with fresh forced cycle',
+                    'example' => '.venv-mac/bin/python main.py --real-learning-proof --run-fresh',
+                    'tone' => 'maint',
+                    'what' => 'Runs one fresh forced real-heartbeat autonomous-learning cycle first, then prints the real learning proof report. This still stays in replay-only learning lanes and does not create broker paper or live trades.',
+                ],
+                [
+                    'command' => 'Self-improvement status',
+                    'example' => '.venv-mac/bin/python main.py --self-improvement-status',
+                    'tone' => 'read',
+                    'what' => 'Reports whether Centaur is improving over time using only real persisted learning evidence from real-heartbeat and launchd-scheduled research cycles, including trend quality, closest-to-promotion profiles, stuck detection, and the final verdict.',
+                ],
+                [
+                    'command' => 'Self-improvement status JSON',
+                    'example' => '.venv-mac/bin/python main.py --self-improvement-status --json',
+                    'tone' => 'read',
+                    'what' => 'Returns the same self-improvement report as structured JSON for dashboards, automation, or machine-readable review, while keeping broker paper and live safety unchanged.',
+                ],
+                [
+                    'command' => 'Operator summary',
+                    'example' => '.venv-mac/bin/python main.py --operator-summary',
+                    'tone' => 'read',
+                    'what' => 'Answers the operator essentials in one compact report: system health, fresh data, real scheduled cycles in lookback, replay-window movement, closest-to-promotion strategy, why no trades are happening, and whether broker/live approvals are still zero.',
+                ],
+                [
+                    'command' => 'Operator summary for Slack',
+                    'example' => '.venv-mac/bin/python main.py --operator-summary --operator-summary-format slack',
+                    'tone' => 'read',
+                    'what' => 'Renders the same operator summary in a Slack-friendly block format. The unattended hourly Slack status reminder now includes this summary automatically.',
+                ],
+                [
+                    'command' => 'Operator summary for email',
+                    'example' => '.venv-mac/bin/python main.py --operator-summary --operator-summary-format email',
+                    'tone' => 'read',
+                    'what' => 'Renders the same operator summary as a professional plain-text email with a blocky header and footer.',
+                ],
+                [
+                    'command' => 'Send operator summary email',
+                    'example' => '.venv-mac/bin/python main.py --send-operator-summary-email',
+                    'tone' => 'read',
+                    'what' => 'Sends the operator summary through the configured SMTP settings as a one-way plain-text operator email. This is notification-only and does not change thresholds, approvals, broker routing, or execution.',
                 ],
                 [
                     'command' => 'Real heartbeat autonomous learning once',
@@ -265,6 +487,30 @@ function commandGroups(): array
                     'what' => 'Checks whether the historical bars store actually has replay-ready rows for the requested window and timeframe, and shows historical-vs-latest storage counts, source labels, timeframe labels, timestamp coverage, newest bar age, and replay readiness blockers.',
                 ],
                 [
+                    'command' => 'Download older crypto 15Min data probe',
+                    'example' => '.venv-mac/bin/python main.py --backfill-or-resample-crypto-15min-bars --symbols BTC/USD --days 1',
+                    'tone' => 'maint',
+                    'what' => 'Runs a tiny one-symbol, one-day probe through the existing Alpaca historical crypto bars downloader and the existing idempotent historical-bar upsert path. Use this first to confirm older 15Min crypto history is downloading and persisting before running a wider fill. Research-only: no paper trades, no live changes, no threshold changes, and no promotion-policy changes.',
+                ],
+                [
+                    'command' => 'Download older crypto 15Min data for configured symbols',
+                    'example' => '.venv-mac/bin/python main.py --backfill-or-resample-crypto-15min-bars --days 30',
+                    'tone' => 'maint',
+                    'what' => 'Uses the existing Alpaca crypto historical-bars backfill path to fetch older 15Min bars for the configured crypto symbol universe, then writes them through the existing idempotent market_data_historical_bars persistence path and updates readiness for historical_crypto_bars:15Min. Research-only and safe for data preparation: no paper trades, no live changes, no threshold changes, and no promotion-policy changes.',
+                ],
+                [
+                    'command' => 'Bulk crypto 15Min import',
+                    'example' => '.venv-mac/bin/python main.py --import-crypto-15min-bars --path data/crypto_15min_2025_2026',
+                    'tone' => 'maint',
+                    'what' => 'Imports one CSV/parquet file or a folder of CSV/parquet files for the configured crypto symbols into the 15Min historical-bar store. The import path must live inside this repo, for example under data/. It upserts idempotently by source/symbol/timeframe/timestamp, reports inserted/updated/skipped rows plus earliest/latest coverage per symbol, persists readiness for historical_crypto_bars:15Min, and stays research-only with no paper trades, live changes, threshold changes, or promotion-policy changes.',
+                ],
+                [
+                    'command' => 'Historical replay coverage',
+                    'example' => '.venv-mac/bin/python main.py --historical-replay-coverage',
+                    'tone' => 'read',
+                    'what' => 'Explains replay-window selection from stored historical bars, including latest raw bar time, replay-eligible anchor time, selected/rejected windows, bucket diagnostics, freshness loss, and whether global or isolated replay-window selection is active.',
+                ],
+                [
                     'command' => 'Replay a fixed window',
                     'example' => '.venv-mac/bin/python main.py --replay --replay-start-at 2026-06-01T00:00:00Z --replay-end-at 2026-06-03T23:59:59Z',
                     'tone' => 'maint',
@@ -293,6 +539,24 @@ function commandGroups(): array
                     'example' => '.venv-mac/bin/python main.py --backfill-api-costs',
                     'tone' => 'maint',
                     'what' => 'Reprices stored API usage events from current pricing assumptions and rebuilds cost rollups.',
+                ],
+                [
+                    'command' => 'One-shot research proof with write-mode refresh',
+                    'example' => 'PRE_REPLAY_HISTORICAL_REFRESH_ENABLED=true PRE_REPLAY_HISTORICAL_REFRESH_DRY_RUN=false .venv-mac/bin/python main.py --heartbeat-autonomous-learning-once --force-research-cycle',
+                    'tone' => 'maint',
+                    'what' => 'Runs one forced real-heartbeat research cycle with pre-replay historical refresh writing through the existing backfill/storage path. This remains replay-only research and must not place broker paper or live orders.',
+                ],
+                [
+                    'command' => 'One-shot research proof with isolated replay buckets',
+                    'example' => 'PRE_REPLAY_HISTORICAL_REFRESH_ENABLED=true PRE_REPLAY_HISTORICAL_REFRESH_DRY_RUN=false REPLAY_WINDOW_SELECTION_MODE=asset_class_and_timeframe .venv-mac/bin/python main.py --heartbeat-autonomous-learning-once --force-research-cycle',
+                    'tone' => 'maint',
+                    'what' => 'Runs the same safe one-shot research cycle but opts into asset_class_and_timeframe replay-window selection for diagnostics and replay bucketing. Global mode remains the default unless REPLAY_WINDOW_SELECTION_MODE is explicitly set.',
+                ],
+                [
+                    'command' => 'One-shot rolling replay proof',
+                    'example' => 'PRE_REPLAY_HISTORICAL_REFRESH_ENABLED=true PRE_REPLAY_HISTORICAL_REFRESH_DRY_RUN=false REPLAY_WINDOW_SELECTION_MODE=asset_class_and_timeframe ROLLING_REPLAY_CURSOR_ENABLED=true .venv-mac/bin/python main.py --heartbeat-autonomous-learning-once --force-research-cycle',
+                    'tone' => 'maint',
+                    'what' => 'Runs the proven safe one-shot rolling replay research cycle with cursor-based replay advancement enabled, while still keeping broker paper, live orders, and automatic approvals at zero.',
                 ],
             ],
         ],
@@ -335,6 +599,18 @@ function commandGroups(): array
                     'example' => '.venv-mac/bin/python main.py --alert-resolve --event-id paper_candidate|mean_reversion.snapback|snapback --reason "review complete"',
                     'tone' => 'warn',
                     'what' => 'Marks an attention alert resolved with an auditable reason and stops further Slack reminders for that issue.',
+                ],
+                [
+                    'command' => 'Reconcile attention alerts',
+                    'example' => '.venv-mac/bin/python main.py --attention-alerts-reconcile',
+                    'tone' => 'maint',
+                    'what' => 'Safely repairs stale or invalid approval-related alerts, including blank-profile approval/live alerts, without approving broker paper, rejecting strategies, enabling live execution, or changing thresholds.',
+                ],
+                [
+                    'command' => 'Attention status',
+                    'example' => '.venv-mac/bin/python main.py --attention-status',
+                    'tone' => 'read',
+                    'what' => 'Lists open attention alerts and shows how to acknowledge or resolve them without approving paper, enabling live, or mutating thresholds.',
                 ],
             ],
         ],
@@ -728,7 +1004,7 @@ $toneLabels = [
       </div>
       <div class="summary-block">
         <span class="summary-label">Why No Proposals?</span>
-        <div class="summary-value"><code>.venv-mac/bin/python main.py --proposal-pipeline-diagnostics</code></div>
+        <div class="summary-value"><code>.venv-mac/bin/python main.py --proposal-suppression-funnel</code></div>
       </div>
       <div class="summary-block">
         <span class="summary-label">Safe Replay First</span>

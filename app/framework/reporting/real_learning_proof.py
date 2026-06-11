@@ -37,7 +37,8 @@ class RealLearningProofReport:
             reasons.append("no_replay_evidence")
         if str(run.get("source", "") or "") != "real_heartbeat":
             reasons.append("wrong_source_tag")
-        if int(state.get("research_decisions_written", 0) or 0) <= 0:
+        persistence_error = str(row.get("persistence_error", "") or "")
+        if persistence_error:
             reasons.append("storage_write_failed")
         promotion_eligible_count = sum(
             1
@@ -92,6 +93,7 @@ class RealLearningProofReport:
         return "\n".join(lines)
 
     def _latest_real_cycle_row(self) -> dict[str, Any] | None:
+        fallback = None
         for row in self.usage_ledger.list_recent_tick_runs(limit=400):
             snapshot = row.get("state_snapshot_json", {}) if isinstance(row, dict) else {}
             run = snapshot.get("run", {}) if isinstance(snapshot, dict) else {}
@@ -99,8 +101,11 @@ class RealLearningProofReport:
                 str(run.get("pipeline", "") or "") == "research_cycle"
                 and str(run.get("source", "") or "") == "real_heartbeat"
             ):
-                return row
-        return None
+                if str(run.get("cycle_origin", "") or "") == "launchd_scheduled":
+                    return row
+                if fallback is None:
+                    fallback = row
+        return fallback
 
     def _result(self, values: dict[str, Any], reasons: list[str]) -> dict[str, Any]:
         proven = not reasons

@@ -63,6 +63,31 @@ class RealLearningProofReportTests(unittest.TestCase):
         self.assertIn("paper_candidates_created=1", rendered)
         self.assertIn("final_safety_summary=PASS", rendered)
 
+    def test_render_does_not_report_storage_write_failed_when_tick_row_persisted(self) -> None:
+        report = RealLearningProofReport(
+            config=SimpleNamespace(),
+            usage_ledger=_Ledger(
+                [
+                    {
+                        "state_snapshot_json": {
+                            "run": {"pipeline": "research_cycle", "source": "real_heartbeat"},
+                            "research_cycle": {
+                                "historical_windows_selected": 0,
+                                "strategy_profiles_evaluated": 2,
+                                "research_decisions_written": 0,
+                                "usable_decisions_count": 0,
+                                "decisions": [],
+                            },
+                        }
+                    }
+                ]
+            ),
+        )
+
+        rendered = report.render()
+
+        self.assertIn("failure_reasons=no_valid_replay_windows,no_replay_evidence,no_decisions_generated", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

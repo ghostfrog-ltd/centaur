@@ -9,10 +9,18 @@ from app.framework.runtime.models import TickContext
 
 
 class _FakeUsageLedger:
-    def __init__(self, promotion: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        promotion: dict[str, object] | None = None,
+        *,
+        fitness_summary: dict[str, object] | None = None,
+    ) -> None:
         self._promotion = promotion
         self._orders: list[dict[str, object]] = []
         self.recorded_evaluations: list[dict[str, object]] = []
+        self.approval_calls: list[dict[str, object]] = []
+        self.resolve_calls: list[dict[str, object]] = []
+        self._fitness_summary = fitness_summary
 
     def get_strategy_promotion(self, *, strategy_id: str, profile_id: str) -> dict[str, object] | None:
         if not self._promotion:
@@ -30,9 +38,28 @@ class _FakeUsageLedger:
     def record_strategy_promotion_evaluation(self, **kwargs: object) -> None:
         self.recorded_evaluations.append(dict(kwargs))
 
+    def approve_strategy_for_paper(self, **kwargs: object) -> None:
+        self.approval_calls.append(dict(kwargs))
+        self._promotion = {
+            "strategy_id": str(kwargs.get("strategy_id", "")),
+            "profile_id": str(kwargs.get("profile_id", "")),
+            "stage": "paper_approved",
+            "paper_approved": 1,
+            "live_approved": 0,
+            "paper_execution_profile": 1,
+            "research_only_profile": 1 if kwargs.get("research_only_profile") else 0,
+            "max_paper_notional_usd": float(kwargs.get("max_paper_notional_usd", 0.0) or 0.0),
+            "max_open_trades": int(kwargs.get("max_open_trades", 0) or 0),
+            "cooldown_minutes": int(kwargs.get("cooldown_minutes", 0) or 0),
+            "rejected": 0,
+        }
+
+    def resolve_attention_alerts_for_approval_request(self, **kwargs: object) -> None:
+        self.resolve_calls.append(dict(kwargs))
+
     def get_latest_strategy_fitness_summary(self, *, strategy_id: str, profile_id: str):
         _ = (strategy_id, profile_id)
-        return {
+        return self._fitness_summary if self._fitness_summary is not None else {
             "composite_fitness_score": 0.75,
             "avg_realized_return_pct": 0.22,
             "win_rate": 0.63,
@@ -239,6 +266,340 @@ class StrategyPromotionGateTests(unittest.TestCase):
 
         self.assertIsNone(approval)
         self.assertEqual(rejection["reason"], "promotion_cooldown_active")
+
+    def _promotion_reporter(self, ledger: _FakeUsageLedger):
+        from app.framework.reporting.promotion_gate import PromotionGateReport
+
+        reporter = PromotionGateReport(
+            config=SimpleNamespace(
+                include_backtest_evidence_in_paper_fitness=False,
+                include_backtest_evidence_in_live_fitness=False,
+                strategy_allocation_min_checkpoints=5,
+                strategy_allocation_suppress_threshold=0.1,
+            ),
+            usage_ledger=ledger,
+        )
+        reporter._resolve_profile = lambda **_kwargs: SimpleNamespace(
+            strategy_id="mean_reversion.snapback",
+            profile_id="snapback",
+            parameters={},
+        )
+        return reporter
+
+    def test_approve_paper_refuses_research_only(self) -> None:
+        reporter = self._promotion_reporter(_FakeUsageLedger())
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "research_only",
+            "recommendation": "hold_research_only",
+            "blocker_reasons": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "approval_refused_stage_research_only"):
+            reporter.approve_paper(
+                strategy_id="mean_reversion.snapback",
+                profile_id="snapback",
+                max_paper_notional_usd=10.0,
+                max_open_trades=1,
+                cooldown_minutes=60,
+                confirmed=True,
+            )
+
+    def test_approve_paper_refuses_rejected(self) -> None:
+        reporter = self._promotion_reporter(_FakeUsageLedger())
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "rejected",
+            "recommendation": "manually_rejected",
+            "blocker_reasons": ["manually_rejected"],
+        }
+
+        with self.assertRaisesRegex(ValueError, "approval_refused_stage_rejected"):
+            reporter.approve_paper(
+                strategy_id="mean_reversion.snapback",
+                profile_id="snapback",
+                max_paper_notional_usd=10.0,
+                max_open_trades=1,
+                cooldown_minutes=60,
+                confirmed=True,
+            )
+
+    def test_approve_paper_refuses_oversized_notional(self) -> None:
+        reporter = self._promotion_reporter(_FakeUsageLedger())
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "paper_candidate",
+            "recommendation": "manual_paper_review",
+            "blocker_reasons": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "approval_refused_notional_cap"):
+            reporter.approve_paper(
+                strategy_id="mean_reversion.snapback",
+                profile_id="snapback",
+                max_paper_notional_usd=10.01,
+                max_open_trades=1,
+                cooldown_minutes=60,
+                confirmed=True,
+            )
+
+    def test_approve_paper_refuses_open_trade_cap_above_one(self) -> None:
+        reporter = self._promotion_reporter(_FakeUsageLedger())
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "paper_candidate",
+            "recommendation": "manual_paper_review",
+            "blocker_reasons": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "approval_refused_open_trade_cap"):
+            reporter.approve_paper(
+                strategy_id="mean_reversion.snapback",
+                profile_id="snapback",
+                max_paper_notional_usd=10.0,
+                max_open_trades=2,
+                cooldown_minutes=60,
+                confirmed=True,
+            )
+
+    def test_approve_paper_refuses_cooldown_below_sixty(self) -> None:
+        reporter = self._promotion_reporter(_FakeUsageLedger())
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "paper_candidate",
+            "recommendation": "manual_paper_review",
+            "blocker_reasons": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "approval_refused_cooldown_too_low"):
+            reporter.approve_paper(
+                strategy_id="mean_reversion.snapback",
+                profile_id="snapback",
+                max_paper_notional_usd=10.0,
+                max_open_trades=1,
+                cooldown_minutes=59,
+                confirmed=True,
+            )
+
+    def test_approve_paper_accepts_paper_candidate_with_safe_caps(self) -> None:
+        ledger = _FakeUsageLedger()
+        reporter = self._promotion_reporter(ledger)
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "paper_candidate",
+            "recommendation": "manual_paper_review",
+            "blocker_reasons": [],
+        }
+
+        record = reporter.approve_paper(
+            strategy_id="mean_reversion.snapback",
+            profile_id="snapback",
+            max_paper_notional_usd=10.0,
+            max_open_trades=1,
+            cooldown_minutes=60,
+            confirmed=True,
+        )
+
+        self.assertEqual(record["stage"], "paper_approved")
+        self.assertEqual(len(ledger.approval_calls), 1)
+        self.assertEqual(ledger.approval_calls[0]["max_paper_notional_usd"], 10.0)
+        self.assertEqual(ledger.approval_calls[0]["max_open_trades"], 1)
+        self.assertEqual(ledger.approval_calls[0]["cooldown_minutes"], 60)
+        self.assertEqual(ledger.resolve_calls[0]["status"], "resolved")
+
+    def test_approve_paper_does_not_affect_live_approval(self) -> None:
+        ledger = _FakeUsageLedger()
+        reporter = self._promotion_reporter(ledger)
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "paper_sim_active",
+            "recommendation": "continue_paper_sim",
+            "blocker_reasons": [],
+        }
+
+        record = reporter.approve_paper(
+            strategy_id="mean_reversion.snapback",
+            profile_id="snapback",
+            max_paper_notional_usd=10.0,
+            max_open_trades=1,
+            cooldown_minutes=60,
+            confirmed=True,
+        )
+
+        self.assertFalse(bool(record.get("live_approved")))
+
+    def test_replay_qualified_candidate_can_become_paper_candidate_and_remains_manual(self) -> None:
+        from app.framework.reporting.promotion_gate import PromotionGateReport
+        import app.framework.reporting.research_status as research_status_module
+        import app.framework.reporting.proposal_pipeline_diagnostics as diagnostics_module
+
+        ledger = _FakeUsageLedger(
+            fitness_summary={
+                "composite_fitness_score": 0.0,
+                "avg_realized_return_pct": 0.0,
+                "win_rate": 0.0,
+                "evaluated_proposals": 0,
+                "avg_max_adverse_excursion_pct": 0.0,
+                "checkpoint_code": "",
+                "captured_at": datetime.now().astimezone(),
+            }
+        )
+        reporter = PromotionGateReport(
+            config=SimpleNamespace(
+                include_backtest_evidence_in_paper_fitness=False,
+                include_backtest_evidence_in_live_fitness=False,
+                strategy_allocation_min_checkpoints=5,
+                strategy_allocation_suppress_threshold=0.1,
+            ),
+            usage_ledger=ledger,
+        )
+        reporter._resolve_profile = lambda **_kwargs: SimpleNamespace(
+            strategy_id="mean_reversion.snapback",
+            profile_id="snapback",
+            parameters={},
+        )
+        reporter._diagnostic_strategy = lambda **_kwargs: {"paper_execution_allowed": True}
+        reporter._latest_research_entry = lambda **_kwargs: {
+            "classification": "paper_sim_candidate",
+            "promotion_recommendation": "paper_sim_candidate",
+            "net_performance_pct": 0.22,
+            "net_win_rate": 0.63,
+            "proposal_count": 55,
+            "replay_windows_with_data": 4,
+            "replay_windows_required": 4,
+            "paper_blocker_reasons": [],
+            "paper_policy_notes": ["paper_allocation_excludes_backtest_evidence"],
+            "live_blocker_reasons": ["live_allocation_excludes_backtest_evidence"],
+            "allocation_includes_backtest_evidence": {"paper": False, "live": False},
+        }
+        original_research = research_status_module.ResearchStatusReport
+        original_diag = diagnostics_module.ProposalPipelineDiagnosticsReport
+        research_status_module.ResearchStatusReport = lambda **_kwargs: SimpleNamespace(build_report=lambda: {})
+        diagnostics_module.ProposalPipelineDiagnosticsReport = lambda **_kwargs: SimpleNamespace(
+            build_report=lambda: {"proposal_data_integrity": {"status": "pass", "failure_reasons": []}}
+        )
+        try:
+            report = reporter.evaluate(strategy_id="mean_reversion.snapback", profile_id="snapback")
+        finally:
+            research_status_module.ResearchStatusReport = original_research
+            diagnostics_module.ProposalPipelineDiagnosticsReport = original_diag
+
+        self.assertEqual(report["current_stage"], "paper_candidate")
+        self.assertTrue(report["paper_stage_eligible"])
+        self.assertFalse(report["live_stage_eligible"])
+        self.assertNotIn("live_allocation_excludes_backtest_evidence", report["paper_blocker_reasons"])
+        self.assertIn("paper_allocation_excludes_backtest_evidence", report["paper_policy_notes"])
+        self.assertEqual(len(ledger.approval_calls), 0)
+
+    def test_replay_only_candidate_cannot_become_live_candidate(self) -> None:
+        from app.framework.reporting.promotion_gate import PromotionGateReport
+        import app.framework.reporting.research_status as research_status_module
+        import app.framework.reporting.proposal_pipeline_diagnostics as diagnostics_module
+
+        ledger = _FakeUsageLedger(
+            fitness_summary={
+                "composite_fitness_score": 0.0,
+                "avg_realized_return_pct": 0.0,
+                "win_rate": 0.0,
+                "evaluated_proposals": 0,
+                "avg_max_adverse_excursion_pct": 0.0,
+                "checkpoint_code": "",
+                "captured_at": datetime.now().astimezone(),
+            }
+        )
+        reporter = PromotionGateReport(
+            config=SimpleNamespace(
+                include_backtest_evidence_in_paper_fitness=True,
+                include_backtest_evidence_in_live_fitness=False,
+                strategy_allocation_min_checkpoints=5,
+                strategy_allocation_suppress_threshold=0.1,
+            ),
+            usage_ledger=ledger,
+        )
+        reporter._resolve_profile = lambda **_kwargs: SimpleNamespace(
+            strategy_id="mean_reversion.snapback",
+            profile_id="snapback",
+            parameters={},
+        )
+        reporter._diagnostic_strategy = lambda **_kwargs: {"paper_execution_allowed": True}
+        reporter._latest_research_entry = lambda **_kwargs: {
+            "classification": "paper_sim_candidate",
+            "promotion_recommendation": "paper_sim_candidate",
+            "net_performance_pct": 0.22,
+            "net_win_rate": 0.63,
+            "proposal_count": 55,
+            "replay_windows_with_data": 4,
+            "replay_windows_required": 4,
+            "paper_blocker_reasons": [],
+            "live_blocker_reasons": ["live_allocation_excludes_backtest_evidence"],
+            "allocation_includes_backtest_evidence": {"paper": True, "live": False},
+        }
+        original_research = research_status_module.ResearchStatusReport
+        original_diag = diagnostics_module.ProposalPipelineDiagnosticsReport
+        research_status_module.ResearchStatusReport = lambda **_kwargs: SimpleNamespace(build_report=lambda: {})
+        diagnostics_module.ProposalPipelineDiagnosticsReport = lambda **_kwargs: SimpleNamespace(
+            build_report=lambda: {"proposal_data_integrity": {"status": "pass", "failure_reasons": []}}
+        )
+        try:
+            report = reporter.evaluate(strategy_id="mean_reversion.snapback", profile_id="snapback")
+        finally:
+            research_status_module.ResearchStatusReport = original_research
+            diagnostics_module.ProposalPipelineDiagnosticsReport = original_diag
+
+        self.assertEqual(report["current_stage"], "paper_candidate")
+        self.assertNotEqual(report["current_stage"], "live_candidate")
+        self.assertFalse(report["live_stage_eligible"])
+
+    def test_live_allocation_exclusion_still_blocks_live_candidate(self) -> None:
+        from app.framework.reporting.promotion_gate import PromotionGateReport
+        import app.framework.reporting.research_status as research_status_module
+        import app.framework.reporting.proposal_pipeline_diagnostics as diagnostics_module
+
+        ledger = _FakeUsageLedger(
+            fitness_summary={
+                "composite_fitness_score": 0.0,
+                "avg_realized_return_pct": 0.0,
+                "win_rate": 0.0,
+                "evaluated_proposals": 0,
+                "avg_max_adverse_excursion_pct": 0.0,
+                "checkpoint_code": "",
+                "captured_at": datetime.now().astimezone(),
+            }
+        )
+        reporter = PromotionGateReport(
+            config=SimpleNamespace(
+                include_backtest_evidence_in_paper_fitness=True,
+                include_backtest_evidence_in_live_fitness=False,
+                strategy_allocation_min_checkpoints=5,
+                strategy_allocation_suppress_threshold=0.1,
+            ),
+            usage_ledger=ledger,
+        )
+        reporter._resolve_profile = lambda **_kwargs: SimpleNamespace(
+            strategy_id="mean_reversion.snapback",
+            profile_id="snapback",
+            parameters={},
+        )
+        reporter._diagnostic_strategy = lambda **_kwargs: {"paper_execution_allowed": True}
+        reporter._latest_research_entry = lambda **_kwargs: {
+            "classification": "paper_sim_candidate",
+            "promotion_recommendation": "paper_sim_candidate",
+            "net_performance_pct": 0.22,
+            "net_win_rate": 0.63,
+            "proposal_count": 55,
+            "replay_windows_with_data": 4,
+            "replay_windows_required": 4,
+            "paper_blocker_reasons": [],
+            "live_blocker_reasons": ["live_allocation_excludes_backtest_evidence"],
+            "allocation_includes_backtest_evidence": {"paper": True, "live": False},
+        }
+        original_research = research_status_module.ResearchStatusReport
+        original_diag = diagnostics_module.ProposalPipelineDiagnosticsReport
+        research_status_module.ResearchStatusReport = lambda **_kwargs: SimpleNamespace(build_report=lambda: {})
+        diagnostics_module.ProposalPipelineDiagnosticsReport = lambda **_kwargs: SimpleNamespace(
+            build_report=lambda: {"proposal_data_integrity": {"status": "pass", "failure_reasons": []}}
+        )
+        try:
+            report = reporter.evaluate(strategy_id="mean_reversion.snapback", profile_id="snapback")
+        finally:
+            research_status_module.ResearchStatusReport = original_research
+            diagnostics_module.ProposalPipelineDiagnosticsReport = original_diag
+
+        self.assertIn("live_allocation_excludes_backtest_evidence", report["live_blocker_reasons"])
+        self.assertFalse(report["live_stage_eligible"])
 
 
 if __name__ == "__main__":

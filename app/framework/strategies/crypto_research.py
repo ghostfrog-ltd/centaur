@@ -6,6 +6,7 @@ Trading ideas:
 
     * dip_rebound watches liquid crypto pullbacks that may mean-revert.
     * range_breakout watches liquid crypto pairs that clear recent range highs.
+    * liquidation_wick_reclaim watches oversold flushes that reclaim the bar body.
 
 Execution boundary:
     These profiles are research/observe-only unless their strategy IDs are
@@ -96,6 +97,36 @@ class CryptoResearchStrategy(StrategyDefinition):
                     "max_atr_pct": 3.0,
                 },
             ),
+            StrategyProfile(
+                strategy_id="crypto_research.liquidation_wick_reclaim",
+                family=self.family,
+                profile_id="liquidation_wick_reclaim",
+                label="Crypto Research Liquidation Wick Reclaim",
+                asset_classes=("crypto",),
+                holding_window_code="2h",
+                holding_window_minutes=window_code_to_minutes("2h"),
+                stop_loss_pct=stop_loss_pct,
+                target_multiple=max(target_multiple, 2.25),
+                max_signals_per_tick=2,
+                min_signal_score=max(64.0, config.shadow_min_opportunity_score),
+                parameters={
+                    "min_flush_pct": 0.9,
+                    "max_flush_pct": max(max_movement_pct * 2.0, 4.0),
+                    "min_body_reclaim_ratio": 0.55,
+                    "min_close_to_high_ratio": 0.7,
+                    "max_close_below_vwap_pct": 0.2,
+                    "min_volume_ratio": 1.5,
+                    "min_discovery_score": max(
+                        float(config.crypto_momentum_min_discovery_score),
+                        3.2,
+                    ),
+                    "min_trade_count": max(1, int(config.crypto_momentum_min_trade_count)),
+                    "min_volume_gbp": min_volume_gbp,
+                    "max_spread_pct": max_spread_pct,
+                    "min_atr_pct": 0.35,
+                    "max_atr_pct": max(3.5, max_movement_pct + 0.5),
+                },
+            ),
         ]
 
     def evaluate_candidate(
@@ -106,19 +137,185 @@ class CryptoResearchStrategy(StrategyDefinition):
         market_context: dict[str, Any],
     ) -> StrategySignal | None:
         """Dispatch to the profile-specific crypto research gate."""
-        if profile.profile_id == "dip_rebound":
+        if profile.profile_id == "dip_rebound" or profile.profile_id.startswith("dip_rebound_"):
             return self._evaluate_dip_rebound(
                 profile=profile,
                 candidate=candidate,
                 market_context=market_context,
             )
-        if profile.profile_id == "range_breakout":
+        if profile.profile_id == "range_breakout" or profile.profile_id.startswith("range_breakout_"):
             return self._evaluate_range_breakout(
                 profile=profile,
                 candidate=candidate,
                 market_context=market_context,
             )
+        if profile.profile_id == "liquidation_wick_reclaim" or profile.profile_id.startswith("liquidation_wick_reclaim_"):
+            return self._evaluate_liquidation_wick_reclaim(
+                profile=profile,
+                candidate=candidate,
+                market_context=market_context,
+            )
         return None
+
+    def _evaluate_liquidation_wick_reclaim(
+        self,
+        *,
+        profile: StrategyProfile,
+        candidate: dict[str, Any],
+        market_context: dict[str, Any],
+    ) -> StrategySignal | None:
+        def reject(reason: str, **metrics: Any) -> None:
+            record_rejection(
+                market_context=market_context,
+                profile=profile,
+                candidate=candidate,
+                reason=reason,
+                metrics=metrics,
+            )
+
+        common = self._crypto_common_inputs(
+            profile=profile,
+            candidate=candidate,
+            reject=reject,
+        )
+        if common is None:
+            return None
+        if not bool(candidate.get("technical_context_ready")):
+            reject("technical_context_not_ready")
+            return None
+        movement_pct = common["movement_pct"]
+        if movement_pct >= 0:
+            reject("flush_not_negative", movement_pct=movement_pct)
+            return None
+        flush_pct = abs(movement_pct)
+        if flush_pct < float(profile.parameters["min_flush_pct"]):
+            reject(
+                "flush_below_min",
+                flush_pct=flush_pct,
+                min_flush_pct=profile.parameters["min_flush_pct"],
+            )
+            return None
+        if flush_pct > float(profile.parameters["max_flush_pct"]):
+            reject(
+                "flush_above_max",
+                flush_pct=flush_pct,
+                max_flush_pct=profile.parameters["max_flush_pct"],
+            )
+            return None
+
+        open_price = to_float(candidate.get("open_price"))
+        high_price = to_float(candidate.get("high_price"))
+        low_price = to_float(candidate.get("low_price"))
+        close_price = common["entry_price"]
+        vwap = to_float(candidate.get("vwap"))
+        volume_ratio = to_float(candidate.get("volume_ratio_20"))
+        atr_pct = to_float(candidate.get("atr_pct_20"))
+        if None in {open_price, high_price, low_price, close_price}:
+            reject("missing_bar_shape_inputs")
+            return None
+        bar_range = max(float(high_price) - float(low_price), 0.0)
+        if bar_range <= 0.0:
+            reject("bar_range_not_positive", bar_range=bar_range)
+            return None
+        lower_wick = min(float(open_price), float(close_price)) - float(low_price)
+        reclaim = float(close_price) - float(low_price)
+        close_to_high = float(high_price) - float(close_price)
+        body_reclaim_ratio = reclaim / bar_range
+        close_to_high_ratio = 1.0 - (close_to_high / bar_range)
+        if body_reclaim_ratio < float(profile.parameters["min_body_reclaim_ratio"]):
+            reject(
+                "body_reclaim_below_min",
+                body_reclaim_ratio=body_reclaim_ratio,
+                min_body_reclaim_ratio=profile.parameters["min_body_reclaim_ratio"],
+            )
+            return None
+        if close_to_high_ratio < float(profile.parameters["min_close_to_high_ratio"]):
+            reject(
+                "close_to_high_below_min",
+                close_to_high_ratio=close_to_high_ratio,
+                min_close_to_high_ratio=profile.parameters["min_close_to_high_ratio"],
+            )
+            return None
+        if lower_wick <= 0:
+            reject("lower_wick_missing", lower_wick=lower_wick)
+            return None
+        if volume_ratio is None or volume_ratio < float(profile.parameters["min_volume_ratio"]):
+            reject(
+                "volume_ratio_below_min",
+                volume_ratio=volume_ratio,
+                min_volume_ratio=profile.parameters["min_volume_ratio"],
+            )
+            return None
+        if atr_pct is None or atr_pct < float(profile.parameters["min_atr_pct"]):
+            reject(
+                "atr_below_min",
+                atr_pct=atr_pct,
+                min_atr_pct=profile.parameters["min_atr_pct"],
+            )
+            return None
+        if atr_pct > float(profile.parameters["max_atr_pct"]):
+            reject(
+                "atr_above_max",
+                atr_pct=atr_pct,
+                max_atr_pct=profile.parameters["max_atr_pct"],
+            )
+            return None
+        if vwap is not None:
+            vwap_gap_pct = ((float(vwap) - float(close_price)) / float(close_price)) * 100.0
+            if vwap_gap_pct > float(profile.parameters["max_close_below_vwap_pct"]):
+                reject(
+                    "close_below_vwap_limit",
+                    vwap_gap_pct=vwap_gap_pct,
+                    max_close_below_vwap_pct=profile.parameters["max_close_below_vwap_pct"],
+                )
+                return None
+
+        signal_score = round(
+            min(
+                100.0,
+                (flush_pct * 26.0)
+                + (body_reclaim_ratio * 22.0)
+                + (close_to_high_ratio * 18.0)
+                + (common["discovery_score"] * 6.5)
+                + (volume_ratio * 7.0),
+            ),
+            6,
+        )
+        if signal_score < profile.min_signal_score:
+            reject(
+                "score_below_min",
+                signal_score=signal_score,
+                min_signal_score=profile.min_signal_score,
+            )
+            return None
+        confidence = round(
+            min(
+                0.9,
+                0.31
+                + min(flush_pct / 8.0, 0.18)
+                + min(body_reclaim_ratio / 2.0, 0.2)
+                + min(close_to_high_ratio / 2.5, 0.16)
+                + min(volume_ratio / 12.0, 0.12),
+            ),
+            6,
+        )
+        return build_signal(
+            profile=profile,
+            candidate=candidate,
+            entry_price=close_price,
+            entry_price_gbp=common["entry_price_gbp"],
+            signal_score=signal_score,
+            confidence=confidence,
+            movement_pct=movement_pct,
+            discovery_score=common["discovery_score"],
+            rationale=(
+                f"{profile.label} observes a {flush_pct:.3f}% oversold flush that reclaimed "
+                f"{body_reclaim_ratio:.2f} of the bar range with {volume_ratio:.2f}x volume."
+            ),
+            note="shadow_only_crypto_liquidation_wick_reclaim",
+            atr_pct=atr_pct,
+            volume_ratio=volume_ratio,
+        )
 
     def _evaluate_dip_rebound(
         self,

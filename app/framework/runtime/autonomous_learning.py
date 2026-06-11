@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from app.framework.engine.research_cycle import ResearchCycleRunner
+from app.framework.engine.research_cycle import (
+    ResearchCycleAlreadyRunningError,
+    ResearchCycleRunner,
+)
 from app.framework.runtime.attention_alerts import (
     approval_request_id,
     build_event_id,
@@ -38,6 +41,13 @@ def run_autonomous_learning_cycle(context: Any) -> dict[str, Any]:
         getattr(context.config, "research_cycle_env_path", "") or ""
     )
     diagnostics["forced_research_cycle"] = _force_research_cycle_requested(context=context)
+    diagnostics["parent_process_mode"] = str(
+        getattr(context, "metadata", {}).get("process_mode", "") or "unknown"
+    )
+    diagnostics["command_source"] = str(
+        getattr(context, "metadata", {}).get("command_source", "") or "unknown"
+    )
+    diagnostics["cycle_origin"] = _cycle_origin(context=context)
     if not diagnostics["research_cycle_enabled"]:
         diagnostics["research_cycle_skipped_reason"] = "research_disabled"
         result = {
@@ -77,6 +87,21 @@ def run_autonomous_learning_cycle(context: Any) -> dict[str, Any]:
     try:
         diagnostics["research_cycle_started"] = True
         report = _build_research_cycle_runner(context=context).run()
+    except ResearchCycleAlreadyRunningError as exc:
+        diagnostics["research_cycle_started"] = False
+        diagnostics["research_cycle_skipped_reason"] = "research_cycle_already_running"
+        result = {
+            "status": "skipped",
+            "triggered": False,
+            "reason": str(exc),
+            "broker_orders_created": 0,
+            "live_orders_created": 0,
+            "auto_paper_approved": 0,
+            "auto_live_approved": 0,
+            **diagnostics,
+        }
+        _store_runtime_snapshot(context=context, result=result)
+        return result
     except Exception as exc:
         now = getattr(context, "started_at", None)
         if not isinstance(now, datetime):
@@ -284,6 +309,9 @@ def _base_diagnostics(*, context: Any) -> dict[str, Any]:
         "research_cycle_last_started_at": "",
         "research_cycle_min_interval_minutes": 0,
         "forced_research_cycle": False,
+        "parent_process_mode": "unknown",
+        "command_source": "unknown",
+        "cycle_origin": "unknown",
     }
 
 
@@ -368,6 +396,9 @@ def _store_runtime_snapshot(*, context: Any, result: dict[str, Any]) -> None:
             "research_cycle_enabled_env_file_value",
             "research_cycle_enabled_value_source",
             "research_cycle_env_path",
+            "cycle_origin",
+            "parent_process_mode",
+            "command_source",
             "forced_research_cycle",
             "research_cycle_due",
             "research_cycle_skipped_reason",
@@ -430,6 +461,14 @@ def _build_research_cycle_runner(*, context: Any) -> ResearchCycleRunner:
         "usage_ledger": context.usage_ledger,
         "source": "real_heartbeat",
         "parent_tick_id": str(getattr(context, "tick_id", "") or ""),
+        "cycle_origin": _cycle_origin(context=context),
+        "parent_process_mode": str(
+            getattr(context, "metadata", {}).get("process_mode", "") or "unknown"
+        ),
+        "command_source": str(
+            getattr(context, "metadata", {}).get("command_source", "") or "unknown"
+        ),
+        "force_mode": _force_research_cycle_requested(context=context),
     }
     try:
         return ResearchCycleRunner(**kwargs)
@@ -566,3 +605,18 @@ def _is_attention_alert_open(
         )
     )
     return bool(row) and str((row or {}).get("attention_status", "")) == "open"
+
+
+def _cycle_origin(*, context: Any) -> str:
+    if _force_research_cycle_requested(context=context):
+        return "forced_one_shot"
+    process_mode = str(getattr(context, "metadata", {}).get("process_mode", "") or "")
+    tick_id = str(getattr(context, "tick_id", "") or "")
+    command_source = str(getattr(context, "metadata", {}).get("command_source", "") or "")
+    if process_mode == "heartbeat_service":
+        return "launchd_scheduled"
+    if tick_id.startswith("sim-") or "simulated" in command_source:
+        return "simulated_natural"
+    if process_mode in {"control_heartbeat_once", "one_shot"}:
+        return "manual_cli"
+    return "manual_cli"

@@ -42,6 +42,9 @@ class ResearchCycleStatusReport:
                     f"research_cycle_completed={'yes' if latest_heartbeat.get('research_cycle_completed') else 'no'}",
                     f"research_cycle_skipped_reason={latest_heartbeat.get('research_cycle_skipped_reason', '-') or '-'}",
                     f"research_cycle_source={latest_heartbeat.get('research_cycle_source', '-') or '-'}",
+                    f"research_cycle_origin={latest_heartbeat.get('cycle_origin', '-') or '-'}",
+                    f"research_cycle_parent_process_mode={latest_heartbeat.get('parent_process_mode', '-') or '-'}",
+                    f"research_cycle_command_source={latest_heartbeat.get('command_source', '-') or '-'}",
                     f"research_cycle_id={latest_heartbeat.get('research_cycle_id', '-') or '-'}",
                     f"research_decisions_written={int(latest_heartbeat.get('research_decisions_written', 0) or 0)}",
                     f"evidence_decisions_count={int(latest_heartbeat.get('usable_decisions_count', 0) or 0)}",
@@ -63,6 +66,9 @@ class ResearchCycleStatusReport:
                     f"latest_real_heartbeat_tick_id={latest_real_cycle.get('latest_real_heartbeat_tick_id', '-')}",
                     f"latest_real_cycle_id={latest_real_cycle.get('latest_real_research_cycle_id', '-')}",
                     f"research_cycle_source={latest_real_cycle.get('source', '-')}",
+                    f"research_cycle_origin={latest_real_cycle.get('cycle_origin', '-')}",
+                    f"research_cycle_parent_process_mode={latest_real_cycle.get('parent_process_mode', '-')}",
+                    f"research_cycle_command_source={latest_real_cycle.get('command_source', '-')}",
                     f"latest_real_cycle_started_at={latest_real_cycle.get('latest_real_research_cycle_started_at', '-')}",
                     f"historical_windows_selected_count={int(latest_real_cycle.get('historical_windows_selected', 0) or 0)}",
                     f"replay_windows_accepted_count={int(latest_real_cycle.get('replay_windows_accepted_count', 0) or 0)}",
@@ -132,6 +138,7 @@ class ResearchCycleStatusReport:
         return {}
 
     def _latest_real_cycle_row(self) -> dict[str, Any] | None:
+        fallback = None
         for row in self.usage_ledger.list_recent_tick_runs(limit=400):
             snapshot = row.get("state_snapshot_json", {}) if isinstance(row, dict) else {}
             if not isinstance(snapshot, dict):
@@ -143,8 +150,11 @@ class ResearchCycleStatusReport:
                 str(run.get("pipeline", "") or "") == "research_cycle"
                 and str(run.get("source", "") or "") == "real_heartbeat"
             ):
-                return row
-        return None
+                if str(run.get("cycle_origin", "") or "") == "launchd_scheduled":
+                    return row
+                if fallback is None:
+                    fallback = row
+        return fallback
 
     def _analyze_real_cycle(self, *, row: dict[str, Any] | None) -> dict[str, Any]:
         if not row:

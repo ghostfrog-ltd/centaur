@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
+from tempfile import TemporaryDirectory
 import unittest
 
 from app.framework.engine.control_graph import (
@@ -220,7 +222,9 @@ class ControlGraphTests(unittest.TestCase):
                 ),
                 usage_ledger=_UsageLedger(),
             )
-            runner.run_heartbeat_service_loop(interval_seconds=1, max_ticks=1)
+            with TemporaryDirectory() as temp_dir:
+                runner._heartbeat_service_singleton_dir = lambda: Path(temp_dir) / "heartbeat.lock"  # type: ignore[method-assign]
+                runner.run_heartbeat_service_loop(interval_seconds=1, max_ticks=1)
         finally:
             control_module.build_default_pipeline = original_build_default_pipeline
             control_module.load_runtime_config = original_load_runtime_config

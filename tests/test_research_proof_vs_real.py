@@ -4,6 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 import unittest
 
+import app.framework.reporting.research_proof_vs_real as research_proof_vs_real_module
 from app.framework.reporting.research_proof_vs_real import ResearchProofVsRealReport
 
 
@@ -75,8 +76,15 @@ class ResearchProofVsRealReportTests(unittest.TestCase):
             "thresholds_applied": "proof",
         }
         report._latest_real_cycle_row = lambda: report.usage_ledger.rows[0]
-
-        rendered = report.render()
+        original_runner = research_proof_vs_real_module.AutopilotProofRunner
+        research_proof_vs_real_module.AutopilotProofRunner = lambda: SimpleNamespace(  # type: ignore[assignment]
+            run=lambda: {},
+            _config=lambda: SimpleNamespace(),
+        )
+        try:
+            rendered = report.render()
+        finally:
+            research_proof_vs_real_module.AutopilotProofRunner = original_runner
 
         self.assertIn("proof_candidate_count=1", rendered)
         self.assertIn("real_candidate_count=0", rendered)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 
@@ -42,6 +43,8 @@ class StrategyRegistryTests(unittest.TestCase):
         self.assertEqual(signal.target_price, 103.15)
         self.assertEqual(signal.risk_pct, 1.8)
         self.assertEqual(signal.target_return_pct, 3.15)
+        self.assertEqual(profile.parameters["min_expected_net_move_pct"], 0.0)
+        self.assertGreater(profile.parameters["estimated_round_trip_cost_pct"], 0.0)
 
         self.assertIsNone(
             strategy.evaluate_candidate(
@@ -60,6 +63,68 @@ class StrategyRegistryTests(unittest.TestCase):
                 market_context={},
             )
         )
+
+    def test_mean_reversion_snapback_filters_when_expected_move_does_not_clear_cost_buffer(self) -> None:
+        config = self._config()
+        strategy = MeanReversionStrategy()
+        profile = strategy.build_profiles(config)[0]
+        cost_aware_profile = replace(
+            profile,
+            parameters={
+                **profile.parameters,
+                "min_expected_net_move_pct": 3.0,
+            },
+        )
+
+        signal = strategy.evaluate_candidate(
+            profile=cost_aware_profile,
+            candidate={
+                "source": "alpaca_equity_data",
+                "symbol": "AAPL",
+                "asset_class": "equity",
+                "canonical_instrument_id": "AAPL-US-EQUITY",
+                "close_price": 100.0,
+                "close_price_gbp": 79.0,
+                "movement_pct": -0.25,
+                "discovery_score": 5.0,
+                "trade_count": 100,
+                "volume": 10_000,
+            },
+            market_context={},
+        )
+
+        self.assertIsNone(signal)
+
+    def test_mean_reversion_snapback_allows_candidate_when_expected_move_clears_cost_buffer(self) -> None:
+        config = self._config()
+        strategy = MeanReversionStrategy()
+        profile = strategy.build_profiles(config)[0]
+        cost_aware_profile = replace(
+            profile,
+            parameters={
+                **profile.parameters,
+                "min_expected_net_move_pct": 0.5,
+            },
+        )
+
+        signal = strategy.evaluate_candidate(
+            profile=cost_aware_profile,
+            candidate={
+                "source": "alpaca_equity_data",
+                "symbol": "AAPL",
+                "asset_class": "equity",
+                "canonical_instrument_id": "AAPL-US-EQUITY",
+                "close_price": 100.0,
+                "close_price_gbp": 79.0,
+                "movement_pct": -0.25,
+                "discovery_score": 5.0,
+                "trade_count": 100,
+                "volume": 10_000,
+            },
+            market_context={},
+        )
+
+        self.assertIsNotNone(signal)
         self.assertIsNone(
             strategy.evaluate_candidate(
                 profile=profile,
@@ -469,6 +534,11 @@ class StrategyRegistryTests(unittest.TestCase):
             shadow_stop_loss_pct=0.02,
             shadow_target_multiple=2.0,
             shadow_min_opportunity_score=55.0,
+            shadow_execution_spread_bps=5.0,
+            shadow_entry_slippage_bps=2.0,
+            shadow_exit_slippage_bps=2.0,
+            shadow_fixed_round_trip_cost_usd=0.05,
+            paper_execution_default_notional_usd=10.0,
             crypto_momentum_stop_loss_pct=0.01,
             crypto_momentum_target_multiple=2.0,
             crypto_momentum_min_signal_score=60.0,

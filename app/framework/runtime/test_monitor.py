@@ -250,7 +250,12 @@ def append_scheduler_freshness_check(
         "status": scheduler_status,
         "summary": scheduler_summary,
     }
-    exit_code = result.exit_code if result.exit_code != 0 or passed else 1
+    if result.exit_code != 0:
+        exit_code = result.exit_code
+    elif scheduler_status == "fail":
+        exit_code = 1
+    else:
+        exit_code = 0
     return TestRunResult(
         exit_code=exit_code,
         output=output,

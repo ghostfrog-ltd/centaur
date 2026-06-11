@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
+from pathlib import Path
 import signal
 from time import perf_counter, sleep
 
@@ -22,10 +24,15 @@ class ControlPipelineRunner:
         logger: ScreenLogger | None = None,
         config: RuntimeConfig | None = None,
         usage_ledger: UsageLedger | None = None,
+        process_mode: str = "one_shot",
+        command_source: str = "main.py",
     ) -> None:
         self.config = config or load_runtime_config()
         self.steps = steps or build_default_pipeline()
         self.logger = logger or ScreenLogger()
+        self.process_mode = str(process_mode or "one_shot")
+        self.command_source = str(command_source or "main.py")
+        os.environ["CENTAUR_COMMAND_SOURCE"] = self.command_source
         self.usage_ledger = usage_ledger or UsageLedger(config=self.config)
         self._stop_requested = False
 
@@ -46,6 +53,10 @@ class ControlPipelineRunner:
             config=self.config,
             usage_ledger=self.usage_ledger,
             state=dict(initial_state or {}),
+            metadata={
+                "process_mode": self.process_mode,
+                "command_source": self.command_source,
+            },
         )
 
         self.logger.tick_start(
@@ -126,6 +137,8 @@ class ControlPipelineRunner:
             logger=self.logger,
             config=self.config,
             usage_ledger=self.usage_ledger,
+            process_mode="control_heartbeat_once",
+            command_source=self.command_source,
         )
         return one_step_runner._run_tick_with_state(initial_state=initial_state)
 
@@ -148,12 +161,21 @@ class ControlPipelineRunner:
         interval_seconds: int = 10,
         max_ticks: int | None = None,
     ) -> None:
-        self.run_heartbeat_loop(
-            interval_seconds=interval_seconds,
-            max_ticks=max_ticks,
-            reload_runtime_each_tick=True,
-            label="Heartbeat service",
-        )
+        lock_state = self._acquire_heartbeat_service_singleton()
+        if lock_state.get("skip_run"):
+            self.logger.line(
+                "Heartbeat service singleton already owned by another process; skipping duplicate startup."
+            )
+            return
+        try:
+            self.run_heartbeat_loop(
+                interval_seconds=interval_seconds,
+                max_ticks=max_ticks,
+                reload_runtime_each_tick=True,
+                label="Heartbeat service",
+            )
+        finally:
+            self._release_heartbeat_service_singleton(lock_state)
 
     def run_heartbeat_loop(
         self,
@@ -180,6 +202,9 @@ class ControlPipelineRunner:
                 loop_started_perf = perf_counter()
                 if reload_runtime_each_tick:
                     self.config = load_runtime_config()
+                    self.process_mode = "heartbeat_service"
+                    self.command_source = "main.py --heartbeat-service"
+                    os.environ["CENTAUR_COMMAND_SOURCE"] = self.command_source
                     self.usage_ledger = UsageLedger(config=self.config)
                     self.steps = build_default_pipeline()
                 self.run_tick()
@@ -218,6 +243,66 @@ class ControlPipelineRunner:
         self.logger.line(
             f"Heartbeat stop signal received | signal={signum} | stop_after_current_tick=yes"
         )
+
+    def _heartbeat_service_singleton_dir(self) -> Path:
+        return Path("/tmp/ghostfrog-centaur-heartbeat-service.lock")
+
+    def _acquire_heartbeat_service_singleton(self) -> dict[str, object]:
+        lock_dir = self._heartbeat_service_singleton_dir()
+        pid_file = lock_dir / "pid"
+        state: dict[str, object] = {
+            "lock_dir": lock_dir,
+            "pid_file": pid_file,
+            "owned": False,
+            "skip_run": False,
+        }
+        existing_detected = "no"
+        try:
+            lock_dir.mkdir()
+        except FileExistsError:
+            existing_pid = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
+            if existing_pid and self._pid_is_running(existing_pid):
+                existing_detected = "yes"
+                state["skip_run"] = True
+            else:
+                self.logger.line(
+                    f"Heartbeat service singleton removing stale lock at {lock_dir}."
+                )
+                pid_file.unlink(missing_ok=True)
+                lock_dir.rmdir()
+                lock_dir.mkdir()
+        if not state["skip_run"]:
+            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+            state["owned"] = True
+        os.environ["CENTAUR_EXISTING_HEARTBEAT_PROCESS_DETECTED"] = existing_detected
+        os.environ["CENTAUR_HEARTBEAT_COMMAND_SOURCE"] = self.command_source
+        self.logger.line(
+            "Heartbeat service singleton "
+            f"existing_heartbeat_process_detected={existing_detected} "
+            f"process_id={os.getpid()} "
+            f"existing_research_cycle_process_detected=unknown"
+        )
+        return state
+
+    def _release_heartbeat_service_singleton(self, state: dict[str, object]) -> None:
+        if not state.get("owned"):
+            return
+        pid_file = state.get("pid_file")
+        lock_dir = state.get("lock_dir")
+        if isinstance(pid_file, Path):
+            pid_file.unlink(missing_ok=True)
+        if isinstance(lock_dir, Path):
+            try:
+                lock_dir.rmdir()
+            except OSError:
+                pass
+
+    def _pid_is_running(self, pid_text: str) -> bool:
+        try:
+            os.kill(int(pid_text), 0)
+        except (OSError, ValueError):
+            return False
+        return True
 
     def _sleep_until_next_tick(self, sleep_for: float) -> None:
         deadline = perf_counter() + max(0.0, sleep_for)

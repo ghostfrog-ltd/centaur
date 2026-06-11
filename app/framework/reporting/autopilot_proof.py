@@ -705,19 +705,9 @@ class AutopilotProofRunner:
 
 
 class _ProofResearchCycleRunner(research_cycle_module.ResearchCycleRunner):
-    def __init__(
-        self,
-        *,
-        config: Any | None = None,
-        usage_ledger: Any | None = None,
-        source: str = "autopilot_proof",
-        parent_tick_id: str = "autopilot-proof",
-    ) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(
-            config=config,
-            usage_ledger=usage_ledger,
-            source=source,
-            parent_tick_id=parent_tick_id,
+            **kwargs,
         )
         self.bars_report = SimpleNamespace(build_report=self._bars_report)
         self.replay_runner = SimpleNamespace(run=self._replay_run)

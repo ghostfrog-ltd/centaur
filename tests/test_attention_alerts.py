@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import unittest
 
 from app.framework.reporting.promotion_gate import PromotionGateReport
+from app.framework.reporting.attention_alerts_reconcile import (
+    AttentionAlertsReconcileReport,
+)
 from app.framework.runtime.attention_alerts import (
     approval_request_id,
     build_event_id,
@@ -19,10 +22,13 @@ class _AlertLedger:
         self.alerts: dict[str, dict[str, object]] = {}
         self.notification_events: list[dict[str, object]] = []
         self.resolve_calls: list[dict[str, object]] = []
+        self.promotions: dict[tuple[str, str], dict[str, object]] = {}
 
     def upsert_attention_alert(self, *, alert: dict[str, object]) -> None:
         existing = self.alerts.get(alert["event_id"], {})
-        self.alerts[alert["event_id"]] = {**existing, **alert}
+        normalized = {**existing, **alert}
+        normalized["evidence_summary_json"] = dict(alert.get("evidence_summary", {}) or {})
+        self.alerts[alert["event_id"]] = normalized
 
     def get_attention_alert(self, *, event_id: str):
         return self.alerts.get(event_id)
@@ -38,6 +44,14 @@ class _AlertLedger:
             ):
                 rows.append(alert)
         return rows
+
+    def list_open_attention_alerts(self, *, limit: int = 200):
+        rows = [
+            alert
+            for alert in self.alerts.values()
+            if str(alert.get("attention_status", "")) == "open"
+        ]
+        return rows[:limit]
 
     def mark_attention_alert_sent(
         self,
@@ -87,19 +101,45 @@ class _AlertLedger:
             }
         )
 
+    def resolve_attention_alert(
+        self,
+        *,
+        event_id: str,
+        status: str,
+        reason: str,
+    ) -> None:
+        self.resolve_calls.append(
+            {
+                "event_id": event_id,
+                "status": status,
+                "reason": reason,
+            }
+        )
+        alert = self.alerts.get(event_id)
+        if alert is not None:
+            alert["attention_status"] = status
+            alert["resolved_reason"] = reason
+            alert["next_slack_due_at"] = None
+
     def get_strategy_promotion(self, *, strategy_id: str, profile_id: str):
-        return {
-            "strategy_id": strategy_id,
-            "profile_id": profile_id,
-            "stage": "paper_candidate",
-            "paper_approved": 0,
-            "live_approved": 0,
-            "paper_execution_profile": 0,
-            "research_only_profile": 1,
-            "max_paper_notional_usd": 0.0,
-            "max_open_trades": 0,
-            "cooldown_minutes": 0,
-        }
+        return self.promotions.get(
+            (strategy_id, profile_id),
+            {
+                "strategy_id": strategy_id,
+                "profile_id": profile_id,
+                "stage": "paper_candidate",
+                "paper_approved": 0,
+                "live_approved": 0,
+                "paper_execution_profile": 0,
+                "research_only_profile": 1,
+                "max_paper_notional_usd": 0.0,
+                "max_open_trades": 0,
+                "cooldown_minutes": 0,
+            },
+        )
+
+    def list_strategy_promotions(self):
+        return list(self.promotions.values())
 
     def approve_strategy_for_paper(self, **_kwargs) -> None:
         return None
@@ -320,7 +360,11 @@ class AttentionAlertTests(unittest.TestCase):
             profile_id="p",
             parameters={},
         )
-        reporter.evaluate = lambda **_kwargs: {"recommendation": "paper_sim_candidate", "blocker_reasons": []}
+        reporter.evaluate = lambda **_kwargs: {
+            "current_stage": "paper_candidate",
+            "recommendation": "paper_sim_candidate",
+            "blocker_reasons": [],
+        }
         reporter.approve_paper(
             strategy_id="s",
             profile_id="p",
@@ -340,6 +384,11 @@ class AttentionAlertTests(unittest.TestCase):
     def test_runtime_sync_creates_attention_alerts_only_for_manual_gates(self) -> None:
         ledger = _AlertLedger()
         now = datetime.now().astimezone()
+        ledger.promotions[("s", "p")] = {
+            "strategy_id": "s",
+            "profile_id": "p",
+            "stage": "paper_candidate",
+        }
         context = SimpleNamespace(
             tick_id="t-sync",
             started_at=now,
@@ -358,6 +407,9 @@ class AttentionAlertTests(unittest.TestCase):
                 "live_risk_cfo": {
                     "reason": "live_execution_disabled",
                     "watch_candidates": 1,
+                    "rejected_candidates": [
+                        {"strategy_id": "s", "profile_id": "p", "reason": "live_execution_disabled"}
+                    ],
                 },
             },
         )
@@ -374,7 +426,11 @@ class AttentionAlertTests(unittest.TestCase):
             ledger.alerts,
         )
         self.assertIn(
-            build_event_id(event_type="live_execution_requested_while_disabled"),
+            build_event_id(
+                event_type="live_execution_requested_while_disabled",
+                strategy_id="s",
+                profile_id="p",
+            ),
             ledger.alerts,
         )
 
@@ -390,6 +446,263 @@ class AttentionAlertTests(unittest.TestCase):
         )
         quiet_alerts = support._sync_attention_alerts(quiet_context)
         self.assertEqual(quiet_alerts, [])
+
+    def test_runtime_sync_uses_profile_id_in_broker_paper_alert(self) -> None:
+        ledger = _AlertLedger()
+        now = datetime.now().astimezone()
+        ledger.promotions[("s", "p")] = {
+            "strategy_id": "s",
+            "profile_id": "p",
+            "stage": "paper_candidate",
+        }
+        context = SimpleNamespace(
+            tick_id="t-profile",
+            started_at=now,
+            config=SimpleNamespace(),
+            usage_ledger=ledger,
+            state={
+                "risk_cfo": {
+                    "rejected_candidates": [
+                        {"strategy_id": "s", "profile_id": "p", "reason": "paper_promotion_required"}
+                    ]
+                },
+                "live_risk_cfo": {},
+            },
+        )
+        support._sync_attention_alerts(context)
+        event_id = build_event_id(
+            event_type="paper_approval_missing",
+            strategy_id="s",
+            profile_id="p",
+            approval_id=approval_request_id(strategy_id="s", profile_id="p"),
+        )
+        alert = ledger.alerts[event_id]
+        self.assertEqual(alert["profile_id"], "p")
+        self.assertIn("--profile-id p", alert["evidence_summary_json"]["approval_command"])
+
+    def test_runtime_sync_missing_profile_id_creates_diagnostic_alert_only(self) -> None:
+        ledger = _AlertLedger()
+        now = datetime.now().astimezone()
+        context = SimpleNamespace(
+            tick_id="t-invalid",
+            started_at=now,
+            config=SimpleNamespace(),
+            usage_ledger=ledger,
+            state={
+                "risk_cfo": {
+                    "rejected_candidates": [
+                        {"strategy_id": "s", "reason": "paper_promotion_required"}
+                    ]
+                },
+                "live_risk_cfo": {},
+            },
+        )
+        support._sync_attention_alerts(context)
+        diagnostic_id = build_event_id(event_type="paper_approval_invalid", strategy_id="s")
+        self.assertIn(diagnostic_id, ledger.alerts)
+        diagnostic = ledger.alerts[diagnostic_id]
+        self.assertEqual(diagnostic["event_type"], "paper_approval_invalid")
+        self.assertNotIn("approval_command", diagnostic["evidence_summary_json"])
+        self.assertFalse(
+            any(
+                str(alert.get("event_type", "")) == "paper_approval_missing"
+                for alert in ledger.alerts.values()
+            )
+        )
+
+    def test_runtime_sync_live_disabled_without_identity_creates_diagnostic_alert(self) -> None:
+        ledger = _AlertLedger()
+        now = datetime.now().astimezone()
+        context = SimpleNamespace(
+            tick_id="t-live-invalid",
+            started_at=now,
+            config=SimpleNamespace(),
+            usage_ledger=ledger,
+            state={
+                "risk_cfo": {"rejected_candidates": []},
+                "live_risk_cfo": {
+                    "reason": "live_execution_disabled",
+                    "watch_candidates": 1,
+                    "rejected_candidates": [],
+                },
+            },
+        )
+        support._sync_attention_alerts(context)
+        diagnostic_id = build_event_id(event_type="live_execution_requested_while_disabled_invalid")
+        self.assertIn(diagnostic_id, ledger.alerts)
+        self.assertFalse(
+            any(
+                str(alert.get("event_type", "")) == "live_execution_requested_while_disabled"
+                and str(alert.get("attention_status", "")) == "open"
+                for alert in ledger.alerts.values()
+            )
+        )
+
+    def test_stale_paper_approval_alert_resolves_when_promotion_returns_to_research_only(self) -> None:
+        ledger = _AlertLedger()
+        now = datetime.now().astimezone()
+        event_id = build_event_id(
+            event_type="paper_approval_missing",
+            strategy_id="s",
+            profile_id="p",
+            approval_id=approval_request_id(strategy_id="s", profile_id="p"),
+        )
+        create_attention_alert(
+            usage_ledger=ledger,
+            now=now,
+            event_id=event_id,
+            severity="warning",
+            event_type="paper_approval_missing",
+            title="Broker paper blocked by missing manual approval",
+            message="Still blocked.",
+            evidence_summary={"stage": "paper_candidate"},
+            recommended_action="Approve or reject.",
+            requires_attention=True,
+            strategy_id="s",
+            profile_id="p",
+            approval_request_id_value=approval_request_id(strategy_id="s", profile_id="p"),
+        )
+        ledger.promotions[("s", "p")] = {
+            "strategy_id": "s",
+            "profile_id": "p",
+            "stage": "research_only",
+        }
+        context = SimpleNamespace(
+            tick_id="t-stale",
+            started_at=now,
+            config=SimpleNamespace(),
+            usage_ledger=ledger,
+            state={"risk_cfo": {"rejected_candidates": []}, "live_risk_cfo": {}},
+        )
+        alerts = support._sync_attention_alerts(context)
+        self.assertEqual(alerts, [])
+        self.assertEqual(ledger.alerts[event_id]["attention_status"], "resolved")
+        self.assertIn("stale_paper_approval_alert_current_stage=research_only", ledger.alerts[event_id]["resolved_reason"])
+
+    def test_runtime_sync_opens_approval_alert_only_when_promotion_is_current_paper_candidate(self) -> None:
+        ledger = _AlertLedger()
+        now = datetime.now().astimezone()
+        ledger.promotions[("s", "p")] = {
+            "strategy_id": "s",
+            "profile_id": "p",
+            "stage": "research_only",
+        }
+        context = SimpleNamespace(
+            tick_id="t-current-state",
+            started_at=now,
+            config=SimpleNamespace(),
+            usage_ledger=ledger,
+            state={
+                "risk_cfo": {
+                    "rejected_candidates": [
+                        {"strategy_id": "s", "profile_id": "p", "reason": "paper_promotion_required"}
+                    ]
+                },
+                "live_risk_cfo": {},
+            },
+        )
+        alerts = support._sync_attention_alerts(context)
+        self.assertEqual(alerts, [])
+        self.assertFalse(
+            any(
+                str(alert.get("event_type", "")) == "paper_approval_missing"
+                and str(alert.get("attention_status", "")) == "open"
+                for alert in ledger.alerts.values()
+            )
+        )
+
+    def test_reconcile_resolves_blank_profile_approval_related_alerts(self) -> None:
+        ledger = _AlertLedger()
+        now = datetime.now().astimezone()
+        create_attention_alert(
+            usage_ledger=ledger,
+            now=now,
+            event_id=build_event_id(event_type="paper_approval_missing", strategy_id="s"),
+            severity="warning",
+            event_type="paper_approval_missing",
+            title="Missing approval",
+            message="Profile missing.",
+            evidence_summary={},
+            recommended_action="Review.",
+            requires_attention=True,
+            strategy_id="s",
+            profile_id="",
+        )
+        create_attention_alert(
+            usage_ledger=ledger,
+            now=now,
+            event_id=build_event_id(event_type="live_execution_requested_while_disabled"),
+            severity="critical",
+            event_type="live_execution_requested_while_disabled",
+            title="Live disabled",
+            message="No profile.",
+            evidence_summary={},
+            recommended_action="Review.",
+            requires_attention=True,
+        )
+        ledger.promotions[("s", "balanced")] = {
+            "strategy_id": "s",
+            "profile_id": "balanced",
+            "stage": "research_only",
+        }
+
+        report = AttentionAlertsReconcileReport(
+            config=SimpleNamespace(),
+            usage_ledger=ledger,
+        ).reconcile()
+
+        self.assertEqual(report["open_blank_profile_approval_related_alerts_before"], 2)
+        self.assertEqual(report["open_blank_profile_approval_related_alerts_after"], 0)
+        self.assertFalse(
+            any(
+                str(alert.get("event_type", "")) in {
+                    "paper_approval_missing",
+                    "paper_candidate",
+                    "live_execution_requested_while_disabled",
+                }
+                and not str(alert.get("profile_id", "") or "").strip()
+                and str(alert.get("attention_status", "")) == "open"
+                for alert in ledger.alerts.values()
+            )
+        )
+
+    def test_reconcile_resolves_research_only_paper_approval_alert(self) -> None:
+        ledger = _AlertLedger()
+        now = datetime.now().astimezone()
+        event_id = build_event_id(
+            event_type="paper_approval_missing",
+            strategy_id="s",
+            profile_id="balanced",
+            approval_id=approval_request_id(strategy_id="s", profile_id="balanced"),
+        )
+        create_attention_alert(
+            usage_ledger=ledger,
+            now=now,
+            event_id=event_id,
+            severity="warning",
+            event_type="paper_approval_missing",
+            title="Missing approval",
+            message="Still open.",
+            evidence_summary={},
+            recommended_action="Review.",
+            requires_attention=True,
+            strategy_id="s",
+            profile_id="balanced",
+            approval_request_id_value=approval_request_id(strategy_id="s", profile_id="balanced"),
+        )
+        ledger.promotions[("s", "balanced")] = {
+            "strategy_id": "s",
+            "profile_id": "balanced",
+            "stage": "research_only",
+        }
+
+        AttentionAlertsReconcileReport(
+            config=SimpleNamespace(),
+            usage_ledger=ledger,
+        ).reconcile()
+
+        self.assertEqual(ledger.alerts[event_id]["attention_status"], "resolved")
+        self.assertIn("reconciled_non_actionable_stage_research_only", ledger.alerts[event_id]["resolved_reason"])
 
 
 if __name__ == "__main__":

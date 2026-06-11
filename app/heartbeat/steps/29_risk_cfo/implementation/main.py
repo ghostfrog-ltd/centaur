@@ -11,6 +11,7 @@ from app.heartbeat.support import (
     _build_paper_trade_approval,
     _earned_slot_policy,
     _orders_state_key_for_broker,
+    _paper_canary_active,
     _paper_lane_position_state,
     _paper_protection_state_key_for_broker,
     _slot_size_native_for_broker,
@@ -47,6 +48,7 @@ def run_implementation(context: TickContext) -> PipelineResult:
     reason = "paper_execution_disabled"
     rejected: list[dict[str, Any]] = []
     approved: list[dict[str, Any]] = []
+    canary_active = _paper_canary_active(context)
 
     if config.paper_execution_kill_switch:
         reason = "paper_kill_switch_on"
@@ -87,6 +89,8 @@ def run_implementation(context: TickContext) -> PipelineResult:
                 slot_size_usd=_slot_size_native_for_broker(context, broker_id),
             )
             effective_max_positions = int(slot_policy["effective_max_open_positions"])
+            if canary_active and broker_id == "alpaca_paper":
+                effective_max_positions = 1
             available_slots = max(0, effective_max_positions - occupied_slots)
             total_available_slots += available_slots
             protection_state = context.state.get(
@@ -269,4 +273,12 @@ def run_implementation(context: TickContext) -> PipelineResult:
         "approved_order_requests": approved,
         "rejected_candidates": rejected,
     }
+    if canary_active:
+        updater = getattr(context.usage_ledger, "update_paper_canary_state", None)
+        if callable(updater):
+            updater(
+                updated_at=context.started_at,
+                last_signal_at=context.started_at,
+                rejection_reason=str(rejected[0]["reason"]) if rejected else "",
+            )
     return result

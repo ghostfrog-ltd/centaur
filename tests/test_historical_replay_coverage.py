@@ -100,6 +100,62 @@ class HistoricalReplayCoverageReportTests(unittest.TestCase):
 
         self.assertIn("latest_valid_replay_window_end=2026-05-29T09:45:00+00:00", rendered)
         self.assertIn("window_anchor_mode=latest_historical_bar_minus_future_horizon", rendered)
+        self.assertIn("ingestion_ran_this_cycle=no", rendered)
+        self.assertIn("pre_replay_refresh_enabled=no", rendered)
+        self.assertIn("pre_replay_refresh_ran=no", rendered)
+        self.assertIn("pre_replay_refresh_mode=disabled", rendered)
+        self.assertIn(
+            "pre_replay_refresh_safety_guard=historical_backfill_only_no_orders_no_auto_approvals",
+            rendered,
+        )
+        self.assertIn("bars_inserted_this_cycle=0", rendered)
+        self.assertIn("bars_updated_this_cycle=0", rendered)
+        self.assertIn("latest_bar_before_ingestion=2026-06-05T09:45:00+00:00", rendered)
+        self.assertIn("latest_bar_after_ingestion=2026-06-05T09:45:00+00:00", rendered)
+        self.assertIn("refresh_attempted_symbols=equity=-;crypto=-", rendered)
+        self.assertIn("provider_error_count=0", rendered)
+        self.assertIn("replay_windows_selected_from_latest_available_data=no", rendered)
+        self.assertIn(
+            "reason_latest_bars_not_used_for_replay=latest_available_bar_not_used_because_future_checkpoint_completeness_requires_older_anchor",
+            rendered,
+        )
+        self.assertIn(
+            "latest_available_bar_per_asset_class=crypto:2026-06-05T09:45:00+00:00",
+            rendered,
+        )
+        self.assertIn(
+            "selected_replay_window_reason=ok",
+            rendered,
+        )
+        self.assertIn("latest_raw_bar_at=2026-06-05T09:45:00+00:00", rendered)
+        self.assertIn("max_future_outcome_horizon=7d0h0m0s", rendered)
+        self.assertIn("latest_replay_eligible_bar_at=2026-05-29T09:45:00+00:00", rendered)
+        self.assertIn("global_anchor_enabled=no", rendered)
+        self.assertIn("freshness_lost_to_future_outcome_horizon=7d0h0m0s", rendered)
+        self.assertIn(
+            "selected_replay_window_end_by_timeframe=15Min:2026-05-29T09:45:00+00:00",
+            rendered,
+        )
+        self.assertIn(
+            "selected_replay_window_end_by_asset_class=crypto:2026-05-29T09:45:00+00:00",
+            rendered,
+        )
+        self.assertIn(
+            "selected_replay_window_end_by_bucket=global/15Min:2026-05-29T09:45:00+00:00",
+            rendered,
+        )
+        self.assertIn(
+            "selected_anchor_time_by_bucket=global/15Min:2026-05-29T09:45:00+00:00",
+            rendered,
+        )
+        self.assertIn("replay_selection_mode=global", rendered)
+        self.assertIn("alternative_replay_selection_modes_available=yes", rendered)
+        self.assertIn(
+            "asset_class_window_policy=single_global_anchor_across_requested_symbol_universe",
+            rendered,
+        )
+        self.assertIn("asset_class_freshness_status=asset_class=crypto", rendered)
+        self.assertIn("asset_class_freshness_status=asset_class=equity", rendered)
         self.assertIn("replay_window_candidates_accepted=4", rendered)
 
     def test_render_includes_rejected_replay_window_reason(self) -> None:

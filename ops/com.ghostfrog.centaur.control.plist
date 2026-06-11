@@ -13,6 +13,18 @@
     <key>WorkingDirectory</key>
     <string>/Volumes/Bob/www/ghostfrog-centaur</string>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PRE_REPLAY_HISTORICAL_REFRESH_ENABLED</key>
+        <string>true</string>
+        <key>PRE_REPLAY_HISTORICAL_REFRESH_DRY_RUN</key>
+        <string>false</string>
+        <key>REPLAY_WINDOW_SELECTION_MODE</key>
+        <string>asset_class_and_timeframe</string>
+        <key>ROLLING_REPLAY_CURSOR_ENABLED</key>
+        <string>true</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
 

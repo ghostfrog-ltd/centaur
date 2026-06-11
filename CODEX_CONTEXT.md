@@ -43,6 +43,7 @@ Purpose: compact read-first truth for safe work. Load history only when needed.
 - Paper/live admission is fitness-only on the fast execution path. Raw score remains ranking/reporting/shadow evidence only.
 - Broker paper execution now requires a persisted manual promotion record at `paper_approved`; replay/paper-sim evidence may recommend but must not auto-enable paper trading.
 - `main.py --research-cycle` now runs replay-only research, persists per-strategy/profile backtest evidence decisions, and updates promotion summaries without approving broker paper or live trading.
+- `main.py --research-autopilot` now parks same-run `deprioritise_until_new_data` candidates, passes those run-scoped parked keys back into the portfolio planner so the same candidate is excluded for the rest of the run, replans for alternatives, and can execute allowlisted research-only runtime-prep commands such as replay dataset precompute steps when the planner surfaces or infers an exact safe command. If a candidate already completed precompute but still has weak post-precompute evidence, autopilot must park that candidate for the run and replan instead of re-emitting the same precompute action; operator-facing summaries now include explicit precompute-command mapping diagnostics.
 - When `RESEARCH_CYCLE_ENABLED=true`, the supervised heartbeat can trigger the same safe research-cycle autonomously from the control step; this remains replay-only and must not place broker paper or live orders.
 - Shadow-only research profiles must stay out of paper/live allowlists unless explicitly approved.
 - `crypto_pullback.downside_reversal_watch` is a paper-research/watch-only crypto pullback profile. It emits non-executable `pullback_watch` proposals for diagnostics/evidence and must not be live-approved.
@@ -67,6 +68,8 @@ Purpose: compact read-first truth for safe work. Load history only when needed.
 - `.venv-mac/bin/python main.py --real-learning-proof --run-fresh`
 - `.venv-mac/bin/python main.py --evidence-report`
 - `.venv-mac/bin/python main.py --strategy-health --strategy-id <strategy>`
+- `.venv-mac/bin/python main.py --strategy-research-planner --base-strategy <strategy>`
+- `.venv-mac/bin/python main.py --paper-candidate-decision-report`
 - `.venv-mac/bin/python main.py --proposal-pipeline-diagnostics`
 - `.venv-mac/bin/python main.py --promotion-status`
 - `.venv-mac/bin/python main.py --promotion-evaluate --strategy-id <strategy> --profile-id <profile>`

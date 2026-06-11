@@ -193,6 +193,43 @@ class TestMonitorTests(unittest.TestCase):
             check_error="PostgreSQL operations store is unavailable; check DATABASE_URL/POSTGRES_* settings.",
         )
 
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.checks["scheduler_freshness"]["status"], "skipped")
+
+    def test_scheduler_preflight_skip_does_not_fail_monitor(self) -> None:
+        result = append_scheduler_freshness_check(
+            result=TestRunResult(
+                exit_code=0,
+                output="unit tests OK",
+                duration_seconds=1.0,
+                checks={"unit_tests": {"status": "pass", "summary": "Unit tests passed."}},
+            ),
+            config=self._config(),
+            latest_tick=None,
+            now=self._now(),
+            check_error="RuntimeError: PostgreSQL operations store is required but unavailable; canceling statement due to lock timeout.",
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.checks["operations_store"]["status"], "fail")
+        self.assertEqual(result.checks["scheduler_freshness"]["status"], "skipped")
+        self.assertIn("SKIPPED: operations store preflight failed", result.output)
+
+    def test_failed_unit_suite_still_alerts_even_when_store_is_unavailable(self) -> None:
+        now = self._now()
+        result = append_scheduler_freshness_check(
+            result=TestRunResult(
+                exit_code=1,
+                output="FAILED test_strategy_registry",
+                duration_seconds=1.0,
+                checks={"unit_tests": {"status": "fail", "summary": "Unit tests failed with exit=1."}},
+            ),
+            config=self._config(),
+            latest_tick=None,
+            now=now,
+            check_error="PostgreSQL operations store is unavailable; check DATABASE_URL/POSTGRES_* settings.",
+        )
+
         state, alerts = plan_state_update(
             previous_state={},
             result=result,
@@ -202,11 +239,8 @@ class TestMonitorTests(unittest.TestCase):
 
         self.assertEqual(state["last_status"], "failed")
         self.assertEqual(len(alerts), 1)
-        self.assertIn(
-            "Tests passed, but scheduler freshness check failed because PostgreSQL operations store is unavailable.",
-            alerts[0].text,
-        )
-        self.assertNotIn("Centaur test monitor failed", alerts[0].text)
+        self.assertIn("Centaur test monitor failed", alerts[0].text)
+        self.assertIn("Unit tests: Unit tests failed with exit=1.", alerts[0].text)
 
     def _failed_result(self, output: str) -> TestRunResult:
         return TestRunResult(exit_code=1, output=output, duration_seconds=0.5)

@@ -349,6 +349,9 @@ def run_implementation(context: TickContext) -> PipelineResult:
                     "refreshed_exit_order_id": exit_request.get(
                         "refreshed_exit_order_id", ""
                     ),
+                    "paper_canary": bool(exit_request.get("paper_canary")),
+                    "execution_mode": str(exit_request.get("execution_mode", "paper")),
+                    "mode": str(exit_request.get("mode", "paper")),
                 }
             )
         elif routed.error:

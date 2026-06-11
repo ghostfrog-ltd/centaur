@@ -73,7 +73,13 @@ def main() -> int:
                     runtime_config=runtime_config
                 )
                 if store_ok:
-                    latest_tick = UsageLedger(config=runtime_config).get_latest_tick_run()
+                    latest_tick = UsageLedger(
+                        config=runtime_config,
+                        read_only=True,
+                        skip_schema_bootstrap=True,
+                        query_timeout_ms=15_000,
+                        lock_timeout_ms=5_000,
+                    ).get_latest_tick_run()
                 else:
                     scheduler_check_error = store_message
             except Exception as exc:

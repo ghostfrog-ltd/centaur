@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from time import monotonic
+from time import sleep
 from typing import Any
 
 from app.framework.core.instruments import default_instrument_registry
@@ -35,17 +39,33 @@ class UsageLedger:
     closed instead of silently rerouting live monitoring or control ticks.
     """
 
-    def __init__(self, *, config: RuntimeConfig) -> None:
+    def __init__(
+        self,
+        *,
+        config: RuntimeConfig,
+        read_only: bool = False,
+        skip_schema_bootstrap: bool = False,
+        query_timeout_ms: int | None = None,
+        lock_timeout_ms: int | None = None,
+    ) -> None:
         self.config = config
         self.db_path = config.usage_ledger_db_path
         self.instrument_registry = default_instrument_registry()
         self.backend = "sqlite"
         self.backend_detail = str(self.db_path)
         self.fallback_reason: str | None = None
+        self.read_only = bool(read_only)
+        self.skip_schema_bootstrap = bool(skip_schema_bootstrap)
+        self.query_timeout_ms = query_timeout_ms
+        self.lock_timeout_ms = lock_timeout_ms
+        self.bootstrap_lock_timeout_ms = max(1, int(lock_timeout_ms or 5_000))
 
         if self._should_try_postgres():
             try:
-                self._ensure_postgres_schema()
+                if self.skip_schema_bootstrap:
+                    self._verify_postgres_startup_without_bootstrap()
+                else:
+                    self._ensure_postgres_schema()
                 self.backend = "postgres"
                 self.backend_detail = (
                     f"postgres:{self.config.database_url_source or 'configured'}"
@@ -1229,6 +1249,8 @@ class UsageLedger:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         symbols: list[str] | None = None,
+        limit: int | None = None,
+        per_symbol_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if self.backend == "postgres":
             rows = self._list_historical_bars_postgres(
@@ -1237,6 +1259,8 @@ class UsageLedger:
                 start_at=start_at,
                 end_at=end_at,
                 symbols=symbols or [],
+                limit=limit,
+                per_symbol_limit=per_symbol_limit,
             )
         else:
             rows = self._list_historical_bars_sqlite(
@@ -1245,6 +1269,8 @@ class UsageLedger:
                 start_at=start_at,
                 end_at=end_at,
                 symbols=symbols or [],
+                limit=limit,
+                per_symbol_limit=per_symbol_limit,
             )
 
         normalized_rows: list[dict[str, Any]] = []
@@ -1273,6 +1299,36 @@ class UsageLedger:
         return self._summarize_historical_bars_sqlite(
             as_of=as_of or datetime.now().astimezone()
         )
+
+    def summarize_historical_bar_coverage(
+        self,
+        *,
+        asset_class: str | None = None,
+        symbols: list[str] | None = None,
+        timeframes: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._summarize_historical_bar_coverage_postgres(
+                asset_class=asset_class,
+                symbols=symbols or [],
+                timeframes=timeframes or [],
+            )
+        else:
+            rows = self._summarize_historical_bar_coverage_sqlite(
+                asset_class=asset_class,
+                symbols=symbols or [],
+                timeframes=timeframes or [],
+            )
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized = dict(row)
+            for key in ("earliest_bar_timestamp", "latest_bar_timestamp"):
+                if key in normalized:
+                    normalized[key] = self._normalize_db_datetime_value(normalized[key])
+            normalized["sources"] = [str(item) for item in list(normalized.get("sources", []) or []) if str(item or "").strip()]
+            normalized["venues"] = [str(item) for item in list(normalized.get("venues", []) or []) if str(item or "").strip()]
+            normalized_rows.append(normalized)
+        return normalized_rows
 
     def get_previous_bars(
         self,
@@ -1477,6 +1533,96 @@ class UsageLedger:
             rows = self._list_strategy_promotions_sqlite()
         return self._normalize_strategy_promotion_rows(rows)
 
+    def get_paper_canary_state(self) -> dict[str, Any] | None:
+        if self.backend == "postgres":
+            row = self._get_paper_canary_state_postgres()
+        else:
+            row = self._get_paper_canary_state_sqlite()
+        if row is None:
+            return None
+        return self._normalize_paper_canary_state_row(row)
+
+    def activate_paper_canary(
+        self,
+        *,
+        started_at: datetime,
+        strategy_id: str,
+        profile_id: str,
+        timeframe: str,
+        operator_override: str,
+        broker_id: str,
+        execution_mode: str,
+    ) -> None:
+        row = {
+            "state_id": "current",
+            "active": 1,
+            "started_at": started_at.isoformat(),
+            "updated_at": started_at.isoformat(),
+            "strategy_id": str(strategy_id or "").strip(),
+            "profile_id": str(profile_id or "").strip(),
+            "timeframe": str(timeframe or "").strip(),
+            "operator_override": str(operator_override or "").strip(),
+            "broker_id": str(broker_id or "").strip().lower(),
+            "execution_mode": str(execution_mode or "").strip().lower(),
+            "last_signal_at": None,
+            "last_entry_at": None,
+            "last_rejection_at": None,
+            "last_rejection_reason": "",
+            "recent_rejection_reasons_json": self._to_json([]),
+        }
+        self._upsert_paper_canary_state(row=row)
+
+    def update_paper_canary_state(
+        self,
+        *,
+        updated_at: datetime,
+        last_signal_at: datetime | None = None,
+        last_entry_at: datetime | None = None,
+        rejection_reason: str = "",
+    ) -> None:
+        current = self.get_paper_canary_state() or {}
+        if not current:
+            return
+        recent_rejections = list(current.get("recent_rejection_reasons", []) or [])
+        normalized_reason = str(rejection_reason or "").strip()
+        if normalized_reason:
+            recent_rejections.append(normalized_reason)
+            recent_rejections = recent_rejections[-5:]
+        row = {
+            "state_id": "current",
+            "active": 1 if bool(current.get("active")) else 0,
+            "started_at": (
+                current.get("started_at").isoformat()
+                if isinstance(current.get("started_at"), datetime)
+                else current.get("started_at")
+            ),
+            "updated_at": updated_at.isoformat(),
+            "strategy_id": str(current.get("strategy_id", "") or ""),
+            "profile_id": str(current.get("profile_id", "") or ""),
+            "timeframe": str(current.get("timeframe", "") or ""),
+            "operator_override": str(current.get("operator_override", "") or ""),
+            "broker_id": str(current.get("broker_id", "") or ""),
+            "execution_mode": str(current.get("execution_mode", "") or ""),
+            "last_signal_at": last_signal_at.isoformat() if last_signal_at is not None else (
+                current.get("last_signal_at").isoformat()
+                if isinstance(current.get("last_signal_at"), datetime)
+                else current.get("last_signal_at")
+            ),
+            "last_entry_at": last_entry_at.isoformat() if last_entry_at is not None else (
+                current.get("last_entry_at").isoformat()
+                if isinstance(current.get("last_entry_at"), datetime)
+                else current.get("last_entry_at")
+            ),
+            "last_rejection_at": updated_at.isoformat() if normalized_reason else (
+                current.get("last_rejection_at").isoformat()
+                if isinstance(current.get("last_rejection_at"), datetime)
+                else current.get("last_rejection_at")
+            ),
+            "last_rejection_reason": normalized_reason or str(current.get("last_rejection_reason", "") or ""),
+            "recent_rejection_reasons_json": self._to_json(recent_rejections),
+        }
+        self._upsert_paper_canary_state(row=row)
+
     def get_strategy_promotion(
         self,
         *,
@@ -1640,11 +1786,38 @@ class UsageLedger:
             normalized_rows.append(normalized)
         return normalized_rows
 
+    def _normalize_paper_canary_state_row(
+        self,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(row)
+        for key in (
+            "started_at",
+            "updated_at",
+            "last_signal_at",
+            "last_entry_at",
+            "last_rejection_at",
+        ):
+            if key in normalized:
+                normalized[key] = self._normalize_db_datetime_value(normalized[key])
+        normalized["active"] = bool(normalized.get("active"))
+        normalized["recent_rejection_reasons"] = self._from_json(
+            normalized.get("recent_rejection_reasons_json"),
+            default=[],
+        )
+        return normalized
+
     def _upsert_strategy_promotion(self, *, row: dict[str, Any]) -> None:
         if self.backend == "postgres":
             self._upsert_strategy_promotion_postgres(row=row)
         else:
             self._upsert_strategy_promotion_sqlite(row=row)
+
+    def _upsert_paper_canary_state(self, *, row: dict[str, Any]) -> None:
+        if self.backend == "postgres":
+            self._upsert_paper_canary_state_postgres(row=row)
+        else:
+            self._upsert_paper_canary_state_sqlite(row=row)
 
     def record_research_cycle_decisions(
         self,
@@ -1738,6 +1911,157 @@ class UsageLedger:
         else:
             rows = self._list_latest_research_cycle_decisions_sqlite()
         return self._normalize_research_cycle_decision_rows(rows)
+
+    def ensure_strategy_variant_definition(
+        self,
+        *,
+        variant_id: str,
+        base_strategy_id: str,
+        profile_id: str,
+        timeframe: str,
+        params: dict[str, Any],
+        created_at: datetime,
+        created_by: str,
+        generation_reason: str,
+        parent_variant_id: str = "",
+        evaluation_status: str = "pending",
+        latest_evaluation_at: datetime | None = None,
+        notes: str = "",
+    ) -> dict[str, Any]:
+        row = {
+            "variant_id": str(variant_id or "").strip(),
+            "base_strategy_id": str(base_strategy_id or "").strip(),
+            "profile_id": str(profile_id or "").strip(),
+            "timeframe": str(timeframe or "").strip(),
+            "params_hash": self._stable_json_hash(params),
+            "params_json": self._to_json(params),
+            "created_at": created_at,
+            "created_by": str(created_by or "").strip(),
+            "generation_reason": str(generation_reason or "").strip(),
+            "parent_variant_id": str(parent_variant_id or "").strip(),
+            "evaluation_status": str(evaluation_status or "pending").strip(),
+            "latest_evaluation_at": latest_evaluation_at,
+            "notes": str(notes or ""),
+        }
+        if self.backend == "postgres":
+            stored = self._ensure_strategy_variant_definition_postgres(row=row)
+        else:
+            stored = self._ensure_strategy_variant_definition_sqlite(row=row)
+        return self._deserialize_strategy_variant_definition_row(stored)
+
+    def update_strategy_variant_definition_status(
+        self,
+        *,
+        variant_id: str,
+        evaluation_status: str,
+        latest_evaluation_at: datetime | None = None,
+        notes: str | None = None,
+    ) -> None:
+        row = {
+            "variant_id": str(variant_id or "").strip(),
+            "evaluation_status": str(evaluation_status or "").strip() or "pending",
+            "latest_evaluation_at": latest_evaluation_at,
+            "notes": notes,
+        }
+        if not row["variant_id"]:
+            return
+        if self.backend == "postgres":
+            self._update_strategy_variant_definition_status_postgres(row=row)
+        else:
+            self._update_strategy_variant_definition_status_sqlite(row=row)
+
+    def list_strategy_variant_definitions(
+        self,
+        *,
+        base_strategy_id: str = "",
+        profile_id: str = "",
+        timeframe: str = "",
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_strategy_variant_definitions_postgres(
+                base_strategy_id=base_strategy_id,
+                profile_id=profile_id,
+                timeframe=timeframe,
+            )
+        else:
+            rows = self._list_strategy_variant_definitions_sqlite(
+                base_strategy_id=base_strategy_id,
+                profile_id=profile_id,
+                timeframe=timeframe,
+            )
+        return [self._deserialize_strategy_variant_definition_row(dict(row)) for row in rows]
+
+    def record_strategy_variant_evaluation(self, **kwargs: Any) -> dict[str, Any]:
+        evaluated_at = kwargs.get("evaluated_at")
+        row = {
+            "evaluation_id": str(kwargs.get("evaluation_id", "") or "").strip(),
+            "variant_id": str(kwargs.get("variant_id", "") or "").strip(),
+            "base_strategy_id": str(kwargs.get("base_strategy_id", "") or "").strip(),
+            "profile_id": str(kwargs.get("profile_id", "") or "").strip(),
+            "timeframe": str(kwargs.get("timeframe", "") or "").strip(),
+            "replay_id": str(kwargs.get("replay_id", "") or "").strip(),
+            "cycle_id": str(kwargs.get("cycle_id", "") or "").strip(),
+            "dataset_id": str(kwargs.get("dataset_id", "") or "").strip(),
+            "asset_class": str(kwargs.get("asset_class", "") or "").strip(),
+            "symbols_tested_json": self._to_json(kwargs.get("symbols_tested", [])),
+            "sample_size": int(kwargs.get("sample_size", 0) or 0),
+            "gross_return": float(kwargs.get("gross_return", 0.0) or 0.0),
+            "net_return_after_costs": float(kwargs.get("net_return_after_costs", 0.0) or 0.0),
+            "fees_cost": float(kwargs.get("fees_cost", 0.0) or 0.0),
+            "spread_cost": float(kwargs.get("spread_cost", 0.0) or 0.0),
+            "slippage_cost": float(kwargs.get("slippage_cost", 0.0) or 0.0),
+            "win_rate": float(kwargs.get("win_rate", 0.0) or 0.0),
+            "drawdown": kwargs.get("drawdown"),
+            "baseline_variant_id": str(kwargs.get("baseline_variant_id", "") or "").strip(),
+            "baseline_strategy_key": str(kwargs.get("baseline_strategy_key", "") or "").strip(),
+            "baseline_net_return_after_costs": float(
+                kwargs.get("baseline_net_return_after_costs", 0.0) or 0.0
+            ),
+            "baseline_win_rate": float(kwargs.get("baseline_win_rate", 0.0) or 0.0),
+            "beats_baseline": 1 if kwargs.get("beats_baseline") else 0,
+            "beats_thresholds": 1 if kwargs.get("beats_thresholds") else 0,
+            "recommended_status": str(kwargs.get("recommended_status", "rejected") or "rejected"),
+            "evaluated_at": evaluated_at,
+            "notes": str(kwargs.get("notes", "") or ""),
+            "raw_json": self._to_json(kwargs.get("raw", kwargs)),
+        }
+        if self.backend == "postgres":
+            self._record_strategy_variant_evaluation_postgres(row=row)
+        else:
+            self._record_strategy_variant_evaluation_sqlite(row=row)
+        self.update_strategy_variant_definition_status(
+            variant_id=row["variant_id"],
+            evaluation_status=row["recommended_status"],
+            latest_evaluation_at=evaluated_at if isinstance(evaluated_at, datetime) else None,
+        )
+        return self._deserialize_strategy_variant_evaluation_row(dict(row))
+
+    def list_strategy_variant_evaluations(
+        self,
+        *,
+        base_strategy_id: str = "",
+        profile_id: str = "",
+        timeframe: str = "",
+        variant_id: str = "",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            rows = self._list_strategy_variant_evaluations_postgres(
+                base_strategy_id=base_strategy_id,
+                profile_id=profile_id,
+                timeframe=timeframe,
+                variant_id=variant_id,
+                limit=limit,
+            )
+        else:
+            rows = self._list_strategy_variant_evaluations_sqlite(
+                base_strategy_id=base_strategy_id,
+                profile_id=profile_id,
+                timeframe=timeframe,
+                variant_id=variant_id,
+                limit=limit,
+            )
+        return [self._deserialize_strategy_variant_evaluation_row(dict(row)) for row in rows]
 
     def upsert_attention_alert(
         self,
@@ -1938,7 +2262,31 @@ class UsageLedger:
         text = str(value or "").strip()
         return text or None
 
+    def _deserialize_strategy_variant_definition_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        for key in ("created_at", "latest_evaluation_at"):
+            if key in normalized:
+                normalized[key] = self._normalize_db_datetime_value(normalized[key])
+        if "params_json" in normalized:
+            normalized["params_json"] = self._from_json(normalized["params_json"], default={})
+        return normalized
+
+    def _deserialize_strategy_variant_evaluation_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        if "evaluated_at" in normalized:
+            normalized["evaluated_at"] = self._normalize_db_datetime_value(normalized["evaluated_at"])
+        if "symbols_tested_json" in normalized:
+            normalized["symbols_tested"] = self._from_json(
+                normalized["symbols_tested_json"],
+                default=[],
+            )
+        if "raw_json" in normalized:
+            normalized["raw_json"] = self._from_json(normalized["raw_json"], default={})
+        return normalized
+
     def latest_real_heartbeat_research_cycle_summary(self) -> dict[str, Any]:
+        preferred: dict[str, Any] | None = None
+        fallback: dict[str, Any] | None = None
         for row in self.list_recent_tick_runs(limit=200):
             snapshot = row.get("state_snapshot_json", {}) if isinstance(row, dict) else {}
             run = snapshot.get("run", {}) if isinstance(snapshot, dict) else {}
@@ -1947,10 +2295,14 @@ class UsageLedger:
                 str(run.get("pipeline", "") or "") == "research_cycle"
                 and str(run.get("source", "") or "") == "real_heartbeat"
             ):
-                return {
+                built = {
                     "latest_real_heartbeat_tick_id": str(run.get("parent_tick_id", "") or ""),
                     "latest_real_research_cycle_id": str(run.get("research_cycle_id", "") or row.get("tick_id", "")),
                     "source": str(run.get("source", "") or ""),
+                    "cycle_origin": str(run.get("cycle_origin", "") or ""),
+                    "parent_process_mode": str(run.get("parent_process_mode", "") or ""),
+                    "command_source": str(run.get("command_source", "") or ""),
+                    "force_mode": bool(run.get("force_mode")),
                     "latest_real_research_cycle_started_at": self._serialize_datetime(
                         row.get("started_at")
                     )
@@ -1984,7 +2336,12 @@ class UsageLedger:
                     ),
                     "blockers": list(state.get("blockers", []) or []),
                 }
-        return {}
+                if str(run.get("cycle_origin", "") or "") == "launchd_scheduled":
+                    preferred = built
+                    break
+                if fallback is None:
+                    fallback = built
+        return preferred or fallback or {}
 
     def list_recent_broker_account_snapshots(self, *, limit: int = 20) -> list[dict[str, Any]]:
         if self.backend == "postgres":
@@ -2336,17 +2693,23 @@ class UsageLedger:
 
     def _postgres_missing_configuration_reasons(self) -> list[str]:
         reasons: list[str] = []
-        if not str(os.getenv("DATABASE_URL", "") or "").strip():
+        database_url = str(getattr(self.config, "database_url", "") or "").strip()
+        if not database_url:
             reasons.append("DATABASE_URL not set")
-        if not str(os.getenv("POSTGRES_HOST", "") or "").strip():
             reasons.append("POSTGRES_HOST not set")
-        if not str(os.getenv("POSTGRES_PORT", "") or "").strip():
             reasons.append("POSTGRES_PORT not set")
-        if not str(os.getenv("POSTGRES_DB", "") or "").strip():
             reasons.append("POSTGRES_DB not set")
-        if not str(os.getenv("POSTGRES_USER", "") or "").strip():
             reasons.append("POSTGRES_USER not set")
-        if not str(os.getenv("POSTGRES_PASSWORD", "") or "").strip():
+            reasons.append("POSTGRES_PASSWORD not set")
+        elif not str(os.getenv("POSTGRES_HOST", "") or "").strip():
+            reasons.append("POSTGRES_HOST not set")
+        if database_url and not str(os.getenv("POSTGRES_PORT", "") or "").strip():
+            reasons.append("POSTGRES_PORT not set")
+        if database_url and not str(os.getenv("POSTGRES_DB", "") or "").strip():
+            reasons.append("POSTGRES_DB not set")
+        if database_url and not str(os.getenv("POSTGRES_USER", "") or "").strip():
+            reasons.append("POSTGRES_USER not set")
+        if database_url and not str(os.getenv("POSTGRES_PASSWORD", "") or "").strip():
             reasons.append("POSTGRES_PASSWORD not set")
         if not DEFAULT_ENV_PATH.exists():
             reasons.append(f".env not found at {DEFAULT_ENV_PATH}")
@@ -2379,6 +2742,11 @@ class UsageLedger:
             return f"could not resolve host {host}"
         if "timeout expired" in lowered:
             return f"connection timed out to {host}:{port}"
+        if "lock timeout" in lowered:
+            return (
+                "operations store bootstrap lock timed out; "
+                "retry shortly or use the read-only report startup path"
+            )
         if "permission denied" in lowered and "schema" in lowered:
             return "operations tables missing or schema permissions denied"
         if "permission denied" in lowered:
@@ -3813,6 +4181,27 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS paper_canary_state (
+                    state_id TEXT PRIMARY KEY,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL DEFAULT '',
+                    profile_id TEXT NOT NULL DEFAULT '',
+                    timeframe TEXT NOT NULL DEFAULT '',
+                    operator_override TEXT NOT NULL DEFAULT '',
+                    broker_id TEXT NOT NULL DEFAULT 'alpaca_paper',
+                    execution_mode TEXT NOT NULL DEFAULT 'paper_canary',
+                    last_signal_at TEXT,
+                    last_entry_at TEXT,
+                    last_rejection_at TEXT,
+                    last_rejection_reason TEXT NOT NULL DEFAULT '',
+                    recent_rejection_reasons_json TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS research_cycle_decisions (
                     cycle_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -3862,6 +4251,100 @@ class UsageLedger:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS strategy_variant_definitions (
+                    variant_id TEXT PRIMARY KEY,
+                    base_strategy_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    params_hash TEXT NOT NULL,
+                    params_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    created_by TEXT NOT NULL DEFAULT '',
+                    generation_reason TEXT NOT NULL DEFAULT '',
+                    parent_variant_id TEXT NOT NULL DEFAULT '',
+                    evaluation_status TEXT NOT NULL DEFAULT 'pending',
+                    latest_evaluation_at TEXT,
+                    notes TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_variant_definitions_identity
+                ON strategy_variant_definitions (base_strategy_id, profile_id, timeframe, params_hash)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_variant_definitions_status
+                ON strategy_variant_definitions (base_strategy_id, evaluation_status, latest_evaluation_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_variant_evaluations (
+                    evaluation_id TEXT PRIMARY KEY,
+                    variant_id TEXT NOT NULL,
+                    base_strategy_id TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    replay_id TEXT NOT NULL DEFAULT '',
+                    cycle_id TEXT NOT NULL DEFAULT '',
+                    dataset_id TEXT NOT NULL DEFAULT '',
+                    asset_class TEXT NOT NULL DEFAULT '',
+                    symbols_tested_json TEXT NOT NULL DEFAULT '[]',
+                    sample_size INTEGER NOT NULL DEFAULT 0,
+                    gross_return REAL NOT NULL DEFAULT 0,
+                    net_return_after_costs REAL NOT NULL DEFAULT 0,
+                    fees_cost REAL NOT NULL DEFAULT 0,
+                    spread_cost REAL NOT NULL DEFAULT 0,
+                    slippage_cost REAL NOT NULL DEFAULT 0,
+                    win_rate REAL NOT NULL DEFAULT 0,
+                    drawdown REAL,
+                    baseline_variant_id TEXT NOT NULL DEFAULT '',
+                    baseline_strategy_key TEXT NOT NULL DEFAULT '',
+                    baseline_net_return_after_costs REAL NOT NULL DEFAULT 0,
+                    baseline_win_rate REAL NOT NULL DEFAULT 0,
+                    beats_baseline INTEGER NOT NULL DEFAULT 0,
+                    beats_thresholds INTEGER NOT NULL DEFAULT 0,
+                    recommended_status TEXT NOT NULL DEFAULT 'rejected',
+                    evaluated_at TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '',
+                    raw_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_variant_evaluations_variant
+                ON strategy_variant_evaluations (variant_id, evaluated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_variant_evaluations_strategy
+                ON strategy_variant_evaluations (base_strategy_id, profile_id, timeframe, evaluated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS replay_progress_cursors (
+                    bucket TEXT PRIMARY KEY,
+                    last_replayed_until TEXT NOT NULL,
+                    last_selected_window_hash TEXT NOT NULL DEFAULT '',
+                    last_research_cycle_id TEXT NOT NULL DEFAULT '',
+                    last_updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_replay_progress_cursors_updated
+                ON replay_progress_cursors (last_updated_at)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS attention_alerts (
                     event_id TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
@@ -3902,13 +4385,196 @@ class UsageLedger:
             )
 
     def _ensure_postgres_schema(self) -> None:
+        max_attempts = 3
+        backoff_seconds = 0.25
+        for attempt in range(1, max_attempts + 1):
+            self._log_startup_db_diagnostic(
+                startup_phase="postgres_schema_bootstrap",
+                db_operation="ensure_postgres_schema",
+                transaction_boundary="attempt_start",
+                retry_count=attempt - 1,
+                lock_wait_context="pg_advisory_xact_lock(centaur_usage_schema)",
+            )
+            try:
+                self._ensure_postgres_schema_once()
+                self._log_startup_db_diagnostic(
+                    startup_phase="postgres_schema_bootstrap",
+                    db_operation="ensure_postgres_schema",
+                    transaction_boundary="attempt_commit",
+                    retry_count=attempt - 1,
+                    lock_wait_context="pg_advisory_xact_lock(centaur_usage_schema)",
+                )
+                return
+            except Exception as exc:
+                if (
+                    not self._is_postgres_deadlock_error(exc)
+                    or attempt >= max_attempts
+                ):
+                    self._log_startup_db_diagnostic(
+                        startup_phase="postgres_schema_bootstrap",
+                        db_operation="ensure_postgres_schema",
+                        transaction_boundary="attempt_failed",
+                        retry_count=attempt - 1,
+                        lock_wait_context=(
+                            "pg_advisory_xact_lock(centaur_usage_schema)"
+                        ),
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    raise
+                self._log_startup_db_diagnostic(
+                    startup_phase="postgres_schema_bootstrap",
+                    db_operation="ensure_postgres_schema",
+                    transaction_boundary="deadlock_retry_scheduled",
+                    retry_count=attempt,
+                    lock_wait_context="pg_advisory_xact_lock(centaur_usage_schema)",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                sleep(backoff_seconds * attempt)
+
+    def _verify_postgres_read_only_startup(self) -> None:
+        started_at = monotonic()
+        self._log_startup_db_diagnostic(
+            startup_phase="postgres_read_only_startup",
+            db_operation="verify_postgres_read_only_startup",
+            transaction_boundary="attempt_start",
+            retry_count=0,
+            lock_wait_context="-",
+        )
         with self._connect_postgres(apply_schema=False) as connection:
             with connection.cursor() as cursor:
+                cursor.execute("SELECT current_schema()")
+                cursor.fetchone()
+                self._verify_postgres_read_only_schema_access(cursor)
+        self._log_startup_db_diagnostic(
+            startup_phase="postgres_read_only_startup",
+            db_operation="verify_postgres_read_only_startup",
+            transaction_boundary="attempt_commit",
+            retry_count=0,
+            lock_wait_context=f"elapsed_ms={int((monotonic() - started_at) * 1000)}",
+        )
+
+    def _verify_postgres_write_enabled_startup(self) -> None:
+        started_at = monotonic()
+        self._log_startup_db_diagnostic(
+            startup_phase="postgres_write_enabled_startup",
+            db_operation="verify_postgres_write_enabled_startup",
+            transaction_boundary="attempt_start",
+            retry_count=0,
+            lock_wait_context="-",
+        )
+        with self._connect_postgres(apply_schema=False) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT current_schema()")
+                cursor.fetchone()
+                self._verify_postgres_write_enabled_schema_access(cursor)
+        self._log_startup_db_diagnostic(
+            startup_phase="postgres_write_enabled_startup",
+            db_operation="verify_postgres_write_enabled_startup",
+            transaction_boundary="attempt_commit",
+            retry_count=0,
+            lock_wait_context=f"elapsed_ms={int((monotonic() - started_at) * 1000)}",
+        )
+
+    def _verify_postgres_startup_without_bootstrap(self) -> None:
+        if self.read_only:
+            self._verify_postgres_read_only_startup()
+            return
+        self._verify_postgres_write_enabled_startup()
+
+    def _verify_postgres_read_only_schema_access(self, cursor) -> None:
+        required_schemas = sorted(
+            {
+                self._postgres_core_schema_name(),
+                self._postgres_execution_schema_name(),
+            }
+        )
+        cursor.execute(
+            """
+            SELECT schema_name
+            FROM information_schema.schemata
+            WHERE schema_name = ANY(%s)
+            """,
+            (required_schemas,),
+        )
+        available = {
+            str(row[0] or "")
+            for row in cursor.fetchall()
+        }
+        missing = [schema_name for schema_name in required_schemas if schema_name not in available]
+        if missing:
+            detail = ", ".join(missing)
+            raise RuntimeError(
+                "Read-only PostgreSQL report startup requires existing operations schemas; "
+                f"missing schema(s): {detail}. "
+                "Run a write-capable Centaur command to bootstrap the schema before using read-only reports."
+            )
+
+    def _verify_postgres_write_enabled_schema_access(self, cursor) -> None:
+        self._verify_postgres_read_only_schema_access(cursor)
+        required_tables = (
+            "strategy_variant_definitions",
+            "strategy_variant_evaluations",
+            "market_data_historical_bars",
+        )
+        search_path = self._postgres_search_path_schemas(scope="execution")
+        cursor.execute(
+            """
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema = ANY(%s) AND table_name = ANY(%s)
+            """,
+            (search_path, list(required_tables)),
+        )
+        available = {
+            (str(row[0] or ""), str(row[1] or ""))
+            for row in cursor.fetchall()
+        }
+        missing = [
+            table_name
+            for table_name in required_tables
+            if not any(found_table == table_name for _schema_name, found_table in available)
+        ]
+        if missing:
+            detail = ", ".join(missing)
+            raise RuntimeError(
+                "Write-enabled PostgreSQL diagnosis startup requires existing research tables; "
+                f"missing table(s): {detail}. "
+                "Run a write-capable Centaur bootstrap command once, then retry the diagnosis."
+            )
+
+    def _ensure_postgres_schema_once(self) -> None:
+        with self._connect_postgres(apply_schema=False) as connection:
+            with connection.cursor() as cursor:
+                self._log_startup_db_diagnostic(
+                    startup_phase="postgres_schema_bootstrap",
+                    db_operation="ensure_postgres_namespace",
+                    transaction_boundary="transaction_open",
+                    retry_count=0,
+                    lock_wait_context="-",
+                )
                 self._ensure_postgres_namespace(cursor)
                 # Status/report commands can start together; serialize bootstrap DDL
                 # so concurrent CREATE INDEX IF NOT EXISTS calls do not race.
+                self._log_startup_db_diagnostic(
+                    startup_phase="postgres_schema_bootstrap",
+                    db_operation="acquire_schema_bootstrap_lock",
+                    transaction_boundary="before_lock_wait",
+                    retry_count=0,
+                    lock_wait_context="pg_advisory_xact_lock(centaur_usage_schema)",
+                )
+                cursor.execute(
+                    "SET LOCAL lock_timeout = %s",
+                    (f"{int(self.bootstrap_lock_timeout_ms)}ms",),
+                )
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext('centaur_usage_schema'))"
+                )
+                self._log_startup_db_diagnostic(
+                    startup_phase="postgres_schema_bootstrap",
+                    db_operation="schema_bootstrap_ddl",
+                    transaction_boundary="ddl_begin",
+                    retry_count=0,
+                    lock_wait_context="pg_advisory_xact_lock(centaur_usage_schema)",
                 )
                 cursor.execute(
                     """
@@ -5181,6 +5847,27 @@ class UsageLedger:
                 )
                 cursor.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS paper_canary_state (
+                        state_id TEXT PRIMARY KEY,
+                        active INTEGER NOT NULL DEFAULT 0,
+                        started_at TIMESTAMPTZ NULL,
+                        updated_at TIMESTAMPTZ NOT NULL,
+                        strategy_id TEXT NOT NULL DEFAULT '',
+                        profile_id TEXT NOT NULL DEFAULT '',
+                        timeframe TEXT NOT NULL DEFAULT '',
+                        operator_override TEXT NOT NULL DEFAULT '',
+                        broker_id TEXT NOT NULL DEFAULT 'alpaca_paper',
+                        execution_mode TEXT NOT NULL DEFAULT 'paper_canary',
+                        last_signal_at TIMESTAMPTZ NULL,
+                        last_entry_at TIMESTAMPTZ NULL,
+                        last_rejection_at TIMESTAMPTZ NULL,
+                        last_rejection_reason TEXT NOT NULL DEFAULT '',
+                        recent_rejection_reasons_json JSONB NOT NULL DEFAULT '[]'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS research_cycle_decisions (
                         cycle_id TEXT NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL,
@@ -5226,6 +5913,100 @@ class UsageLedger:
                     """
                     CREATE INDEX IF NOT EXISTS idx_research_cycle_decisions_latest
                     ON research_cycle_decisions (created_at DESC, recommendation, strategy_id, profile_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS strategy_variant_definitions (
+                        variant_id TEXT PRIMARY KEY,
+                        base_strategy_id TEXT NOT NULL,
+                        profile_id TEXT NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        params_hash TEXT NOT NULL,
+                        params_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        created_by TEXT NOT NULL DEFAULT '',
+                        generation_reason TEXT NOT NULL DEFAULT '',
+                        parent_variant_id TEXT NOT NULL DEFAULT '',
+                        evaluation_status TEXT NOT NULL DEFAULT 'pending',
+                        latest_evaluation_at TIMESTAMPTZ,
+                        notes TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_variant_definitions_identity
+                    ON strategy_variant_definitions (base_strategy_id, profile_id, timeframe, params_hash)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_variant_definitions_status
+                    ON strategy_variant_definitions (base_strategy_id, evaluation_status, latest_evaluation_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS strategy_variant_evaluations (
+                        evaluation_id TEXT PRIMARY KEY,
+                        variant_id TEXT NOT NULL,
+                        base_strategy_id TEXT NOT NULL,
+                        profile_id TEXT NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        replay_id TEXT NOT NULL DEFAULT '',
+                        cycle_id TEXT NOT NULL DEFAULT '',
+                        dataset_id TEXT NOT NULL DEFAULT '',
+                        asset_class TEXT NOT NULL DEFAULT '',
+                        symbols_tested_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        sample_size INTEGER NOT NULL DEFAULT 0,
+                        gross_return DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        net_return_after_costs DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        fees_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        spread_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        slippage_cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        win_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        drawdown DOUBLE PRECISION,
+                        baseline_variant_id TEXT NOT NULL DEFAULT '',
+                        baseline_strategy_key TEXT NOT NULL DEFAULT '',
+                        baseline_net_return_after_costs DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        baseline_win_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        beats_baseline INTEGER NOT NULL DEFAULT 0,
+                        beats_thresholds INTEGER NOT NULL DEFAULT 0,
+                        recommended_status TEXT NOT NULL DEFAULT 'rejected',
+                        evaluated_at TIMESTAMPTZ NOT NULL,
+                        notes TEXT NOT NULL DEFAULT '',
+                        raw_json JSONB NOT NULL DEFAULT '{}'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_variant_evaluations_variant
+                    ON strategy_variant_evaluations (variant_id, evaluated_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strategy_variant_evaluations_strategy
+                    ON strategy_variant_evaluations (base_strategy_id, profile_id, timeframe, evaluated_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS replay_progress_cursors (
+                        bucket TEXT PRIMARY KEY,
+                        last_replayed_until TIMESTAMPTZ NOT NULL,
+                        last_selected_window_hash TEXT NOT NULL DEFAULT '',
+                        last_research_cycle_id TEXT NOT NULL DEFAULT '',
+                        last_updated_at TIMESTAMPTZ NOT NULL
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_replay_progress_cursors_updated
+                    ON replay_progress_cursors (last_updated_at DESC)
                     """
                 )
                 cursor.execute(
@@ -9445,6 +10226,8 @@ class UsageLedger:
         start_at: datetime | None,
         end_at: datetime | None,
         symbols: list[str],
+        limit: int | None = None,
+        per_symbol_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if not sources:
             return []
@@ -9462,6 +10245,7 @@ class UsageLedger:
             params.extend(symbols)
 
         where_clause = " AND ".join(conditions)
+        limit_clause = f" LIMIT {int(limit or 0)}" if int(limit or 0) > 0 else ""
         with self._connect_sqlite() as connection:
             rows = connection.execute(
                 f"""
@@ -9474,6 +10258,7 @@ class UsageLedger:
                 FROM market_data_historical_bars
                 WHERE {where_clause}
                 ORDER BY bar_timestamp ASC, source ASC, symbol ASC
+                {limit_clause}
                 """,
                 tuple(params),
             ).fetchall()
@@ -9547,6 +10332,37 @@ class UsageLedger:
         start_at: datetime | None,
         end_at: datetime | None,
         symbols: list[str],
+        limit: int | None,
+        per_symbol_limit: int | None,
+    ) -> list[dict[str, Any]]:
+        return self._run_postgres_read_with_deadlock_retry(
+            startup_phase="runtime_historical_bar_read",
+            runtime_phase="historical_replay_diagnostics",
+            db_operation="list_historical_bars",
+            db_table="market_data_historical_bars",
+            query_purpose="replay_window_selection_and_freshness_diagnostics",
+            transaction_boundary="transaction_open",
+            operation=lambda: self._list_historical_bars_postgres_once(
+                timeframe=timeframe,
+                sources=sources,
+                start_at=start_at,
+                end_at=end_at,
+                symbols=symbols,
+                limit=limit,
+                per_symbol_limit=per_symbol_limit,
+            ),
+        )
+
+    def _list_historical_bars_postgres_once(
+        self,
+        *,
+        timeframe: str,
+        sources: list[str],
+        start_at: datetime | None,
+        end_at: datetime | None,
+        symbols: list[str],
+        limit: int | None,
+        per_symbol_limit: int | None,
     ) -> list[dict[str, Any]]:
         if not sources:
             return []
@@ -9564,22 +10380,60 @@ class UsageLedger:
             params.append(symbols)
 
         where_clause = " AND ".join(conditions)
+        capped_by_symbol = int(per_symbol_limit or 0) > 0
+        limit_clause = ""
+        limit_params: list[Any] = []
+        if int(limit or 0) > 0:
+            limit_clause = "LIMIT %s"
+            limit_params.append(int(limit or 0))
         with self._connect_postgres() as connection:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT batch_id, captured_at, source, asset_class, symbol, timeframe,
-                           canonical_instrument_id, venue, venue_symbol,
-                           bar_timestamp, quote_currency, usd_to_gbp_rate,
-                           open_price, high_price, low_price, close_price,
-                           open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
-                           volume, trade_count, vwap
-                    FROM market_data_historical_bars
-                    WHERE {where_clause}
-                    ORDER BY bar_timestamp ASC, source ASC, symbol ASC
-                    """,
-                    tuple(params),
-                )
+                if capped_by_symbol:
+                    cursor.execute(
+                        f"""
+                        WITH ranked_bars AS (
+                            SELECT batch_id, captured_at, source, asset_class, symbol, timeframe,
+                                   canonical_instrument_id, venue, venue_symbol,
+                                   bar_timestamp, quote_currency, usd_to_gbp_rate,
+                                   open_price, high_price, low_price, close_price,
+                                   open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
+                                   volume, trade_count, vwap,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY source, symbol, timeframe
+                                       ORDER BY bar_timestamp DESC
+                                   ) AS row_rank
+                            FROM market_data_historical_bars
+                            WHERE {where_clause}
+                        )
+                        SELECT batch_id, captured_at, source, asset_class, symbol, timeframe,
+                               canonical_instrument_id, venue, venue_symbol,
+                               bar_timestamp, quote_currency, usd_to_gbp_rate,
+                               open_price, high_price, low_price, close_price,
+                               open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
+                               volume, trade_count, vwap
+                        FROM ranked_bars
+                        WHERE row_rank <= %s
+                        ORDER BY bar_timestamp ASC, source ASC, symbol ASC
+                        {limit_clause}
+                        """,
+                        tuple(params + [int(per_symbol_limit or 0)] + limit_params),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT batch_id, captured_at, source, asset_class, symbol, timeframe,
+                               canonical_instrument_id, venue, venue_symbol,
+                               bar_timestamp, quote_currency, usd_to_gbp_rate,
+                               open_price, high_price, low_price, close_price,
+                               open_price_gbp, high_price_gbp, low_price_gbp, close_price_gbp,
+                               volume, trade_count, vwap
+                        FROM market_data_historical_bars
+                        WHERE {where_clause}
+                        ORDER BY bar_timestamp ASC, source ASC, symbol ASC
+                        {limit_clause}
+                        """,
+                        tuple(params + limit_params),
+                    )
                 rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
@@ -9755,6 +10609,138 @@ class UsageLedger:
         }
 
     def _summarize_historical_bars_postgres(
+        self,
+        *,
+        as_of: datetime,
+    ) -> dict[str, Any]:
+        return self._run_postgres_read_with_deadlock_retry(
+            startup_phase="runtime_historical_bar_read",
+            runtime_phase="historical_bars_status",
+            db_operation="summarize_historical_bars",
+            db_table="market_data_latest_bars",
+            query_purpose="historical_and_latest_bar_coverage_summary",
+            transaction_boundary="transaction_open",
+            operation=lambda: self._summarize_historical_bars_postgres_once(as_of=as_of),
+        )
+
+    def _summarize_historical_bar_coverage_sqlite(
+        self,
+        *,
+        asset_class: str | None,
+        symbols: list[str],
+        timeframes: list[str],
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if asset_class:
+            conditions.append("asset_class = ?")
+            params.append(str(asset_class))
+        if symbols:
+            conditions.append(
+                f"symbol IN ({','.join('?' for _ in symbols)})"
+            )
+            params.extend(symbols)
+        if timeframes:
+            conditions.append(
+                f"timeframe IN ({','.join('?' for _ in timeframes)})"
+            )
+            params.extend(timeframes)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT symbol,
+                       timeframe,
+                       COUNT(*) AS row_count,
+                       MIN(bar_timestamp) AS earliest_bar_timestamp,
+                       MAX(bar_timestamp) AS latest_bar_timestamp,
+                       GROUP_CONCAT(DISTINCT source) AS sources_csv,
+                       GROUP_CONCAT(DISTINCT venue) AS venues_csv,
+                       COUNT(DISTINCT substr(bar_timestamp, 1, 10)) AS distinct_bar_days
+                FROM market_data_historical_bars
+                {where_clause}
+                GROUP BY symbol, timeframe
+                ORDER BY symbol ASC, timeframe ASC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [
+            {
+                "symbol": str(row[0] or ""),
+                "timeframe": str(row[1] or ""),
+                "row_count": int(row[2] or 0),
+                "earliest_bar_timestamp": row[3],
+                "latest_bar_timestamp": row[4],
+                "sources": [item for item in str(row[5] or "").split(",") if item],
+                "venues": [item for item in str(row[6] or "").split(",") if item],
+                "distinct_bar_days": int(row[7] or 0),
+            }
+            for row in rows
+        ]
+
+    def _summarize_historical_bar_coverage_postgres(
+        self,
+        *,
+        asset_class: str | None,
+        symbols: list[str],
+        timeframes: list[str],
+    ) -> list[dict[str, Any]]:
+        return self._run_postgres_read_with_deadlock_retry(
+            startup_phase="runtime_historical_bar_read",
+            runtime_phase="historical_coverage_report",
+            db_operation="summarize_historical_bar_coverage",
+            db_table="market_data_historical_bars",
+            query_purpose="equity_historical_timeframe_coverage_summary",
+            transaction_boundary="transaction_open",
+            operation=lambda: self._summarize_historical_bar_coverage_postgres_once(
+                asset_class=asset_class,
+                symbols=symbols,
+                timeframes=timeframes,
+            ),
+        )
+
+    def _summarize_historical_bar_coverage_postgres_once(
+        self,
+        *,
+        asset_class: str | None,
+        symbols: list[str],
+        timeframes: list[str],
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if asset_class:
+            conditions.append("asset_class = %s")
+            params.append(str(asset_class))
+        if symbols:
+            conditions.append("symbol = ANY(%s)")
+            params.append(symbols)
+        if timeframes:
+            conditions.append("timeframe = ANY(%s)")
+            params.append(timeframes)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT symbol,
+                           timeframe,
+                           COUNT(*) AS row_count,
+                           MIN(bar_timestamp) AS earliest_bar_timestamp,
+                           MAX(bar_timestamp) AS latest_bar_timestamp,
+                           ARRAY_REMOVE(ARRAY_AGG(DISTINCT source), NULL) AS sources,
+                           ARRAY_REMOVE(ARRAY_AGG(DISTINCT venue), NULL) AS venues,
+                           COUNT(DISTINCT DATE(bar_timestamp)) AS distinct_bar_days
+                    FROM market_data_historical_bars
+                    {where_clause}
+                    GROUP BY symbol, timeframe
+                    ORDER BY symbol ASC, timeframe ASC
+                    """,
+                    tuple(params),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _summarize_historical_bars_postgres_once(
         self,
         *,
         as_of: datetime,
@@ -10835,6 +11821,30 @@ class UsageLedger:
                 row = cursor.fetchone()
         return dict(row) if row is not None else None
 
+    def _get_paper_canary_state_sqlite(self) -> dict[str, Any] | None:
+        with self._connect_sqlite() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM paper_canary_state
+                WHERE state_id = 'current'
+                """
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _get_paper_canary_state_postgres(self) -> dict[str, Any] | None:
+        with self._connect_postgres(scope="execution") as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM paper_canary_state
+                    WHERE state_id = 'current'
+                    """
+                )
+                row = cursor.fetchone()
+        return dict(row) if row is not None else None
+
     def _upsert_strategy_promotion_sqlite(self, *, row: dict[str, Any]) -> None:
         with self._connect_sqlite() as connection:
             connection.execute(
@@ -10950,6 +11960,101 @@ class UsageLedger:
                         row["updated_at"],
                         row["approved_at"],
                         row["rejected_at"],
+                    ),
+                )
+
+    def _upsert_paper_canary_state_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                INSERT INTO paper_canary_state (
+                    state_id, active, started_at, updated_at, strategy_id, profile_id,
+                    timeframe, operator_override, broker_id, execution_mode,
+                    last_signal_at, last_entry_at, last_rejection_at,
+                    last_rejection_reason, recent_rejection_reasons_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(state_id) DO UPDATE SET
+                    active = excluded.active,
+                    started_at = excluded.started_at,
+                    updated_at = excluded.updated_at,
+                    strategy_id = excluded.strategy_id,
+                    profile_id = excluded.profile_id,
+                    timeframe = excluded.timeframe,
+                    operator_override = excluded.operator_override,
+                    broker_id = excluded.broker_id,
+                    execution_mode = excluded.execution_mode,
+                    last_signal_at = excluded.last_signal_at,
+                    last_entry_at = excluded.last_entry_at,
+                    last_rejection_at = excluded.last_rejection_at,
+                    last_rejection_reason = excluded.last_rejection_reason,
+                    recent_rejection_reasons_json = excluded.recent_rejection_reasons_json
+                """,
+                (
+                    row["state_id"],
+                    row["active"],
+                    row["started_at"],
+                    row["updated_at"],
+                    row["strategy_id"],
+                    row["profile_id"],
+                    row["timeframe"],
+                    row["operator_override"],
+                    row["broker_id"],
+                    row["execution_mode"],
+                    row["last_signal_at"],
+                    row["last_entry_at"],
+                    row["last_rejection_at"],
+                    row["last_rejection_reason"],
+                    row["recent_rejection_reasons_json"],
+                ),
+            )
+
+    def _upsert_paper_canary_state_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres(scope="execution") as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO paper_canary_state (
+                        state_id, active, started_at, updated_at, strategy_id, profile_id,
+                        timeframe, operator_override, broker_id, execution_mode,
+                        last_signal_at, last_entry_at, last_rejection_at,
+                        last_rejection_reason, recent_rejection_reasons_json
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                    )
+                    ON CONFLICT(state_id) DO UPDATE SET
+                        active = EXCLUDED.active,
+                        started_at = EXCLUDED.started_at,
+                        updated_at = EXCLUDED.updated_at,
+                        strategy_id = EXCLUDED.strategy_id,
+                        profile_id = EXCLUDED.profile_id,
+                        timeframe = EXCLUDED.timeframe,
+                        operator_override = EXCLUDED.operator_override,
+                        broker_id = EXCLUDED.broker_id,
+                        execution_mode = EXCLUDED.execution_mode,
+                        last_signal_at = EXCLUDED.last_signal_at,
+                        last_entry_at = EXCLUDED.last_entry_at,
+                        last_rejection_at = EXCLUDED.last_rejection_at,
+                        last_rejection_reason = EXCLUDED.last_rejection_reason,
+                        recent_rejection_reasons_json = EXCLUDED.recent_rejection_reasons_json
+                    """,
+                    (
+                        row["state_id"],
+                        row["active"],
+                        row["started_at"],
+                        row["updated_at"],
+                        row["strategy_id"],
+                        row["profile_id"],
+                        row["timeframe"],
+                        row["operator_override"],
+                        row["broker_id"],
+                        row["execution_mode"],
+                        row["last_signal_at"],
+                        row["last_entry_at"],
+                        row["last_rejection_at"],
+                        row["last_rejection_reason"],
+                        row["recent_rejection_reasons_json"],
                     ),
                 )
 
@@ -11225,7 +12330,525 @@ class UsageLedger:
                     """
                 )
                 rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    def _ensure_strategy_variant_definition_sqlite(
+        self,
+        *,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._connect_sqlite() as connection:
+            existing = connection.execute(
+                """
+                SELECT *
+                FROM strategy_variant_definitions
+                WHERE base_strategy_id = ? AND profile_id = ? AND timeframe = ? AND params_hash = ?
+                LIMIT 1
+                """,
+                (
+                    row["base_strategy_id"],
+                    row["profile_id"],
+                    row["timeframe"],
+                    row["params_hash"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+            connection.execute(
+                """
+                INSERT INTO strategy_variant_definitions (
+                    variant_id, base_strategy_id, profile_id, timeframe, params_hash, params_json,
+                    created_at, created_by, generation_reason, parent_variant_id,
+                    evaluation_status, latest_evaluation_at, notes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["variant_id"],
+                    row["base_strategy_id"],
+                    row["profile_id"],
+                    row["timeframe"],
+                    row["params_hash"],
+                    row["params_json"],
+                    self._serialize_datetime(row["created_at"]),
+                    row["created_by"],
+                    row["generation_reason"],
+                    row["parent_variant_id"],
+                    row["evaluation_status"],
+                    self._serialize_datetime(row["latest_evaluation_at"]),
+                    row["notes"],
+                ),
+            )
+            stored = connection.execute(
+                "SELECT * FROM strategy_variant_definitions WHERE variant_id = ? LIMIT 1",
+                (row["variant_id"],),
+            ).fetchone()
+        return dict(stored) if stored is not None else dict(row)
+
+    def _ensure_strategy_variant_definition_postgres(
+        self,
+        *,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM strategy_variant_definitions
+                    WHERE base_strategy_id = %s AND profile_id = %s AND timeframe = %s AND params_hash = %s
+                    LIMIT 1
+                    """,
+                    (
+                        row["base_strategy_id"],
+                        row["profile_id"],
+                        row["timeframe"],
+                        row["params_hash"],
+                    ),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    return dict(existing)
+                cursor.execute(
+                    """
+                    INSERT INTO strategy_variant_definitions (
+                        variant_id, base_strategy_id, profile_id, timeframe, params_hash, params_json,
+                        created_at, created_by, generation_reason, parent_variant_id,
+                        evaluation_status, latest_evaluation_at, notes
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        row["variant_id"],
+                        row["base_strategy_id"],
+                        row["profile_id"],
+                        row["timeframe"],
+                        row["params_hash"],
+                        row["params_json"],
+                        row["created_at"],
+                        row["created_by"],
+                        row["generation_reason"],
+                        row["parent_variant_id"],
+                        row["evaluation_status"],
+                        row["latest_evaluation_at"],
+                        row["notes"],
+                    ),
+                )
+                stored = cursor.fetchone()
+        return dict(stored) if stored is not None else dict(row)
+
+    def _update_strategy_variant_definition_status_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            if row.get("notes") is None:
+                connection.execute(
+                    """
+                    UPDATE strategy_variant_definitions
+                    SET evaluation_status = ?, latest_evaluation_at = ?
+                    WHERE variant_id = ?
+                    """,
+                    (
+                        row["evaluation_status"],
+                        self._serialize_datetime(row["latest_evaluation_at"]),
+                        row["variant_id"],
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE strategy_variant_definitions
+                    SET evaluation_status = ?, latest_evaluation_at = ?, notes = ?
+                    WHERE variant_id = ?
+                    """,
+                    (
+                        row["evaluation_status"],
+                        self._serialize_datetime(row["latest_evaluation_at"]),
+                        row["notes"],
+                        row["variant_id"],
+                    ),
+                )
+
+    def _update_strategy_variant_definition_status_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                if row.get("notes") is None:
+                    cursor.execute(
+                        """
+                        UPDATE strategy_variant_definitions
+                        SET evaluation_status = %s, latest_evaluation_at = %s
+                        WHERE variant_id = %s
+                        """,
+                        (
+                            row["evaluation_status"],
+                            row["latest_evaluation_at"],
+                            row["variant_id"],
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE strategy_variant_definitions
+                        SET evaluation_status = %s, latest_evaluation_at = %s, notes = %s
+                        WHERE variant_id = %s
+                        """,
+                        (
+                            row["evaluation_status"],
+                            row["latest_evaluation_at"],
+                            row["notes"],
+                            row["variant_id"],
+                        ),
+                    )
+
+    def _list_strategy_variant_definitions_sqlite(
+        self,
+        *,
+        base_strategy_id: str,
+        profile_id: str,
+        timeframe: str,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if base_strategy_id:
+            clauses.append("base_strategy_id = ?")
+            values.append(base_strategy_id)
+        if profile_id:
+            clauses.append("profile_id = ?")
+            values.append(profile_id)
+        if timeframe:
+            clauses.append("timeframe = ?")
+            values.append(timeframe)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM strategy_variant_definitions
+                {where}
+                ORDER BY created_at ASC, variant_id ASC
+                """,
+                tuple(values),
+            ).fetchall()
         return [dict(row) for row in rows]
+
+    def _list_strategy_variant_definitions_postgres(
+        self,
+        *,
+        base_strategy_id: str,
+        profile_id: str,
+        timeframe: str,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if base_strategy_id:
+            clauses.append("base_strategy_id = %s")
+            values.append(base_strategy_id)
+        if profile_id:
+            clauses.append("profile_id = %s")
+            values.append(profile_id)
+        if timeframe:
+            clauses.append("timeframe = %s")
+            values.append(timeframe)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM strategy_variant_definitions
+                    {where}
+                    ORDER BY created_at ASC, variant_id ASC
+                    """,
+                    tuple(values),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _record_strategy_variant_evaluation_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                INSERT INTO strategy_variant_evaluations (
+                    evaluation_id, variant_id, base_strategy_id, profile_id, timeframe,
+                    replay_id, cycle_id, dataset_id, asset_class, symbols_tested_json,
+                    sample_size, gross_return, net_return_after_costs, fees_cost, spread_cost,
+                    slippage_cost, win_rate, drawdown, baseline_variant_id, baseline_strategy_key,
+                    baseline_net_return_after_costs, baseline_win_rate, beats_baseline,
+                    beats_thresholds, recommended_status, evaluated_at, notes, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["evaluation_id"],
+                    row["variant_id"],
+                    row["base_strategy_id"],
+                    row["profile_id"],
+                    row["timeframe"],
+                    row["replay_id"],
+                    row["cycle_id"],
+                    row["dataset_id"],
+                    row["asset_class"],
+                    row["symbols_tested_json"],
+                    row["sample_size"],
+                    row["gross_return"],
+                    row["net_return_after_costs"],
+                    row["fees_cost"],
+                    row["spread_cost"],
+                    row["slippage_cost"],
+                    row["win_rate"],
+                    row["drawdown"],
+                    row["baseline_variant_id"],
+                    row["baseline_strategy_key"],
+                    row["baseline_net_return_after_costs"],
+                    row["baseline_win_rate"],
+                    row["beats_baseline"],
+                    row["beats_thresholds"],
+                    row["recommended_status"],
+                    self._serialize_datetime(row["evaluated_at"]),
+                    row["notes"],
+                    row["raw_json"],
+                ),
+            )
+
+    def _record_strategy_variant_evaluation_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO strategy_variant_evaluations (
+                        evaluation_id, variant_id, base_strategy_id, profile_id, timeframe,
+                        replay_id, cycle_id, dataset_id, asset_class, symbols_tested_json,
+                        sample_size, gross_return, net_return_after_costs, fees_cost, spread_cost,
+                        slippage_cost, win_rate, drawdown, baseline_variant_id, baseline_strategy_key,
+                        baseline_net_return_after_costs, baseline_win_rate, beats_baseline,
+                        beats_thresholds, recommended_status, evaluated_at, notes, raw_json
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+                    )
+                    """,
+                    (
+                        row["evaluation_id"],
+                        row["variant_id"],
+                        row["base_strategy_id"],
+                        row["profile_id"],
+                        row["timeframe"],
+                        row["replay_id"],
+                        row["cycle_id"],
+                        row["dataset_id"],
+                        row["asset_class"],
+                        row["symbols_tested_json"],
+                        row["sample_size"],
+                        row["gross_return"],
+                        row["net_return_after_costs"],
+                        row["fees_cost"],
+                        row["spread_cost"],
+                        row["slippage_cost"],
+                        row["win_rate"],
+                        row["drawdown"],
+                        row["baseline_variant_id"],
+                        row["baseline_strategy_key"],
+                        row["baseline_net_return_after_costs"],
+                        row["baseline_win_rate"],
+                        row["beats_baseline"],
+                        row["beats_thresholds"],
+                        row["recommended_status"],
+                        row["evaluated_at"],
+                        row["notes"],
+                        row["raw_json"],
+                    ),
+                )
+
+    def _list_strategy_variant_evaluations_sqlite(
+        self,
+        *,
+        base_strategy_id: str,
+        profile_id: str,
+        timeframe: str,
+        variant_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if base_strategy_id:
+            clauses.append("base_strategy_id = ?")
+            values.append(base_strategy_id)
+        if profile_id:
+            clauses.append("profile_id = ?")
+            values.append(profile_id)
+        if timeframe:
+            clauses.append("timeframe = ?")
+            values.append(timeframe)
+        if variant_id:
+            clauses.append("variant_id = ?")
+            values.append(variant_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM strategy_variant_evaluations
+                {where}
+                ORDER BY evaluated_at DESC, evaluation_id DESC
+                LIMIT ?
+                """,
+                tuple([*values, limit]),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_strategy_variant_evaluations_postgres(
+        self,
+        *,
+        base_strategy_id: str,
+        profile_id: str,
+        timeframe: str,
+        variant_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if base_strategy_id:
+            clauses.append("base_strategy_id = %s")
+            values.append(base_strategy_id)
+        if profile_id:
+            clauses.append("profile_id = %s")
+            values.append(profile_id)
+        if timeframe:
+            clauses.append("timeframe = %s")
+            values.append(timeframe)
+        if variant_id:
+            clauses.append("variant_id = %s")
+            values.append(variant_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM strategy_variant_evaluations
+                    {where}
+                    ORDER BY evaluated_at DESC, evaluation_id DESC
+                    LIMIT %s
+                    """,
+                    tuple([*values, limit]),
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def list_replay_progress_cursors(self) -> list[dict[str, Any]]:
+        if self.backend == "postgres":
+            return self._list_replay_progress_cursors_postgres()
+        return self._list_replay_progress_cursors_sqlite()
+
+    def upsert_replay_progress_cursor(
+        self,
+        *,
+        bucket: str,
+        last_replayed_until: datetime,
+        last_selected_window_hash: str,
+        last_research_cycle_id: str,
+        last_updated_at: datetime,
+    ) -> None:
+        row = {
+            "bucket": str(bucket or "").strip(),
+            "last_replayed_until": last_replayed_until,
+            "last_selected_window_hash": str(last_selected_window_hash or ""),
+            "last_research_cycle_id": str(last_research_cycle_id or ""),
+            "last_updated_at": last_updated_at,
+        }
+        if not row["bucket"] or not isinstance(last_replayed_until, datetime):
+            return
+        if self.backend == "postgres":
+            self._upsert_replay_progress_cursor_postgres(row=row)
+        else:
+            self._upsert_replay_progress_cursor_sqlite(row=row)
+
+    def _list_replay_progress_cursors_sqlite(self) -> list[dict[str, Any]]:
+        with self._connect_sqlite() as connection:
+            rows = connection.execute(
+                """
+                SELECT bucket, last_replayed_until, last_selected_window_hash,
+                       last_research_cycle_id, last_updated_at
+                FROM replay_progress_cursors
+                ORDER BY bucket ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _list_replay_progress_cursors_postgres(self) -> list[dict[str, Any]]:
+        return self._run_postgres_read_with_deadlock_retry(
+            startup_phase="runtime_historical_bar_read",
+            runtime_phase="historical_replay_diagnostics",
+            db_operation="list_replay_progress_cursors",
+            db_table="replay_progress_cursors",
+            query_purpose="rolling_replay_cursor_lookup",
+            transaction_boundary="transaction_open",
+            operation=self._list_replay_progress_cursors_postgres_once,
+        )
+
+    def _list_replay_progress_cursors_postgres_once(self) -> list[dict[str, Any]]:
+        with self._connect_postgres() as connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    """
+                    SELECT bucket, last_replayed_until, last_selected_window_hash,
+                           last_research_cycle_id, last_updated_at
+                    FROM replay_progress_cursors
+                    ORDER BY bucket ASC
+                    """
+                )
+                rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def _upsert_replay_progress_cursor_sqlite(self, *, row: dict[str, Any]) -> None:
+        with self._connect_sqlite() as connection:
+            connection.execute(
+                """
+                INSERT INTO replay_progress_cursors (
+                    bucket, last_replayed_until, last_selected_window_hash,
+                    last_research_cycle_id, last_updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(bucket) DO UPDATE SET
+                    last_replayed_until = excluded.last_replayed_until,
+                    last_selected_window_hash = excluded.last_selected_window_hash,
+                    last_research_cycle_id = excluded.last_research_cycle_id,
+                    last_updated_at = excluded.last_updated_at
+                """,
+                (
+                    row["bucket"],
+                    row["last_replayed_until"].isoformat(),
+                    row["last_selected_window_hash"],
+                    row["last_research_cycle_id"],
+                    row["last_updated_at"].isoformat(),
+                ),
+            )
+
+    def _upsert_replay_progress_cursor_postgres(self, *, row: dict[str, Any]) -> None:
+        with self._connect_postgres() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO replay_progress_cursors (
+                        bucket, last_replayed_until, last_selected_window_hash,
+                        last_research_cycle_id, last_updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT(bucket) DO UPDATE SET
+                        last_replayed_until = EXCLUDED.last_replayed_until,
+                        last_selected_window_hash = EXCLUDED.last_selected_window_hash,
+                        last_research_cycle_id = EXCLUDED.last_research_cycle_id,
+                        last_updated_at = EXCLUDED.last_updated_at
+                    """,
+                    (
+                        row["bucket"],
+                        row["last_replayed_until"],
+                        row["last_selected_window_hash"],
+                        row["last_research_cycle_id"],
+                        row["last_updated_at"],
+                    ),
+                )
 
     def _upsert_attention_alert_sqlite(self, *, row: dict[str, Any]) -> None:
         with self._connect_sqlite() as connection:
@@ -12333,7 +13956,7 @@ class UsageLedger:
 
         inferred_mode = "live" if environment == "live" else "paper"
         mode = str(order.get("mode") or inferred_mode).strip().lower()
-        if mode not in {"shadow", "paper", "live_dry", "live"}:
+        if mode not in {"shadow", "paper", "paper_canary", "live_dry", "live"}:
             mode = inferred_mode
 
         source_environment = str(order.get("source_environment") or "").strip().lower()
@@ -12421,6 +14044,213 @@ class UsageLedger:
             ),
         }
 
+    def _log_startup_db_diagnostic(
+        self,
+        *,
+        startup_phase: str,
+        db_operation: str,
+        transaction_boundary: str,
+        retry_count: int,
+        lock_wait_context: str,
+        error: str | None = None,
+    ) -> None:
+        fields = {
+            "process_id": str(os.getpid()),
+            "command_source": str(
+                os.getenv("CENTAUR_COMMAND_SOURCE")
+                or os.getenv("CENTAUR_HEARTBEAT_COMMAND_SOURCE")
+                or "unknown"
+            ),
+            "startup_phase": startup_phase,
+            "db_operation": db_operation,
+            "transaction_boundary": transaction_boundary,
+            "lock_wait_context": lock_wait_context,
+            "retry_count": str(retry_count),
+            "existing_heartbeat_process_detected": str(
+                os.getenv("CENTAUR_EXISTING_HEARTBEAT_PROCESS_DETECTED", "unknown")
+            ),
+            "existing_research_cycle_process_detected": str(
+                os.getenv("CENTAUR_EXISTING_RESEARCH_CYCLE_PROCESS_DETECTED", "unknown")
+            ),
+        }
+        if error:
+            fields["error"] = error.replace("\n", " ").strip()
+        print(
+            "startup_db_diagnostic "
+            + " ".join(f"{key}={value}" for key, value in fields.items()),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _log_runtime_db_diagnostic(
+        self,
+        *,
+        startup_phase: str,
+        runtime_phase: str,
+        db_operation: str,
+        db_table: str,
+        query_purpose: str,
+        transaction_boundary: str,
+        retry_count: int,
+        error: str | None = None,
+        research_cycle_id_if_known: str = "",
+    ) -> None:
+        fields = {
+            "process_id": str(os.getpid()),
+            "command_source": str(
+                os.getenv("CENTAUR_COMMAND_SOURCE")
+                or os.getenv("CENTAUR_HEARTBEAT_COMMAND_SOURCE")
+                or "unknown"
+            ),
+            "research_cycle_id_if_known": str(
+                research_cycle_id_if_known
+                or os.getenv("CENTAUR_RESEARCH_CYCLE_ID_IF_KNOWN", "")
+                or "-"
+            ),
+            "startup_phase": startup_phase,
+            "runtime_phase": runtime_phase,
+            "db_operation": db_operation,
+            "db_table": db_table,
+            "query_purpose": query_purpose,
+            "transaction_boundary": transaction_boundary,
+            "retry_count": str(retry_count),
+            "existing_heartbeat_process_detected": str(
+                os.getenv("CENTAUR_EXISTING_HEARTBEAT_PROCESS_DETECTED", "unknown")
+            ),
+            "existing_research_cycle_process_detected": str(
+                os.getenv("CENTAUR_EXISTING_RESEARCH_CYCLE_PROCESS_DETECTED", "unknown")
+            ),
+            "current_process_is_forced_one_shot": str(
+                os.getenv("CENTAUR_CURRENT_PROCESS_IS_FORCED_ONE_SHOT", "unknown")
+            ),
+        }
+        if error:
+            fields["error"] = error.replace("\n", " ").strip()
+        print(
+            "runtime_db_diagnostic "
+            + " ".join(f"{key}={value}" for key, value in fields.items()),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _run_postgres_read_with_deadlock_retry(
+        self,
+        *,
+        startup_phase: str,
+        runtime_phase: str,
+        db_operation: str,
+        db_table: str,
+        query_purpose: str,
+        transaction_boundary: str,
+        operation,
+        research_cycle_id_if_known: str = "",
+    ):
+        max_attempts = 3
+        backoff_seconds = 0.25
+        for attempt in range(1, max_attempts + 1):
+            self._log_runtime_db_diagnostic(
+                startup_phase=startup_phase,
+                runtime_phase=runtime_phase,
+                db_operation=db_operation,
+                db_table=db_table,
+                query_purpose=query_purpose,
+                transaction_boundary=transaction_boundary,
+                retry_count=attempt - 1,
+                research_cycle_id_if_known=research_cycle_id_if_known,
+            )
+            try:
+                return operation()
+            except Exception as exc:
+                if (
+                    not self._is_postgres_deadlock_error(exc)
+                    or attempt >= max_attempts
+                ):
+                    self._log_runtime_db_diagnostic(
+                        startup_phase=startup_phase,
+                        runtime_phase=runtime_phase,
+                        db_operation=db_operation,
+                        db_table=db_table,
+                        query_purpose=query_purpose,
+                        transaction_boundary="attempt_failed",
+                        retry_count=attempt - 1,
+                        research_cycle_id_if_known=research_cycle_id_if_known,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    raise
+                self._log_runtime_db_diagnostic(
+                    startup_phase=startup_phase,
+                    runtime_phase=runtime_phase,
+                    db_operation=db_operation,
+                    db_table=db_table,
+                    query_purpose=query_purpose,
+                    transaction_boundary="deadlock_retry_scheduled",
+                    retry_count=attempt,
+                    research_cycle_id_if_known=research_cycle_id_if_known,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                sleep(backoff_seconds * attempt)
+
+    def _log_connection_diagnostic(
+        self,
+        *,
+        phase: str,
+        status: str,
+        scope: str,
+        elapsed_ms: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        fields = {
+            "process_id": str(os.getpid()),
+            "command_source": str(
+                os.getenv("CENTAUR_COMMAND_SOURCE")
+                or os.getenv("CENTAUR_HEARTBEAT_COMMAND_SOURCE")
+                or "unknown"
+            ),
+            "phase": phase,
+            "status": status,
+            "scope": scope,
+            "read_only": "yes" if self.read_only else "no",
+            "skip_schema_bootstrap": "yes" if self.skip_schema_bootstrap else "no",
+        }
+        if elapsed_ms is not None:
+            fields["elapsed_ms"] = str(elapsed_ms)
+        if self.query_timeout_ms is not None:
+            fields["statement_timeout_ms"] = str(self.query_timeout_ms)
+        if self.lock_timeout_ms is not None:
+            fields["lock_timeout_ms"] = str(self.lock_timeout_ms)
+        if error:
+            fields["error"] = error.replace("\n", " ").strip()
+        print(
+            "db_connection_diagnostic "
+            + " ".join(f"{key}={value}" for key, value in fields.items()),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _configure_postgres_session(self, cursor, *, scope: str) -> None:
+        if self.query_timeout_ms is not None:
+            cursor.execute(
+                "SET statement_timeout = %s",
+                (f"{int(self.query_timeout_ms)}ms",),
+            )
+        if self.lock_timeout_ms is not None:
+            cursor.execute(
+                "SET lock_timeout = %s",
+                (f"{int(self.lock_timeout_ms)}ms",),
+            )
+        self._set_postgres_search_path(cursor, scope=scope)
+
+    def _is_postgres_deadlock_error(self, exc: Exception) -> bool:
+        errors_module = getattr(psycopg2, "errors", None)
+        deadlock_error = getattr(errors_module, "DeadlockDetected", None)
+        lock_not_available_error = getattr(errors_module, "LockNotAvailable", None)
+        if bool(deadlock_error) and isinstance(exc, deadlock_error):
+            return True
+        if bool(lock_not_available_error) and isinstance(exc, lock_not_available_error):
+            return True
+        message = str(exc).lower()
+        return "lock timeout" in message or "deadlock detected" in message
+
     def _connect_sqlite(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
@@ -12434,11 +14264,35 @@ class UsageLedger:
     ):
         if psycopg2 is None:  # pragma: no cover
             raise RuntimeError("psycopg2 is not installed.")
-        connection = psycopg2.connect(self.config.database_url, connect_timeout=5)
-        if apply_schema:
-            with connection.cursor() as cursor:
-                self._set_postgres_search_path(cursor, scope=scope)
-        return connection
+        started_at = monotonic()
+        self._log_connection_diagnostic(
+            phase="postgres_connect",
+            status="start",
+            scope=scope,
+        )
+        try:
+            connection = psycopg2.connect(self.config.database_url, connect_timeout=5)
+            if self.read_only:
+                connection.set_session(readonly=True)
+            if apply_schema:
+                with connection.cursor() as cursor:
+                    self._configure_postgres_session(cursor, scope=scope)
+            self._log_connection_diagnostic(
+                phase="postgres_connect",
+                status="ok",
+                scope=scope,
+                elapsed_ms=int((monotonic() - started_at) * 1000),
+            )
+            return connection
+        except Exception as exc:
+            self._log_connection_diagnostic(
+                phase="postgres_connect",
+                status="failed",
+                scope=scope,
+                elapsed_ms=int((monotonic() - started_at) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
 
     def _ensure_postgres_namespace(self, cursor, schema_name: str | None = None) -> None:
         target_schema = schema_name or self._postgres_execution_schema_name()
@@ -12565,6 +14419,9 @@ class UsageLedger:
 
     def _to_json(self, value: Any) -> str:
         return json.dumps(value, sort_keys=True, default=self._json_default)
+
+    def _stable_json_hash(self, value: Any) -> str:
+        return hashlib.sha256(self._to_json(value).encode("utf-8")).hexdigest()
 
     def _from_json(self, value: Any, *, default: Any) -> Any:
         if value in (None, ""):

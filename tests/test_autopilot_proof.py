@@ -2,18 +2,33 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from io import StringIO
+from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 
 import main as main_module
+import app.framework.reporting.autopilot_proof as autopilot_proof_module
 from app.framework.reporting.autopilot_proof import AutopilotProofRunner
 
 
 class AutopilotProofTests(unittest.TestCase):
     def test_autopilot_proof_runner_reports_safe_manual_boundaries(self) -> None:
-        runner = AutopilotProofRunner()
-        result = runner.run()
-        rendered = runner.render(result)
+        with TemporaryDirectory() as temp_dir:
+            original_config = autopilot_proof_module.AutopilotProofRunner._config
+            autopilot_proof_module.AutopilotProofRunner._config = lambda self: SimpleNamespace(
+                **{
+                    **original_config(self).__dict__,
+                    "research_cycle_singleton_dir": str(Path(temp_dir) / "research-cycle.lock"),
+                }
+            )
+            try:
+                runner = AutopilotProofRunner()
+                result = runner.run()
+                rendered = runner.render(result)
+            finally:
+                autopilot_proof_module.AutopilotProofRunner._config = original_config
 
         self.assertEqual(result["status"], "pass")
         self.assertIn("autopilot_research_cycle", result["autonomous_work_performed"])
@@ -53,14 +68,23 @@ class AutopilotProofTests(unittest.TestCase):
         self.assertIn("final_safety_summary=PASS", rendered)
 
     def test_main_autopilot_proof_command_prints_required_summary(self) -> None:
-        original_argv = sys.argv
-        buffer = StringIO()
-        sys.argv = ["main.py", "--autopilot-proof"]
-        try:
-            with redirect_stdout(buffer):
-                main_module.main()
-        finally:
-            sys.argv = original_argv
+        with TemporaryDirectory() as temp_dir:
+            original_argv = sys.argv
+            original_config = autopilot_proof_module.AutopilotProofRunner._config
+            buffer = StringIO()
+            sys.argv = ["main.py", "--autopilot-proof"]
+            autopilot_proof_module.AutopilotProofRunner._config = lambda self: SimpleNamespace(
+                **{
+                    **original_config(self).__dict__,
+                    "research_cycle_singleton_dir": str(Path(temp_dir) / "research-cycle.lock"),
+                }
+            )
+            try:
+                with redirect_stdout(buffer):
+                    main_module.main()
+            finally:
+                autopilot_proof_module.AutopilotProofRunner._config = original_config
+                sys.argv = original_argv
 
         output = buffer.getvalue()
         self.assertIn("Centaur Autopilot Proof", output)

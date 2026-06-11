@@ -33,6 +33,17 @@ class FakeLedger:
             "estimated_cost_usd": kwargs.get("estimated_cost_usd", 0.0) or 0.0,
         }
 
+    def list_recent_tick_runs(self, *, limit: int = 0) -> list[dict[str, object]]:
+        _ = limit
+        return []
+
+    def list_recent_research_cycles(self, *, limit: int = 0) -> list[dict[str, object]]:
+        _ = limit
+        return []
+
+    def list_strategy_promotions(self) -> list[dict[str, object]]:
+        return []
+
 
 def _config() -> SimpleNamespace:
     return SimpleNamespace(

@@ -33,6 +33,12 @@ $diagrams = [
         'path' => 'docs/visuals/entry_decision_funnel.mmd',
         'mermaid' => flowReadMermaid('docs/visuals/entry_decision_funnel.mmd'),
     ],
+    [
+        'title' => 'Learning System',
+        'description' => 'Detailed map of the autonomous learning lane: heartbeat trigger, replay readiness, evidence generation, operator alerts, and fail-closed promotion boundaries.',
+        'path' => 'docs/visuals/learning_system_flow.mmd',
+        'mermaid' => flowReadMermaid('docs/visuals/learning_system_flow.mmd'),
+    ],
 ];
 ?>
 <!doctype html>
@@ -253,7 +259,7 @@ $diagrams = [
       <div>
         <p class="eyebrow">Project Centaur</p>
         <h1>Flow Map</h1>
-        <p class="lede">Rendered Mermaid views of the current control pipeline and the entry decision funnel, with generated runtime nodes tied back to code ownership.</p>
+        <p class="lede">Rendered Mermaid views of the current control pipeline, the entry decision funnel, and the autonomous learning system, with each diagram tied back to code ownership and safety boundaries.</p>
       </div>
       <div class="toolbar centaur-menu-toolbar">
         <?php centaurRenderNavigation('/flow.php'); ?>

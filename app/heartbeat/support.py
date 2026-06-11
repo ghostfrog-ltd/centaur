@@ -27,6 +27,15 @@ from app.framework.runtime.attention_alerts import (
     create_attention_alert as _create_attention_alert,
 )
 from app.framework.reporting.promotion_gate import PromotionGateReport
+from app.framework.reporting.operator_summary import OperatorSummaryReport
+from app.framework.reporting.paper_canary import (
+    PAPER_CANARY_BROKER_ID,
+    PAPER_CANARY_COOLDOWN_MINUTES,
+    PAPER_CANARY_EXECUTION_MODE,
+    PAPER_CANARY_MAX_NEW_ENTRIES_PER_DAY,
+    PAPER_CANARY_MAX_NOTIONAL_USD,
+    PAPER_CANARY_MAX_OPEN_TRADES,
+)
 from app.framework.reporting.threshold_advisor import ThresholdAdvisor
 from app.framework.runtime.models import TickContext
 from app.framework.runtime.slack import SlackNotificationError, SlackWebhookClient
@@ -49,6 +58,43 @@ PipelineRunner = Callable[[TickContext], PipelineResult]
 # below this until observed broker/API behaviour and human approval say otherwise.
 ALPACA_PDT_MIN_EQUITY_USD = 25_000.0
 EXIT_QUALITY_TARGET_PCTS = (1.25, 1.5, 1.75, 2.0)
+
+
+def _paper_canary_state(context: TickContext) -> dict[str, Any] | None:
+    state = context.state.get("paper_canary_state")
+    if isinstance(state, dict):
+        return state
+    getter = getattr(context.usage_ledger, "get_paper_canary_state", None)
+    if not callable(getter):
+        return None
+    state = getter()
+    if isinstance(state, dict):
+        context.state["paper_canary_state"] = state
+        return state
+    return None
+
+
+def _paper_canary_active(context: TickContext) -> bool:
+    state = _paper_canary_state(context)
+    return bool(isinstance(state, dict) and state.get("active"))
+
+
+def _paper_canary_timeframe_matches(*, requested_timeframe: str, proposal: dict[str, Any]) -> bool:
+    normalized_requested = str(requested_timeframe or "").strip().lower()
+    if not normalized_requested:
+        return True
+    proposal_timeframe = str(
+        proposal.get("timeframe")
+        or proposal.get("holding_window_code")
+        or ""
+    ).strip().lower()
+    aliases = {
+        "15min": {"15min", "15m"},
+        "1hour": {"1hour", "1h", "60min", "60m"},
+        "1day": {"1day", "1d"},
+    }
+    expected = aliases.get(normalized_requested, {normalized_requested})
+    return proposal_timeframe in expected
 
 
 def _paper_min_projected_gain_pct(config: Any, asset_class: str) -> float:
@@ -754,7 +800,13 @@ def _build_slack_hourly_status_alert(context: TickContext) -> dict[str, Any] | N
     if not isinstance(account_summary, dict):
         account_summary = {}
 
+    operator_summary = OperatorSummaryReport(
+        config=context.config,
+        usage_ledger=context.usage_ledger,
+    ).render_slack()
     detail_parts = [
+        operator_summary,
+        "",
         f"tick={context.tick_id}",
         f"started={context.started_at.isoformat(timespec='seconds')}",
         (
@@ -809,8 +861,71 @@ def _format_slack_alert(alert: dict[str, Any]) -> str:
         return f"[Project Centaur] {level}: {summary}\n{detail}"
     return f"[Project Centaur] {level}: {summary}"
 
+def _promotion_supports_paper_approval_alert(*, promotion: dict[str, Any] | None) -> bool:
+    if not isinstance(promotion, dict) or not promotion:
+        return False
+    return str(promotion.get("stage", "") or "").strip() == "paper_candidate"
+
+def _safe_alert_strategy_profile(
+    *,
+    strategy_id: str,
+    profile_id: str,
+    promotions_by_strategy: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[str, str]:
+    normalized_strategy_id = str(strategy_id or "").strip()
+    normalized_profile_id = str(profile_id or "").strip()
+    if normalized_strategy_id and normalized_profile_id:
+        return normalized_strategy_id, normalized_profile_id
+    if not normalized_strategy_id or not isinstance(promotions_by_strategy, dict):
+        return normalized_strategy_id, normalized_profile_id
+    matches = [
+        item
+        for item in promotions_by_strategy.get(normalized_strategy_id, [])
+        if str(item.get("profile_id", "") or "").strip()
+    ]
+    if len(matches) != 1:
+        return normalized_strategy_id, normalized_profile_id
+    return normalized_strategy_id, str(matches[0].get("profile_id", "") or "").strip()
+
+def _resolve_stale_paper_approval_alerts(context: TickContext) -> None:
+    list_open = getattr(context.usage_ledger, "list_open_attention_alerts", None)
+    resolve = getattr(context.usage_ledger, "resolve_attention_alert", None)
+    get_promotion = getattr(context.usage_ledger, "get_strategy_promotion", None)
+    if not callable(list_open) or not callable(resolve):
+        return
+    for alert in list_open(limit=200) or []:
+        if not isinstance(alert, dict):
+            continue
+        event_type = str(alert.get("event_type", "") or "")
+        if event_type not in {"paper_approval_missing", "paper_candidate"}:
+            continue
+        event_id = str(alert.get("event_id", "") or "").strip()
+        if not event_id:
+            continue
+        strategy_id = str(alert.get("strategy_id", "") or "").strip()
+        profile_id = str(alert.get("profile_id", "") or "").strip()
+        if not profile_id:
+            resolve(
+                event_id=event_id,
+                status="resolved",
+                reason="stale_or_invalid_paper_approval_alert_missing_profile_id",
+            )
+            continue
+        promotion = None
+        if callable(get_promotion):
+            promotion = get_promotion(strategy_id=strategy_id, profile_id=profile_id)
+        if _promotion_supports_paper_approval_alert(promotion=promotion):
+            continue
+        current_stage = str((promotion or {}).get("stage", "") or "missing_promotion")
+        resolve(
+            event_id=event_id,
+            status="resolved",
+            reason=f"stale_paper_approval_alert_current_stage={current_stage}",
+        )
+
 def _sync_attention_alerts(context: TickContext) -> list[dict[str, Any]]:
     alerts: list[dict[str, Any]] = []
+    _resolve_stale_paper_approval_alerts(context)
     risk_cfo = context.state.get("risk_cfo", {})
     if isinstance(risk_cfo, dict):
         for item in risk_cfo.get("rejected_candidates", []) or []:
@@ -819,6 +934,44 @@ def _sync_attention_alerts(context: TickContext) -> list[dict[str, Any]]:
             if str(item.get("reason", "")) == "paper_promotion_required":
                 strategy_id = str(item.get("strategy_id", "") or "")
                 profile_id = str(item.get("profile_id", "") or "")
+                if not profile_id:
+                    alerts.append(
+                        _create_attention_alert(
+                            usage_ledger=context.usage_ledger,
+                            now=context.started_at,
+                            event_id=_build_attention_event_id(
+                                event_type="paper_approval_invalid",
+                                strategy_id=strategy_id,
+                            ),
+                            severity="warning",
+                            event_type="paper_approval_invalid",
+                            title="Broker paper block event missing profile_id",
+                            message=(
+                                f"{strategy_id or 'unknown_strategy'} was blocked from broker paper "
+                                "execution, but the block event omitted profile_id."
+                            ),
+                            evidence_summary={
+                                "stage": "invalid_broker_paper_block",
+                                "open_reason": "Broker paper block event is missing profile_id.",
+                            },
+                            recommended_action=(
+                                "Inspect the broker-paper block source and repair the missing "
+                                "strategy/profile identity before reviewing approval state."
+                            ),
+                            requires_attention=True,
+                            strategy_id=strategy_id,
+                            profile_id="",
+                            approval_request_id_value="",
+                            source="real_heartbeat",
+                        )
+                    )
+                    break
+                promotion = context.usage_ledger.get_strategy_promotion(
+                    strategy_id=strategy_id,
+                    profile_id=profile_id,
+                )
+                if not _promotion_supports_paper_approval_alert(promotion=promotion):
+                    break
                 approval_id = _approval_request_id(
                     strategy_id=strategy_id,
                     profile_id=profile_id,
@@ -871,11 +1024,67 @@ def _sync_attention_alerts(context: TickContext) -> list[dict[str, Any]]:
             "live_kill_switch_on",
             "activation_ack_missing",
         } and int(live_risk.get("watch_candidates", 0) or 0) > 0:
+            promotions_by_strategy: dict[str, list[dict[str, Any]]] = {}
+            list_promotions = getattr(context.usage_ledger, "list_strategy_promotions", None)
+            if callable(list_promotions):
+                for promotion in list_promotions() or []:
+                    if not isinstance(promotion, dict):
+                        continue
+                    strategy_id = str(promotion.get("strategy_id", "") or "").strip()
+                    if not strategy_id:
+                        continue
+                    promotions_by_strategy.setdefault(strategy_id, []).append(promotion)
+            live_rejected = list(live_risk.get("rejected_candidates", []) or [])
+            live_candidate = live_rejected[0] if live_rejected and isinstance(live_rejected[0], dict) else {}
+            strategy_id, profile_id = _safe_alert_strategy_profile(
+                strategy_id=str(live_candidate.get("strategy_id", "") or ""),
+                profile_id=str(live_candidate.get("profile_id", "") or ""),
+                promotions_by_strategy=promotions_by_strategy,
+            )
+            if not profile_id:
+                alerts.append(
+                    _create_attention_alert(
+                        usage_ledger=context.usage_ledger,
+                        now=context.started_at,
+                        event_id=_build_attention_event_id(
+                            event_type="live_execution_requested_while_disabled_invalid",
+                            strategy_id=strategy_id,
+                        ),
+                        severity="warning",
+                        event_type="live_execution_requested_while_disabled_invalid",
+                        title="Live execution block event missing strategy/profile identity",
+                        message=(
+                            "Live proposals were present while live execution was disabled, "
+                            "but the blocking event could not be mapped to a valid strategy/profile."
+                        ),
+                        evidence_summary={
+                            "stage": "live_blocked_invalid_identity",
+                            "reason": live_reason,
+                            "open_reason": (
+                                "Live execution remained disabled, and the alert was downgraded "
+                                "to diagnostic because no safe strategy/profile mapping was available."
+                            ),
+                        },
+                        recommended_action=(
+                            "Inspect the live request source and rejected candidate payload so future "
+                            "disabled-live alerts can include a valid strategy/profile identity."
+                        ),
+                        requires_attention=False,
+                        strategy_id=strategy_id,
+                        profile_id="",
+                        source="real_heartbeat",
+                    )
+                )
+                return alerts
             alerts.append(
                 _create_attention_alert(
                     usage_ledger=context.usage_ledger,
                     now=context.started_at,
-                    event_id=_build_attention_event_id(event_type="live_execution_requested_while_disabled"),
+                    event_id=_build_attention_event_id(
+                        event_type="live_execution_requested_while_disabled",
+                        strategy_id=strategy_id,
+                        profile_id=profile_id,
+                    ),
                     severity="critical",
                     event_type="live_execution_requested_while_disabled",
                     title="Live execution requested while disabled",
@@ -886,6 +1095,8 @@ def _sync_attention_alerts(context: TickContext) -> list[dict[str, Any]]:
                     evidence_summary={"stage": "live_blocked", "reason": live_reason},
                     recommended_action="Review live request source; keep live disabled unless explicitly approved.",
                     requires_attention=True,
+                    strategy_id=strategy_id,
+                    profile_id=profile_id,
                     source="real_heartbeat",
                 )
             )
@@ -1018,38 +1229,70 @@ def _build_paper_trade_approval(
             "reason": "projected_gain_too_thin",
         }
 
-    promotion = PromotionGateReport(
-        config=config,
-        usage_ledger=context.usage_ledger,
-    ).get_paper_approval(
-        strategy_id=strategy_id,
-        profile_id=str(proposal.get("profile_id", "")),
-    )
-    if promotion is None or not promotion.paper_approved:
-        return None, {
-            "symbol": symbol,
-            "strategy_id": strategy_id,
-            "reason": "paper_promotion_required",
-        }
-    if promotion.research_only_profile and not promotion.paper_execution_profile:
-        return None, {
-            "symbol": symbol,
-            "strategy_id": strategy_id,
-            "reason": "research_only_profile_not_converted_for_paper_execution",
-        }
+    canary_state = _paper_canary_state(context)
+    canary_active = bool(isinstance(canary_state, dict) and canary_state.get("active"))
+    if canary_active:
+        if broker_id != PAPER_CANARY_BROKER_ID:
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "paper_canary_requires_alpaca_paper",
+            }
+        if not str(canary_state.get("operator_override", "") or "").strip():
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "paper_canary_operator_override_required",
+            }
+        if (
+            str(canary_state.get("strategy_id", "") or "").strip() != strategy_id
+            or str(canary_state.get("profile_id", "") or "").strip() != str(proposal.get("profile_id", ""))
+            or not _paper_canary_timeframe_matches(
+                requested_timeframe=str(canary_state.get("timeframe", "") or ""),
+                proposal=proposal,
+            )
+        ):
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "paper_canary_candidate_mismatch",
+            }
+        notional_usd = min(PAPER_CANARY_MAX_NOTIONAL_USD, _notional_usd_for_broker(context, broker_id))
+        if notional_usd <= 0:
+            return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "qty_too_small"}
+    else:
+        promotion = PromotionGateReport(
+            config=config,
+            usage_ledger=context.usage_ledger,
+        ).get_paper_approval(
+            strategy_id=strategy_id,
+            profile_id=str(proposal.get("profile_id", "")),
+        )
+        if promotion is None or not promotion.paper_approved:
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "paper_promotion_required",
+            }
+        if promotion.research_only_profile and not promotion.paper_execution_profile:
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "research_only_profile_not_converted_for_paper_execution",
+            }
 
-    notional_usd = _notional_usd_for_broker(context, broker_id)
-    if notional_usd <= 0:
-        return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "qty_too_small"}
-    if (
-        promotion.max_paper_notional_usd > 0
-        and notional_usd > promotion.max_paper_notional_usd
-    ):
-        return None, {
-            "symbol": symbol,
-            "strategy_id": strategy_id,
-            "reason": "promotion_max_notional_exceeded",
-        }
+        notional_usd = _notional_usd_for_broker(context, broker_id)
+        if notional_usd <= 0:
+            return None, {"symbol": symbol, "strategy_id": strategy_id, "reason": "qty_too_small"}
+        if (
+            promotion.max_paper_notional_usd > 0
+            and notional_usd > promotion.max_paper_notional_usd
+        ):
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "promotion_max_notional_exceeded",
+            }
 
     recent_strategy_orders = [
         item
@@ -1058,6 +1301,13 @@ def _build_paper_trade_approval(
         and str(item.get("profile_id", "")) == str(proposal.get("profile_id", ""))
         and str(item.get("broker_id", "")).strip().lower() == broker_id
     ]
+    if canary_active:
+        recent_strategy_orders = [
+            item
+            for item in recent_strategy_orders
+            if str(item.get("mode", "")).strip().lower() == PAPER_CANARY_EXECUTION_MODE
+            or bool((item.get("raw_json") or {}).get("paper_canary"))
+        ]
     latest_submitted_at = None
     active_order_like_count = 0
     for item in recent_strategy_orders:
@@ -1072,20 +1322,49 @@ def _build_paper_trade_approval(
             latest_submitted_at = submitted_at
         if side == "buy" and status not in {"canceled", "cancelled", "rejected"}:
             active_order_like_count += 1
-    if promotion.cooldown_minutes > 0 and latest_submitted_at is not None:
+    cooldown_minutes = PAPER_CANARY_COOLDOWN_MINUTES if canary_active else promotion.cooldown_minutes
+    if cooldown_minutes > 0 and latest_submitted_at is not None:
         minutes_since_last = (context.started_at - latest_submitted_at).total_seconds() / 60.0
-        if minutes_since_last < promotion.cooldown_minutes:
+        if minutes_since_last < cooldown_minutes:
             return None, {
                 "symbol": symbol,
                 "strategy_id": strategy_id,
-                "reason": "promotion_cooldown_active",
+                "reason": "paper_canary_cooldown_active" if canary_active else "promotion_cooldown_active",
             }
-    if promotion.max_open_trades > 0 and active_order_like_count >= promotion.max_open_trades:
+    max_open_trades = PAPER_CANARY_MAX_OPEN_TRADES if canary_active else promotion.max_open_trades
+    if max_open_trades > 0 and active_order_like_count >= max_open_trades:
         return None, {
             "symbol": symbol,
             "strategy_id": strategy_id,
-            "reason": "promotion_max_open_trades_reached",
+            "reason": "paper_canary_max_open_trades_reached" if canary_active else "promotion_max_open_trades_reached",
         }
+    if canary_active:
+        today = context.started_at.date()
+        entries_today = 0
+        for item in recent_strategy_orders:
+            if str(item.get("side", "")).strip().lower() != "buy":
+                continue
+            submitted_at = _coerce_datetime(item.get("submitted_at")) or _coerce_datetime(
+                item.get("captured_at")
+            )
+            raw = item.get("raw_json", {})
+            if not isinstance(raw, dict):
+                raw = {}
+            if (
+                submitted_at is not None
+                and submitted_at.astimezone().date() == today
+                and (
+                    str(item.get("mode", "")).strip().lower() == PAPER_CANARY_EXECUTION_MODE
+                    or bool(raw.get("paper_canary"))
+                )
+            ):
+                entries_today += 1
+        if entries_today >= PAPER_CANARY_MAX_NEW_ENTRIES_PER_DAY:
+            return None, {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "reason": "paper_canary_daily_entry_limit_reached",
+            }
 
     try:
         adapter = get_execution_adapter(context, broker_id)
@@ -1149,6 +1428,11 @@ def _build_paper_trade_approval(
             "stop_loss_price": stop_loss_price,
             "target_price": target_price,
             "projected_gain_pct": round(projected_gain_pct, 6),
+            "paper_canary": canary_active,
+            "execution_mode": PAPER_CANARY_EXECUTION_MODE if canary_active else "paper",
+            "mode": PAPER_CANARY_EXECUTION_MODE if canary_active else "paper",
+            "timeframe": str(canary_state.get("timeframe", "") if canary_active else proposal.get("timeframe", "")),
+            "operator_override": str(canary_state.get("operator_override", "") if canary_active else ""),
             "holding_window_code": _paper_exit_policy_holding_window_code(
                 strategy_id=strategy_id,
                 proposal=proposal,
@@ -1486,6 +1770,8 @@ def _paper_execution_broker_ids_for_asset_class(
     return deduped
 
 def _active_paper_broker_ids(context: TickContext) -> list[str]:
+    if _paper_canary_active(context):
+        return [PAPER_CANARY_BROKER_ID]
     broker_ids: list[str] = []
     for asset_class in ("equity", "crypto"):
         for broker_id in _paper_execution_broker_ids_for_asset_class(
@@ -2569,6 +2855,18 @@ def _build_exit_order_request(
             "exit_reason": exit_reason,
             "exit_quality_audit": exit_quality_audit,
             "latest_close_price": close_price,
+            "paper_canary": bool(raw.get("paper_canary") or entry_order.get("paper_canary")),
+            "execution_mode": str(
+                raw.get("execution_mode")
+                or entry_order.get("execution_mode")
+                or entry_order.get("mode")
+                or "paper"
+            ),
+            "mode": str(
+                raw.get("execution_mode")
+                or entry_order.get("mode")
+                or "paper"
+            ),
             "order_request": order_request,
         },
         None,

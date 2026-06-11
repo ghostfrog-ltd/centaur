@@ -70,6 +70,14 @@ class RuntimeConfig:
     slack_attention_repeat_enabled: bool
     slack_attention_repeat_minutes: int
     slack_attention_max_repeats: int
+    smtp_host: str
+    smtp_port: int
+    smtp_user: str
+    smtp_pass: str
+    smtp_from: str
+    smtp_to: tuple[str, ...]
+    smtp_use_ssl: bool
+    smtp_timeout_seconds: int
     live_equity_pdt_review_reminders_enabled: bool
     live_equity_pdt_review_reminder_start_date: str
     live_equity_pdt_review_reminder_interval_minutes: int
@@ -96,6 +104,10 @@ class RuntimeConfig:
     research_cycle_enabled_value_source: str
     research_cycle_env_path: str
     research_cycle_min_interval_minutes: int
+    pre_replay_historical_refresh_enabled: bool
+    pre_replay_historical_refresh_dry_run: bool
+    rolling_replay_cursor_enabled: bool
+    replay_window_selection_mode: str
     research_replay_timeframe: str
     research_replay_days: int
     research_max_replay_timestamps: int
@@ -488,6 +500,23 @@ def load_runtime_config() -> RuntimeConfig:
             os.getenv("SLACK_ATTENTION_MAX_REPEATS"),
             default=0,
         ),
+        smtp_host=os.getenv("SMTP_HOST", "").strip(),
+        smtp_port=_parse_int(
+            os.getenv("SMTP_PORT"),
+            default=465,
+        ),
+        smtp_user=os.getenv("SMTP_USER", "").strip(),
+        smtp_pass=os.getenv("SMTP_PASS", "").strip(),
+        smtp_from=os.getenv("SMTP_FROM", "").strip(),
+        smtp_to=_parse_csv(os.getenv("SMTP_TO", "")),
+        smtp_use_ssl=_parse_bool(
+            os.getenv("SMTP_USE_SSL"),
+            default=True,
+        ),
+        smtp_timeout_seconds=_parse_int(
+            os.getenv("SMTP_TIMEOUT_SECONDS"),
+            default=10,
+        ),
         live_equity_pdt_review_reminders_enabled=_parse_bool(
             os.getenv("LIVE_EQUITY_PDT_REVIEW_REMINDERS_ENABLED"),
             default=True,
@@ -561,6 +590,21 @@ def load_runtime_config() -> RuntimeConfig:
         research_cycle_min_interval_minutes=_parse_int(
             os.getenv("RESEARCH_CYCLE_MIN_INTERVAL_MINUTES"),
             default=60,
+        ),
+        pre_replay_historical_refresh_enabled=_parse_bool(
+            os.getenv("PRE_REPLAY_HISTORICAL_REFRESH_ENABLED"),
+            default=False,
+        ),
+        pre_replay_historical_refresh_dry_run=_parse_bool(
+            os.getenv("PRE_REPLAY_HISTORICAL_REFRESH_DRY_RUN"),
+            default=True,
+        ),
+        rolling_replay_cursor_enabled=_parse_bool(
+            os.getenv("ROLLING_REPLAY_CURSOR_ENABLED"),
+            default=False,
+        ),
+        replay_window_selection_mode=_parse_replay_window_selection_mode(
+            os.getenv("REPLAY_WINDOW_SELECTION_MODE", "global")
         ),
         research_replay_timeframe=(
             os.getenv("RESEARCH_REPLAY_TIMEFRAME", "15Min").strip() or "15Min"
@@ -1591,6 +1635,18 @@ def _parse_shadow_windows(value: str | None) -> tuple[str, ...]:
         if item:
             windows.append(item)
     return tuple(windows)
+
+
+def _parse_replay_window_selection_mode(value: str | None) -> str:
+    normalized = str(value or "global").strip().lower() or "global"
+    allowed = {"global", "asset_class", "asset_class_and_timeframe"}
+    if normalized not in allowed:
+        joined = ",".join(sorted(allowed))
+        raise ValueError(
+            "invalid_replay_window_selection_mode: "
+            f"{normalized} (allowed: {joined})"
+        )
+    return normalized
 
 
 def _parse_float_csv(value: str | None, *, default: tuple[float, ...]) -> tuple[float, ...]:

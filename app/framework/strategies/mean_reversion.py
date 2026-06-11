@@ -59,6 +59,10 @@ class MeanReversionStrategy(StrategyDefinition):
                     "max_movement_pct": -0.18,
                     "min_discovery_score": 4.0,
                     "min_trade_count": 40,
+                    # Percentage-point units, matching target_return_pct and
+                    # realized_return_pct elsewhere in the replay/reporting code.
+                    "min_expected_net_move_pct": 0.0,
+                    "estimated_round_trip_cost_pct": self._estimated_round_trip_cost_pct(config),
                 },
             )
         ]
@@ -129,6 +133,24 @@ class MeanReversionStrategy(StrategyDefinition):
             reject("missing_entry_price", entry_price=entry_price)
             return None
 
+        min_expected_net_move_pct = float(
+            profile.parameters.get("min_expected_net_move_pct", 0.0) or 0.0
+        )
+        estimated_round_trip_cost_pct = float(
+            profile.parameters.get("estimated_round_trip_cost_pct", 0.0) or 0.0
+        )
+        expected_target_return_pct = profile.stop_loss_pct * profile.target_multiple * 100.0
+        required_expected_move_pct = estimated_round_trip_cost_pct + min_expected_net_move_pct
+        if expected_target_return_pct < required_expected_move_pct:
+            reject(
+                "expected_move_below_cost_adjusted_min",
+                expected_target_return_pct=round(expected_target_return_pct, 6),
+                estimated_round_trip_cost_pct=round(estimated_round_trip_cost_pct, 6),
+                min_expected_net_move_pct=round(min_expected_net_move_pct, 6),
+                required_expected_move_pct=round(required_expected_move_pct, 6),
+            )
+            return None
+
         entry_price_gbp = to_float(candidate.get("close_price_gbp"))
         score_liquidity = liquidity_component(
             volume=to_int(candidate.get("volume")),
@@ -177,3 +199,22 @@ class MeanReversionStrategy(StrategyDefinition):
             ),
             note="rule_based_mean_reversion",
         )
+
+    def _estimated_round_trip_cost_pct(self, config: RuntimeConfig) -> float:
+        spread_pct = max(
+            0.0,
+            float(getattr(config, "shadow_execution_spread_bps", 0.0) or 0.0),
+        ) / 100.0
+        slippage_pct = (
+            max(0.0, float(getattr(config, "shadow_entry_slippage_bps", 0.0) or 0.0))
+            + max(0.0, float(getattr(config, "shadow_exit_slippage_bps", 0.0) or 0.0))
+        ) / 100.0
+        fixed_cost_pct = 0.0
+        notional = float(getattr(config, "paper_execution_default_notional_usd", 0.0) or 0.0)
+        fixed_cost = max(
+            0.0,
+            float(getattr(config, "shadow_fixed_round_trip_cost_usd", 0.0) or 0.0),
+        )
+        if notional > 0.0 and fixed_cost > 0.0:
+            fixed_cost_pct = (fixed_cost / notional) * 100.0
+        return round(spread_pct + slippage_pct + fixed_cost_pct, 6)

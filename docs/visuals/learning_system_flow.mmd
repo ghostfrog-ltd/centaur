@@ -1,0 +1,72 @@
+flowchart TD
+  trigger["Real heartbeat or manual proof run<br/>app/framework/runtime/autonomous_learning.py::run_autonomous_learning_cycle"]
+  enabled{"RESEARCH_CYCLE_ENABLED<br/>and safe source/origin?"}
+  skip_disabled["Skip cleanly<br/>reason: research_disabled or not_due_yet<br/>store runtime snapshot only"]
+  due{"Interval gate passed<br/>or forced one-shot?"}
+  runner["ResearchCycleRunner.run()<br/>app/framework/engine/research_cycle.py::ResearchCycleRunner.run"]
+
+  subgraph lane_refresh["Historical readiness / app.framework.engine.backfill + reporting"]
+    refresh["Optional pre-replay historical refresh<br/>historical_backfill_only_no_orders_no_auto_approvals"]
+    bars["HistoricalBarsStatusReport<br/>inventory, coverage, replay eligibility"]
+    plans["Timeframe plans + replay windows<br/>global anchor, future-outcome horizon, completeness checks"]
+    no_windows["No ready windows<br/>fail closed with diagnostics"]
+  end
+
+  subgraph lane_replay["Replay evidence generation / app.framework.engine.replay"]
+    replay["HistoricalReplayRunner.run()<br/>per ready timeframe and accepted window"]
+    summaries["ReplaySummaryReport + ReplayComparisonReport<br/>aggregate returns, win rate, checkpoints, blockers"]
+  end
+
+  subgraph lane_decisions["Research decisions / app.framework.engine + promotion gate"]
+    decisions["Build per strategy/profile decisions<br/>research_only or paper_sim_candidate or removal candidate"]
+    persist["Persist research_cycle decisions<br/>UsageLedger.record_research_cycle_decisions"]
+    gate["PromotionGateReport.record_research_evidence<br/>update auditable promotion evidence only"]
+  end
+
+  subgraph lane_operator["Operator review + status surfaces / reporting + attention alerts"]
+    alerts["Create or resolve attention alerts<br/>paper_candidate, removal_candidate, cycle_failure"]
+    status["SelfImprovementStatus / operator summary / proof reports<br/>show freshness, trends, blockers, opportunities"]
+    snapshot["Persist tick report + state snapshot<br/>research_cycle diagnostics, windows, decisions, comparison"]
+  end
+
+  subgraph lane_safety["Capital-preservation boundary"]
+    manual["Manual approval required for any paper promotion"]
+    blocked["No autonomous broker paper approval<br/>No autonomous live approval<br/>No order placement from learning lane"]
+  end
+
+  trigger --> enabled
+  enabled -->|no| skip_disabled
+  enabled -->|yes| due
+  due -->|no| skip_disabled
+  due -->|yes| runner
+  runner --> refresh
+  refresh --> bars
+  bars --> plans
+  plans -->|no ready plans or windows| no_windows
+  plans -->|ready windows| replay
+  replay --> summaries
+  summaries --> decisions
+  no_windows --> decisions
+  decisions --> persist
+  persist --> gate
+  gate --> alerts
+  gate --> status
+  persist --> snapshot
+  alerts --> manual
+  status --> manual
+  snapshot --> manual
+  manual --> blocked
+
+  classDef style_runtime fill:#eef7f4,stroke:#28705f,color:#10231f
+  classDef style_refresh fill:#fff8e6,stroke:#b78313,color:#3d2a09
+  classDef style_replay fill:#edf7ff,stroke:#1f6feb,color:#10233f
+  classDef style_decision fill:#f2f5f7,stroke:#657174,color:#172022
+  classDef style_operator fill:#eef5f1,stroke:#0f8b8d,color:#10231f
+  classDef style_safety fill:#fff1f0,stroke:#b0413e,color:#3d1716
+
+  class trigger,enabled,due,skip_disabled,runner style_runtime
+  class refresh,bars,plans,no_windows style_refresh
+  class replay,summaries style_replay
+  class decisions,persist,gate style_decision
+  class alerts,status,snapshot style_operator
+  class manual,blocked style_safety

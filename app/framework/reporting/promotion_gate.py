@@ -109,7 +109,22 @@ class PromotionGateReport:
             "sample_size": int(research_entry.get("proposal_count", 0) or 0),
             "windows_with_data": int(research_entry.get("replay_windows_with_data", 0) or 0),
             "windows_required": int(research_entry.get("replay_windows_required", 0) or 0),
+            "paper_blocker_reasons": list(research_entry.get("paper_blocker_reasons", []) or []),
+            "paper_policy_notes": list(research_entry.get("paper_policy_notes", []) or []),
+            "live_blocker_reasons": list(research_entry.get("live_blocker_reasons", []) or []),
+            "allocation_includes_backtest_evidence": dict(
+                research_entry.get("allocation_includes_backtest_evidence", {}) or {}
+            ),
         }
+        replay_summary["paper_blocker_reasons"] = [
+            reason
+            for reason in replay_summary["paper_blocker_reasons"]
+            if str(reason).strip() != "paper_allocation_excludes_backtest_evidence"
+        ]
+        if "paper_allocation_excludes_backtest_evidence" in list(
+            research_entry.get("paper_blocker_reasons", []) or []
+        ) and "paper_allocation_excludes_backtest_evidence" not in replay_summary["paper_policy_notes"]:
+            replay_summary["paper_policy_notes"].append("paper_allocation_excludes_backtest_evidence")
         paper_sim_summary = {
             "composite_fitness_score": float(fitness.get("composite_fitness_score", 0.0) or 0.0)
             if fitness
@@ -136,41 +151,52 @@ class PromotionGateReport:
                 or []
             ),
         }
-        blocker_reasons: list[str] = []
+        paper_blocker_reasons: list[str] = list(replay_summary["paper_blocker_reasons"])
+        live_blocker_reasons: list[str] = list(replay_summary["live_blocker_reasons"])
         if replay_summary["classification"] == "research_only":
-            blocker_reasons.append("replay_research_not_yet_promising")
+            paper_blocker_reasons.append("replay_research_not_yet_promising")
+            live_blocker_reasons.append("replay_research_not_yet_promising")
         if replay_summary["classification"] == "rejected_research":
-            blocker_reasons.append("replay_evidence_rejected")
+            paper_blocker_reasons.append("replay_evidence_rejected")
+            live_blocker_reasons.append("replay_evidence_rejected")
         if paper_sim_summary["sample_size"] < int(self.config.strategy_allocation_min_checkpoints):
-            blocker_reasons.append("paper_sim_sample_below_min_checkpoints")
+            live_blocker_reasons.append("paper_sim_sample_below_min_checkpoints")
         if paper_sim_summary["composite_fitness_score"] <= float(
             self.config.strategy_allocation_suppress_threshold
         ):
-            blocker_reasons.append("paper_sim_fitness_below_suppress_threshold")
+            live_blocker_reasons.append("paper_sim_fitness_below_suppress_threshold")
         if data_integrity["status"] != "pass":
-            blocker_reasons.extend(data_integrity["failure_reasons"])
+            paper_blocker_reasons.extend(data_integrity["failure_reasons"])
+            live_blocker_reasons.extend(data_integrity["failure_reasons"])
         if promotion and bool(promotion.get("rejected")):
-            blocker_reasons.append("manually_rejected")
+            paper_blocker_reasons.append("manually_rejected")
+            live_blocker_reasons.append("manually_rejected")
+
+        paper_eligible = (
+            replay_summary["classification"] in {"paper_sim_candidate", "paper_candidate"}
+            and data_integrity["status"] == "pass"
+            and "paper_allocation_excludes_backtest_evidence" not in paper_blocker_reasons
+            and "replay_research_not_yet_promising" not in paper_blocker_reasons
+            and "replay_evidence_rejected" not in paper_blocker_reasons
+            and "manually_rejected" not in paper_blocker_reasons
+        )
+        live_eligible = False
 
         recommendation = "hold_research_only"
         next_stage = "research_only"
         if replay_summary["classification"] == "promising_research":
             next_stage = "promising_research"
             recommendation = "continue_research"
-        if replay_summary["classification"] == "paper_sim_candidate":
+        if replay_summary["classification"] in {"paper_sim_candidate", "paper_candidate"}:
             next_stage = "paper_sim_candidate"
             recommendation = "start_or_continue_paper_sim"
         if (
             paper_sim_summary["sample_size"] > 0
-            and replay_summary["classification"] in {"paper_sim_candidate", "promising_research"}
+            and replay_summary["classification"] in {"paper_sim_candidate", "paper_candidate", "promising_research"}
         ):
             next_stage = "paper_sim_active"
             recommendation = "continue_paper_sim"
-        if (
-            not blocker_reasons
-            and replay_summary["classification"] == "paper_sim_candidate"
-            and paper_sim_summary["sample_size"] > 0
-        ):
+        if paper_eligible:
             next_stage = "paper_candidate"
             recommendation = "manual_paper_review"
         if (
@@ -183,7 +209,8 @@ class PromotionGateReport:
         ):
             next_stage = "paper_removal_candidate"
             recommendation = "manual_paper_removal_review"
-            blocker_reasons = [*blocker_reasons, "manual_paper_removal_required"]
+            paper_blocker_reasons = [*paper_blocker_reasons, "manual_paper_removal_required"]
+            live_blocker_reasons = [*live_blocker_reasons, "manual_paper_removal_required"]
         if promotion and bool(promotion.get("paper_approved")):
             if next_stage != "paper_removal_candidate":
                 next_stage = "paper_approved"
@@ -211,7 +238,12 @@ class PromotionGateReport:
             "adverse_excursion_pct": paper_sim_summary["adverse_excursion_pct"],
             "data_integrity_status": data_integrity,
             "recommendation": recommendation,
-            "blocker_reasons": blocker_reasons,
+            "blocker_reasons": paper_blocker_reasons,
+            "paper_blocker_reasons": paper_blocker_reasons,
+            "paper_policy_notes": list(replay_summary.get("paper_policy_notes", []) or []),
+            "live_blocker_reasons": live_blocker_reasons,
+            "paper_stage_eligible": paper_eligible,
+            "live_stage_eligible": live_eligible,
             "current_stage": next_stage,
             "current_record": promotion or {},
             "paper_execution_allowed": bool(
@@ -224,7 +256,7 @@ class PromotionGateReport:
             stage=next_stage,
             research_only_profile=bool(profile.parameters.get("research_only")),
             recommendation=recommendation,
-            blocker_reasons=blocker_reasons,
+            blocker_reasons=paper_blocker_reasons,
             replay_summary=replay_summary,
             paper_sim_summary=paper_sim_summary,
             data_integrity=data_integrity,
@@ -287,6 +319,19 @@ class PromotionGateReport:
             raise ValueError("explicit_confirmation_required")
         profile = self._resolve_profile(strategy_id=strategy_id, profile_id=profile_id)
         evaluation = self.evaluate(strategy_id=profile.strategy_id, profile_id=profile.profile_id)
+        current_stage = str(evaluation.get("current_stage", "") or "").strip()
+        if current_stage == "research_only":
+            raise ValueError("approval_refused_stage_research_only")
+        if current_stage == "rejected":
+            raise ValueError("approval_refused_stage_rejected")
+        if current_stage not in {"paper_candidate", "paper_sim_active"}:
+            raise ValueError(f"approval_refused_stage_{current_stage or 'unknown'}")
+        if float(max_paper_notional_usd) > 10.0:
+            raise ValueError("approval_refused_notional_cap")
+        if int(max_open_trades) > 1:
+            raise ValueError("approval_refused_open_trade_cap")
+        if int(cooldown_minutes) < 60:
+            raise ValueError("approval_refused_cooldown_too_low")
         self.usage_ledger.approve_strategy_for_paper(
             strategy_id=profile.strategy_id,
             profile_id=profile.profile_id,
@@ -481,6 +526,15 @@ class PromotionGateReport:
                 "net_performance_pct": (latest.get("net_return_summary_json", {}) or {}).get("avg_pct", 0.0),
                 "net_win_rate": (latest.get("win_rate_summary_json", {}) or {}).get("avg", 0.0),
                 "blocked_from_execution_reasons": latest.get("blocker_reasons_json", []),
+                "paper_blocker_reasons": latest.get(
+                    "paper_blocker_reasons_json",
+                    latest.get("blocker_reasons_json", []),
+                ),
+                "paper_policy_notes": latest.get("paper_policy_notes_json", []),
+                "live_blocker_reasons": latest.get(
+                    "live_blocker_reasons_json",
+                    latest.get("blocker_reasons_json", []),
+                ),
                 "allocation_includes_backtest_evidence": {
                     "paper": bool(latest.get("paper_fitness_includes_backtest")),
                     "live": bool(latest.get("live_fitness_includes_backtest")),
